@@ -1,0 +1,18 @@
+digraph "TrafficLight" {
+  rankdir=LR;
+  labelloc="t";
+  label="TrafficLight  (DISTRIBUTED)";
+  node [shape=rectangle, style=rounded, fontname="Helvetica"];
+  edge [fontname="Helvetica", fontsize=10];
+
+  __start [shape=point, width=0.12, label=""];
+  __start -> "Red";
+
+  "Red" [penwidth=2, color="#1a73e8"];
+  "Green";
+  "Yellow";
+
+  "Red" -> "Green";
+  "Green" -> "Yellow";
+  "Yellow" -> "Red";
+}
