@@ -192,6 +192,44 @@ class ExtractionIntegrationTest {
         assertEquals("Closed", m.initialState().orElse(null));
     }
 
+    @Test
+    void factoryAndDelegateResolvedInterprocedurally() {
+        // F3: the transition arms delegate to helpers instead of building the
+        // next state inline:
+        //   case Open o -> shutOnTurn(current, event);   // returns new Shut() or current
+        //   case Shut s -> factoryOpen();                // returns new Open()
+        // Bounded inter-procedural summaries (k = 2) must fold each helper's
+        // return values into the call site — recovering the guarded edge and the
+        // self-loop *through* the delegate — while a target that sits deeper than
+        // the budget stays unresolved rather than being guessed.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/factory"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(Set.of("Open", "Shut", "Jammed"), stateIds(m));
+
+        // Resolved *through* helper methods.
+        assertTrue(hasResolved(m, "Open", "Shut"), "Open -> Shut via delegate shutOnTurn");
+        assertTrue(hasResolved(m, "Open", "Open"), "Open -> Open self-loop via delegate");
+        assertTrue(hasResolved(m, "Shut", "Open"), "Shut -> Open via factory factoryOpen");
+
+        // The guard survives the fold.
+        Transition guarded = m.transitions().stream()
+                .filter(t -> t.from().equals("Open") && "Shut".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(guarded.guard(), "delegated target should keep its guard");
+        assertTrue(guarded.guard().contains("Turn"), "guard should reference the delegate's condition");
+
+        // Out-of-budget chain (concrete target 3 hops deep, k = 2): recorded
+        // unresolved, never resolved on a guess. This keeps precision honest.
+        boolean anyJammedResolved = m.transitions().stream()
+                .anyMatch(t -> t.from().equals("Jammed") && t.isResolved());
+        assertFalse(anyJammedResolved, "target beyond the depth budget must not be resolved");
+        boolean jammedUnresolved = m.transitions().stream()
+                .anyMatch(t -> t.from().equals("Jammed") && !t.isResolved());
+        assertTrue(jammedUnresolved, "the out-of-budget call must be recorded as unresolved");
+    }
+
     // ---- negative control --------------------------------------------------
 
     @Test

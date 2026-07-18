@@ -24,11 +24,15 @@ import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtParameter;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtVariable;
+import spoon.reflect.reference.CtExecutableReference;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.reference.CtVariableReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -84,6 +88,12 @@ public final class TransitionExtractor {
     private Set<String> stateFieldNames = Set.of();
     private Set<String> mutatorNames = Set.of();
 
+    // F3: bounded inter-procedural resolution. k = 2 keeps the fixed analysis
+    // terminating; the stack also detects recursion cycles.
+    private static final int MAX_INTERPROC_DEPTH = 2;
+    private final Deque<String> interProcStack = new ArrayDeque<>();
+    private int interProcResolvedEdges = 0;
+
     public TransitionExtractor(Set<String> hierarchyQualifiedNames, String rootQualifiedName) {
         this.hierarchyQualifiedNames = hierarchyQualifiedNames;
         this.resolver = new TransitionResolver(hierarchyQualifiedNames, rootQualifiedName);
@@ -97,11 +107,18 @@ public final class TransitionExtractor {
         Set<Transition> out = new LinkedHashSet<>();
         List<CtMethod<?>> distributed = StateMachineClassifier.findDistributedTransitionMethods(root);
         List<CtMethod<?>> centralized = StateMachineClassifier.findCentralizedTransitionMethods(root, model);
+
+        // F3: a transition function that is *invoked* by another transition
+        // function is an inter-procedural helper — its return values are folded
+        // into the caller at the call site, so extracting it standalone would
+        // double-count and emit spurious undetermined-origin edges. Exclude those.
+        Set<String> helperSignatures = interproceduralHelperSignatures(distributed, centralized);
+
         for (CtMethod<?> m : distributed) {
-            extractDistributed(m, out);
+            if (!helperSignatures.contains(m.getSignature())) extractDistributed(m, out);
         }
         for (CtMethod<?> m : centralized) {
-            extractCentralized(m, out);
+            if (!helperSignatures.contains(m.getSignature())) extractCentralized(m, out);
         }
         // F2: GoF / field-mutation encoding. Run only as a fallback when no
         // return-based transition method exists, so a hierarchy that already
@@ -110,7 +127,38 @@ public final class TransitionExtractor {
         if (distributed.isEmpty() && centralized.isEmpty()) {
             extractMutationEncoding(root, model, out);
         }
+        if (interProcResolvedEdges > 0) {
+            diagnostics.add(interProcResolvedEdges + " transition target(s) resolved via bounded "
+                    + "inter-procedural summaries (depth ≤ " + MAX_INTERPROC_DEPTH
+                    + "); precision-sensitive — audit separately");
+        }
         return new ArrayList<>(out);
+    }
+
+    /**
+     * Signatures of transition methods invoked by another transition method:
+     * inter-procedural helpers whose return values are folded into their callers
+     * (F3), so they must not also be extracted as standalone machine fragments.
+     */
+    private Set<String> interproceduralHelperSignatures(List<CtMethod<?>> distributed,
+                                                        List<CtMethod<?>> centralized) {
+        Set<String> callable = new HashSet<>();
+        for (CtMethod<?> m : distributed) callable.add(m.getSignature());
+        for (CtMethod<?> m : centralized) callable.add(m.getSignature());
+
+        Set<String> helpers = new HashSet<>();
+        List<CtMethod<?>> all = new ArrayList<>(distributed);
+        all.addAll(centralized);
+        for (CtMethod<?> caller : all) {
+            for (CtInvocation<?> inv : caller.getElements(new TypeFilter<>(CtInvocation.class))) {
+                CtMethod<?> callee = calleeMethod(inv);
+                if (callee != null && callable.contains(callee.getSignature())
+                        && !callee.getSignature().equals(caller.getSignature())) {
+                    helpers.add(callee.getSignature());
+                }
+            }
+        }
+        return helpers;
     }
 
     // ---- distributed (State pattern) -----------------------------------------
@@ -256,6 +304,95 @@ public final class TransitionExtractor {
         return t != null && hierarchyQualifiedNames.contains(t.getQualifiedName());
     }
 
+    // ---- inter-procedural resolution (F3) ------------------------------------
+
+    /**
+     * Fold a call to an in-model helper that returns the hierarchy type into its
+     * possible return targets — a bounded, k-limited return-value summary. Returns
+     * {@code true} when the call was folded (its resolvable targets emitted, any
+     * unresolvable ones recorded); {@code false} when it cannot be summarised
+     * soundly — a library/abstract callee, a non-hierarchy return, an exhausted
+     * depth budget, or a recursion cycle — leaving the caller to record it
+     * unresolved (the never-guess invariant).
+     */
+    private boolean resolveInterprocedural(CtInvocation<?> inv, String from, String event,
+                                           String guard, Set<Transition> out) {
+        CtExecutableReference<?> exe = inv.getExecutable();
+        if (exe == null) return false;
+        CtTypeReference<?> ret = exe.getType();
+        if (ret == null || !hierarchyQualifiedNames.contains(ret.getQualifiedName())) {
+            return false; // not a state-producing call
+        }
+        if (!(exe.getExecutableDeclaration() instanceof CtMethod<?> callee) || callee.getBody() == null) {
+            return false; // library / abstract / unavailable in the model
+        }
+        String sig = callee.getSignature();
+        if (interProcStack.size() >= MAX_INTERPROC_DEPTH || interProcStack.contains(sig)) {
+            return false; // depth budget exhausted or recursion cycle
+        }
+        List<GuardedExpr> returns = collectReturns(callee.getBody(), null);
+        if (returns.isEmpty()) return false; // nothing summarisable (e.g. returns hidden in a switch)
+
+        boolean top = interProcStack.isEmpty();
+        int resolvedBefore = top ? countResolved(out) : 0;
+        interProcStack.push(sig);
+        try {
+            for (GuardedExpr ge : returns) {
+                // Resolve each callee return in the *caller's* from-context, so a
+                // returned root-typed value ("the current state") becomes a
+                // self-loop to the caller's from-state — exactly as in a direct
+                // transition method. A returned call recurses under the budget.
+                handleValue(ge.expr(), from, event, merge(guard, ge.guard()), out);
+            }
+        } finally {
+            interProcStack.pop();
+            if (top) interProcResolvedEdges += Math.max(0, countResolved(out) - resolvedBefore);
+        }
+        return true;
+    }
+
+    /** Returned / yielded expressions of a body, each with its accumulated guard. */
+    private record GuardedExpr(CtExpression<?> expr, String guard) {}
+
+    private List<GuardedExpr> collectReturns(CtElement node, String guard) {
+        List<GuardedExpr> out = new ArrayList<>();
+        collectReturnsInto(node, guard, out);
+        return out;
+    }
+
+    private void collectReturnsInto(CtElement node, String guard, List<GuardedExpr> out) {
+        if (node == null) return;
+        if (node instanceof CtBlock<?> b) {
+            for (CtStatement s : b.getStatements()) collectReturnsInto(s, guard, out);
+        } else if (node instanceof CtIf ctIf) {
+            String c = safeText(ctIf.getCondition());
+            collectReturnsInto(ctIf.getThenStatement(), merge(guard, c), out);
+            collectReturnsInto(ctIf.getElseStatement(), merge(guard, negate(c)), out);
+        } else if (node instanceof CtReturn<?> r && r.getReturnedExpression() != null) {
+            out.add(new GuardedExpr(r.getReturnedExpression(), guard));
+        } else if (node instanceof CtYieldStatement ys && ys.getExpression() != null) {
+            out.add(new GuardedExpr(ys.getExpression(), guard));
+        }
+        // A helper whose returns hide inside a switch / loop / try is not
+        // summarised here; resolveInterprocedural then reports the call unresolved.
+    }
+
+    private static CtMethod<?> calleeMethod(CtInvocation<?> inv) {
+        try {
+            CtExecutableReference<?> exe = inv.getExecutable();
+            if (exe == null) return null;
+            return exe.getExecutableDeclaration() instanceof CtMethod<?> m ? m : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static int countResolved(Set<Transition> out) {
+        int n = 0;
+        for (Transition t : out) if (t.isResolved()) n++;
+        return n;
+    }
+
     // ---- unified control-flow walk -------------------------------------------
 
     /**
@@ -367,6 +504,13 @@ public final class TransitionExtractor {
         // definitions (each under its own path guard) instead.
         if (value instanceof CtVariableAccess<?> va && isReassignedLocal(va)) {
             handleReassignedLocal(va, from, event, guard, out);
+            return;
+        }
+        // F3: an invocation returning the hierarchy type may be an in-model
+        // helper/factory; fold its bounded return-value summary when we soundly
+        // can, otherwise fall through and record it unresolved as before.
+        if (value instanceof CtInvocation<?> inv
+                && resolveInterprocedural(inv, from, event, guard, out)) {
             return;
         }
         for (TransitionResolver.Candidate cand : resolver.resolve(value, from)) {

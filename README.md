@@ -122,7 +122,7 @@ Given one produced expression, resolve the concrete target state(s).
 | `cond ? a : b` | Two guarded transitions | `(event instanceof Lock) ? new Locked() : new Open()` |
 | Variable typed as concrete state | Resolved to that state | `Locked l = ...; return l;` |
 | `static final X INSTANCE = new X()` | Resolved via initializer | Singleton states |
-| `return helper()` | **Unresolved** (recorded) | Inter-procedural — v1 scope line |
+| `return helper()` / `return factory.make()` | Resolved via bounded inter-procedural summary | The callee's return values are folded into the call site (finding F3), depth-limited to k = 2 with cycle detection; a library/abstract callee or an out-of-budget target stays **unresolved** |
 | Reassigned local (`next = …; return next;`) | Resolved per reaching definition | Handled upstream by the walker's reaching-definitions pass (Layer 1); only a write inside a loop/try leaves it unresolved |
 | Anything else | **Unresolved** (recorded) | Raw text preserved in `note` |
 
@@ -210,6 +210,7 @@ The `--returns` flag is especially useful: it shows the exact `CtExpression` sub
 | `examples/turnstile` | centralized | 2 states; imperative `if`-guarded arms with fall-through self-loops |
 | `examples/localvar` | centralized | 2 states; next state via a **reassigned root-typed local** — guarded edge + else self-loop, no blind self-loop (finding F1) |
 | `examples/gofcontext` | mutation / GoF | 3 states; transitions via `ctx.setState(...)` field mutation; recovers the **same edge set** as `examples/door` (finding F2) |
+| `examples/factory` | centralized | 3 states; arms **delegate to helper/factory methods**; resolved via bounded inter-procedural summaries, out-of-budget target stays unresolved (finding F3) |
 | `examples/shape` | — (negative) | **rejected** as a plain sum type |
 
 The `examples/door` case deliberately exercises the hardest patterns: type-pattern `from`-states, constructor-call targets, a guarded ternary transition, and a `return current;` self-loop.
@@ -240,7 +241,7 @@ mvn test
 
 ## Known limitations (v1 scope)
 
-- **Inter-procedural targets** (`return helper();`) are recorded as unresolved, not chased.
+- **Inter-procedural targets** (`return helper();`, `return factory.make();`) are chased with bounded return-value summaries (finding F3), depth-limited to k = 2 with cycle detection and reported as a separate, precision-sensitive count in diagnostics; a library/abstract callee, a callee whose returns hide inside a switch/loop, or a target beyond the budget stays unresolved.
 - **Reassigned locals** are tracked by a flow-sensitive reaching-definitions pass over straight-line + `if`/`else` code (finding F1); a variable written inside a loop, `try`, or nested switch still falls back to an unresolved edge.
 - **Mutation / GoF State** transitions (field write or `setState` call) are recovered (finding F2), but only as a fallback and only once the hierarchy is classified as an FSM — a pure-mutation hierarchy currently needs the `@Fsm` marker, since detecting the GoF family structurally (without false-positiving on mutable-field sum types) is future work.
 - **Event labels** are taken from method names in the distributed style; centralized- and mutation-style event labelling and independent enumeration of a sealed `Event` alphabet are future work.
@@ -284,6 +285,7 @@ examples/
 ├── turnstile/  # centralized switch with if-guarded arms + fall-through
 ├── localvar/   # reassigned root-typed local (reaching-definitions, F1)
 ├── gofcontext/ # GoF State pattern: setState field mutation (F2)
+├── factory/    # inter-procedural delegate + factory helpers (F3)
 └── shape/      # negative control (plain sum type)
 sample-output/  # reference DOT/SCXML for diffing
 ```
