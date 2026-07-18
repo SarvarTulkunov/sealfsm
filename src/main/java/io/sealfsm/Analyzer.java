@@ -62,6 +62,11 @@ public final class Analyzer {
             for (Transition t : te.extract(root, model)) {
                 machine.addTransition(t);
             }
+            // F4: register the closed-world event alphabet Σ, so it is complete
+            // even for events the transition function ignores (no edge carries them).
+            for (String symbol : te.alphabet()) {
+                machine.addAlphabetSymbol(symbol);
+            }
             for (String d : te.diagnostics()) {
                 result.warn(root.getQualifiedName(), d);
             }

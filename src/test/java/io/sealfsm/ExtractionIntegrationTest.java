@@ -43,6 +43,12 @@ class ExtractionIntegrationTest {
                 .anyMatch(t -> t.isResolved() && t.from().equals(from) && to.equals(t.to()));
     }
 
+    private boolean hasEventEdge(StateMachine m, String from, String event, String to) {
+        return m.transitions().stream()
+                .anyMatch(t -> t.isResolved() && t.from().equals(from)
+                        && to.equals(t.to()) && event.equals(t.event()));
+    }
+
     private Set<String> stateIds(StateMachine m) {
         return m.allStates().stream().map(io.sealfsm.model.State::id).collect(Collectors.toSet());
     }
@@ -228,6 +234,43 @@ class ExtractionIntegrationTest {
         boolean jammedUnresolved = m.transitions().stream()
                 .anyMatch(t -> t.from().equals("Jammed") && !t.isResolved());
         assertTrue(jammedUnresolved, "the out-of-budget call must be recorded as unresolved");
+    }
+
+    @Test
+    void eventAlphabetRecoveredAndEdgesLabelled() {
+        // F4: the transition function dispatches on the state and then on a sealed
+        // Event parameter. Σ must be recovered in full from Event's permits clause
+        // (including the ignored `Skip`), and each switch-over-event arm must label
+        // its edge with the matched event so parallel edges no longer collapse.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/eventalphabet"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(Set.of("Stopped", "Playing", "Paused"), stateIds(m));
+
+        // Σ is exact and complete — enumerated from the sealed Event type.
+        assertEquals(Set.of("Play", "Pause", "Stop", "Skip"), m.alphabet());
+
+        // `Skip` is in Σ purely by structure: it is folded into every `default`
+        // arm and so appears on no edge. This proves Σ comes from the sealed type,
+        // not merely from the emitted transitions.
+        assertTrue(m.alphabet().contains("Skip"), "ignored event must still be in Σ");
+        assertFalse(m.transitions().stream().anyMatch(t -> "Skip".equals(t.event())),
+                "the ignored event must not label any edge");
+
+        // Each event-switch arm labels its edge with the matched event.
+        assertTrue(hasEventEdge(m, "Playing", "Pause", "Paused"), "Playing --Pause--> Paused");
+        assertTrue(hasEventEdge(m, "Playing", "Stop", "Stopped"), "Playing --Stop--> Stopped");
+        assertTrue(hasEventEdge(m, "Paused", "Play", "Playing"), "Paused --Play--> Playing");
+
+        // Parallel edges between the same two states no longer collapse: two
+        // distinct events drive Stopped -> Playing, so both survive as edges.
+        assertTrue(hasEventEdge(m, "Stopped", "Play", "Playing"), "Stopped --Play--> Playing");
+        assertTrue(hasEventEdge(m, "Stopped", "Pause", "Playing"), "Stopped --Pause--> Playing");
+        long stoppedToPlaying = m.transitions().stream()
+                .filter(t -> t.isResolved() && t.from().equals("Stopped") && "Playing".equals(t.to()))
+                .count();
+        assertEquals(2, stoppedToPlaying, "Play and Pause must be two distinct edges, not collapsed into one");
     }
 
     // ---- negative control --------------------------------------------------

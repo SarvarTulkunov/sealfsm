@@ -57,6 +57,16 @@ public final class StateMachine {
         if (t.event() != null) alphabet.add(t.event());
     }
 
+    /**
+     * Add an input symbol to the alphabet Σ independently of the transitions.
+     * Used to record the <em>complete</em>, closed-world event set enumerated
+     * from a sealed/enum event type (finding F4) — including events the
+     * transition function ignores, which therefore appear on no edge.
+     */
+    public void addAlphabetSymbol(String symbol) {
+        if (symbol != null && !symbol.isBlank()) alphabet.add(symbol);
+    }
+
     public void setInitialState(String id) {
         this.initialState = id;
         allStates().forEach(s -> s.setInitial(s.id().equals(id)));

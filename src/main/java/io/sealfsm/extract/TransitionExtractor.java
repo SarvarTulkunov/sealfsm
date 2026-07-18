@@ -1,5 +1,6 @@
 package io.sealfsm.extract;
 
+import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.model.Transition;
 import spoon.reflect.CtModel;
@@ -19,6 +20,8 @@ import spoon.reflect.code.CtSwitchExpression;
 import spoon.reflect.code.CtVariableAccess;
 import spoon.reflect.code.CtYieldStatement;
 import spoon.reflect.declaration.CtElement;
+import spoon.reflect.declaration.CtEnum;
+import spoon.reflect.declaration.CtEnumValue;
 import spoon.reflect.declaration.CtField;
 import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtParameter;
@@ -94,6 +97,13 @@ public final class TransitionExtractor {
     private final Deque<String> interProcStack = new ArrayDeque<>();
     private int interProcResolvedEdges = 0;
 
+    // F4: the closed-world event alphabet Σ enumerated from the sealed/enum event
+    // parameter of centralized transition functions, plus the qualified names of
+    // that event type (root + members) so a switch-over-event can be recognised
+    // and its arms attributed to the matched event.
+    private final Set<String> alphabet = new LinkedHashSet<>();
+    private final Set<String> eventQualifiedNames = new LinkedHashSet<>();
+
     public TransitionExtractor(Set<String> hierarchyQualifiedNames, String rootQualifiedName) {
         this.hierarchyQualifiedNames = hierarchyQualifiedNames;
         this.resolver = new TransitionResolver(hierarchyQualifiedNames, rootQualifiedName);
@@ -101,6 +111,11 @@ public final class TransitionExtractor {
 
     public List<String> diagnostics() {
         return diagnostics;
+    }
+
+    /** The event alphabet Σ recovered from sealed/enum event parameters (F4). */
+    public Set<String> alphabet() {
+        return alphabet;
     }
 
     public List<Transition> extract(CtType<?> root, CtModel model) {
@@ -174,6 +189,10 @@ public final class TransitionExtractor {
     // ---- centralized (single transition function) ----------------------------
 
     private void extractCentralized(CtMethod<?> method, Set<Transition> out) {
+        // F4: recover the closed-world event alphabet Σ from the event parameter
+        // (and register the event type so a nested switch-over-event can label
+        // each arm). Done before the walk so walkSwitch sees eventQualifiedNames.
+        enumerateEventAlphabet(method);
         if (!containsStateDispatchSwitch(method)) {
             // No switch we could attribute from-states to. Walk anyway so produced
             // targets remain visible (recorded with an undetermined origin), and
@@ -182,9 +201,47 @@ public final class TransitionExtractor {
                     + "' has no recognised switch over the state type; "
                     + "from-states could not be attributed");
         }
-        // Centralized-style event labelling is a v1 scope line, so event is null;
-        // from starts unknown and is set per matched state-pattern case.
+        // from starts unknown and is set per matched state-pattern case; the event
+        // label is null until a switch-over-event arm names it (F4).
         walk(method.getBody(), null, null, null, out);
+    }
+
+    /**
+     * Enumerate Σ from a transition method's event parameter — the same
+     * closed-world trick used for states (finding F4). The event parameter is a
+     * parameter (other than the state selector) whose type is a sealed hierarchy
+     * or an enum; Σ is then its permitted subtypes / enum constants, exact and
+     * complete. Records both the symbols (into the alphabet) and the qualified
+     * names of the event type and its members (so {@link #walkSwitch} can attribute
+     * a switch-over-event's arms to the matched event).
+     */
+    private void enumerateEventAlphabet(CtMethod<?> method) {
+        for (CtParameter<?> p : method.getParameters()) {
+            CtTypeReference<?> pt = p.getType();
+            if (pt == null || hierarchyQualifiedNames.contains(pt.getQualifiedName())) {
+                continue; // skip the state selector (and untyped params)
+            }
+            CtType<?> decl = pt.getTypeDeclaration();
+            if (decl == null) continue;
+
+            List<String> symbols = new ArrayList<>();
+            if (decl instanceof CtEnum<?> en) {
+                for (CtEnumValue<?> v : en.getEnumValues()) symbols.add(v.getSimpleName());
+            } else if (SpoonCompat.isSealed(decl)) {
+                for (CtTypeReference<?> ref : SpoonCompat.permittedTypes(decl)) {
+                    symbols.add(ref.getSimpleName());
+                }
+            } else {
+                continue; // not a closed event type — no exact Σ to recover
+            }
+            if (symbols.isEmpty()) continue;
+
+            eventQualifiedNames.add(pt.getQualifiedName());
+            for (CtTypeReference<?> ref : SpoonCompat.permittedTypes(decl)) {
+                eventQualifiedNames.add(ref.getQualifiedName());
+            }
+            alphabet.addAll(symbols);
+        }
     }
 
     // ---- mutation / GoF State encoding (F2) ----------------------------------
@@ -683,15 +740,17 @@ public final class TransitionExtractor {
 
     /**
      * Walk the arms of a switch. When the switch dispatches on the state type,
-     * each arm's from-state is the matched type pattern; otherwise the from-state
-     * is inherited (e.g. a switch-over-event inside a distributed method or
-     * inside a state arm).
+     * each arm's from-state is the matched type pattern. When it dispatches on the
+     * event type (finding F4), each arm's event label is the matched event —
+     * mirroring the state case exactly. Otherwise both are inherited.
      */
     private void walkSwitch(CtAbstractSwitch<?> sw, String from, String event,
                             String guard, Set<Transition> out) {
         boolean overState = isStateDispatch(sw);
+        boolean overEvent = !overState && isEventDispatch(sw);
         for (CtCase<?> c : sw.getCases()) {
-            String caseFrom;
+            String caseFrom = from;
+            String caseEvent = event;
             if (overState) {
                 caseFrom = caseFromState(c);
                 if (caseFrom == null) {
@@ -700,12 +759,13 @@ public final class TransitionExtractor {
                     // fall through with a null from so produced targets are still
                     // recorded (as undetermined-origin) rather than dropped.
                 }
-            } else {
-                caseFrom = from;
+            } else if (overEvent) {
+                String ev = caseEventName(c);
+                if (ev != null) caseEvent = ev; // default/unmatched arm keeps inherited event
             }
             String caseGuard = merge(guard, caseGuard(c));
             for (CtStatement st : c.getStatements()) {
-                walk(st, caseFrom, event, caseGuard, out);
+                walk(st, caseFrom, caseEvent, caseGuard, out);
             }
         }
     }
@@ -739,6 +799,12 @@ public final class TransitionExtractor {
     private boolean isStateDispatch(CtAbstractSwitch<?> sw) {
         CtTypeReference<?> selType = selectorType(sw);
         return selType != null && hierarchyQualifiedNames.contains(selType.getQualifiedName());
+    }
+
+    /** True when the switch selector is the event type (F4). */
+    private boolean isEventDispatch(CtAbstractSwitch<?> sw) {
+        CtTypeReference<?> selType = selectorType(sw);
+        return selType != null && eventQualifiedNames.contains(selType.getQualifiedName());
     }
 
     private CtTypeReference<?> selectorType(CtAbstractSwitch<?> sw) {
@@ -799,6 +865,30 @@ public final class TransitionExtractor {
         } catch (ReflectiveOperationException e) {
             return null;
         }
+    }
+
+    /**
+     * The event matched by a switch-over-event arm (F4): the type pattern for a
+     * sealed event ({@code case Lock l ->}) or the constant name for an enum
+     * event ({@code case LOCK ->}). Returns {@code null} for a {@code default}
+     * arm, so the inherited event label is kept.
+     */
+    private String caseEventName(CtCase<?> c) {
+        try {
+            for (CtExpression<?> ce : c.getCaseExpressions()) {
+                CtTypeReference<?> t = patternType(ce);
+                if (t != null && eventQualifiedNames.contains(t.getQualifiedName())) {
+                    return t.getSimpleName();
+                }
+                // enum constant label: `case LOCK ->` reads the constant.
+                if (ce instanceof CtVariableAccess<?> va && va.getVariable() != null) {
+                    return va.getVariable().getSimpleName();
+                }
+            }
+        } catch (Throwable ignored) {
+            // best effort — fall through to null (keep inherited event)
+        }
+        return null;
     }
 
     /** Guarded-pattern {@code when} clause, if present and supported. */

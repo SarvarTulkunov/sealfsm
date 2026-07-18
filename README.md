@@ -8,8 +8,8 @@ SealFSM reads Java source, finds `sealed` type hierarchies that encode state mac
 
 A `sealed` interface lists its implementations in a compiler-checked `permits` clause. That makes the set of subtypes **closed and exhaustive**. SealFSM exploits this in two steps that make claims of *different strength* — keeping them separate is the whole point:
 
-1. **State enumeration is provably complete.** Every permitted subtype is a state; the `permits` clause guarantees there are no others. This is exact, not heuristic.
-2. **Transition extraction is approximate.** Transitions are recovered by intra-procedural data-flow analysis over the transition code. This is empirical and is reported with precision/recall, never presented as complete.
+1. **State enumeration is provably complete.** Every permitted subtype is a state; the `permits` clause guarantees there are no others. This is exact, not heuristic. When the *event* type is itself a sealed hierarchy or an enum, the input alphabet Σ is recovered the same exact way (finding F4) — so both the state set Q *and* Σ come soundly from the closed-world structure.
+2. **Transition extraction is approximate.** Transitions — the transition relation δ connecting states over events — are recovered by intra-procedural data-flow analysis over the transition code. This is empirical and is reported with precision/recall, never presented as complete.
 
 The tool is built around that asymmetry. Anything it cannot resolve on the transition side is **recorded as an explicit unresolved edge** (a dashed red arrow in DOT, an XML comment in SCXML) rather than silently dropped, so gaps depress recall visibly instead of masquerading as a complete model.
 
@@ -96,6 +96,7 @@ A single recursive, guard-carrying traversal handles both encodings. It descends
 | **Distributed method** (`Red.next()` on a state class) | `from` = declaring state class; `event` = method name (neutral names like `next`/`transition`/`step`/`advance`/`tick` → no label) |
 | **Centralized method** (`transition(State, Event)`) | `from` = matched type-pattern per switch arm; `event` = `null` (v1 scope line) |
 | **Type-pattern switch arm** (`case Locked l -> …`) | Arm's matched type becomes the `from`-state |
+| **Switch-over-event arm** (`case Lock l -> …` inside a `switch (event)`) | Arm's matched event becomes the transition's event label; the alphabet Σ is enumerated from the sealed/enum event type (finding F4) |
 | **Guarded pattern** (`case Locked l when …`) | `when` clause becomes the transition guard |
 | **Enclosing `if`** | Condition becomes the guard; its negation guards the `else`/fall-through branch |
 | **Value produced inside an `if`** (`if (e instanceof Coin) yield new Unlocked();`) | Recovered with the `if` condition as guard — not dropped |
@@ -211,6 +212,7 @@ The `--returns` flag is especially useful: it shows the exact `CtExpression` sub
 | `examples/localvar` | centralized | 2 states; next state via a **reassigned root-typed local** — guarded edge + else self-loop, no blind self-loop (finding F1) |
 | `examples/gofcontext` | mutation / GoF | 3 states; transitions via `ctx.setState(...)` field mutation; recovers the **same edge set** as `examples/door` (finding F2) |
 | `examples/factory` | centralized | 3 states; arms **delegate to helper/factory methods**; resolved via bounded inter-procedural summaries, out-of-budget target stays unresolved (finding F3) |
+| `examples/eventalphabet` | centralized | 3 states; nested `switch (event)` — recovers Σ = {Play, Pause, Stop, Skip} from the sealed event type and labels each edge with its event (finding F4) |
 | `examples/shape` | — (negative) | **rejected** as a plain sum type |
 
 The `examples/door` case deliberately exercises the hardest patterns: type-pattern `from`-states, constructor-call targets, a guarded ternary transition, and a `return current;` self-loop.
@@ -244,7 +246,7 @@ mvn test
 - **Inter-procedural targets** (`return helper();`, `return factory.make();`) are chased with bounded return-value summaries (finding F3), depth-limited to k = 2 with cycle detection and reported as a separate, precision-sensitive count in diagnostics; a library/abstract callee, a callee whose returns hide inside a switch/loop, or a target beyond the budget stays unresolved.
 - **Reassigned locals** are tracked by a flow-sensitive reaching-definitions pass over straight-line + `if`/`else` code (finding F1); a variable written inside a loop, `try`, or nested switch still falls back to an unresolved edge.
 - **Mutation / GoF State** transitions (field write or `setState` call) are recovered (finding F2), but only as a fallback and only once the hierarchy is classified as an FSM — a pure-mutation hierarchy currently needs the `@Fsm` marker, since detecting the GoF family structurally (without false-positiving on mutable-field sum types) is future work.
-- **Event labels** are taken from method names in the distributed style; centralized- and mutation-style event labelling and independent enumeration of a sealed `Event` alphabet are future work.
+- **Event labels & alphabet Σ.** The alphabet is enumerated exactly and completely from a sealed/enum event parameter — the same closed-world trick used for states (finding F4) — and a `switch (event)` labels each edge with its matched event. Still open: attributing events carried by `instanceof`/ternary guards (as in `examples/door`, whose Σ is recovered but whose edges stay guard-labelled) and mutation-style (GoF) event labelling.
 - **Initial-state detection** is heuristic (field initializer, else the unique source-only state) and is flagged when it fails.
 
 ## Project layout
@@ -286,6 +288,7 @@ examples/
 ├── localvar/   # reassigned root-typed local (reaching-definitions, F1)
 ├── gofcontext/ # GoF State pattern: setState field mutation (F2)
 ├── factory/    # inter-procedural delegate + factory helpers (F3)
+├── eventalphabet/ # switch-over-event: recovers Σ + labels edges (F4)
 └── shape/      # negative control (plain sum type)
 sample-output/  # reference DOT/SCXML for diffing
 ```
