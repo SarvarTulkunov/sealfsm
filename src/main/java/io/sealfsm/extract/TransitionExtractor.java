@@ -2,6 +2,7 @@ package io.sealfsm.extract;
 
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.model.Transition;
+import spoon.reflect.CtModel;
 import spoon.reflect.code.CtAbstractSwitch;
 import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtBlock;
@@ -9,6 +10,7 @@ import spoon.reflect.code.CtCase;
 import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtIf;
+import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtLocalVariable;
 import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtStatement;
@@ -17,7 +19,9 @@ import spoon.reflect.code.CtSwitchExpression;
 import spoon.reflect.code.CtVariableAccess;
 import spoon.reflect.code.CtYieldStatement;
 import spoon.reflect.declaration.CtElement;
+import spoon.reflect.declaration.CtField;
 import spoon.reflect.declaration.CtMethod;
+import spoon.reflect.declaration.CtParameter;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtVariable;
 import spoon.reflect.reference.CtTypeReference;
@@ -65,9 +69,20 @@ public final class TransitionExtractor {
     private static final Set<String> NEUTRAL_METHOD_NAMES =
             Set.of("next", "transition", "step", "advance", "nextstate", "transitionto", "tick");
 
+    /** Conventional state-mutator names recognised regardless of body (F2). */
+    private static final Set<String> MUTATOR_NAMES =
+            Set.of("setstate", "changestate", "transitionto", "goto", "setcurrent", "become");
+
     private final TransitionResolver resolver;
     private final Set<String> hierarchyQualifiedNames;
     private final List<String> diagnostics = new ArrayList<>();
+
+    // F2: mutation-encoding context, populated only while the GoF/mutation
+    // fallback runs (a hierarchy with no return-based transition method). Left
+    // empty for distributed/centralized extraction, so those paths are unchanged.
+    private boolean mutationMode = false;
+    private Set<String> stateFieldNames = Set.of();
+    private Set<String> mutatorNames = Set.of();
 
     public TransitionExtractor(Set<String> hierarchyQualifiedNames, String rootQualifiedName) {
         this.hierarchyQualifiedNames = hierarchyQualifiedNames;
@@ -78,13 +93,22 @@ public final class TransitionExtractor {
         return diagnostics;
     }
 
-    public List<Transition> extract(CtType<?> root, spoon.reflect.CtModel model) {
+    public List<Transition> extract(CtType<?> root, CtModel model) {
         Set<Transition> out = new LinkedHashSet<>();
-        for (CtMethod<?> m : StateMachineClassifier.findDistributedTransitionMethods(root)) {
+        List<CtMethod<?>> distributed = StateMachineClassifier.findDistributedTransitionMethods(root);
+        List<CtMethod<?>> centralized = StateMachineClassifier.findCentralizedTransitionMethods(root, model);
+        for (CtMethod<?> m : distributed) {
             extractDistributed(m, out);
         }
-        for (CtMethod<?> m : StateMachineClassifier.findCentralizedTransitionMethods(root, model)) {
+        for (CtMethod<?> m : centralized) {
             extractCentralized(m, out);
+        }
+        // F2: GoF / field-mutation encoding. Run only as a fallback when no
+        // return-based transition method exists, so a hierarchy that already
+        // exposes a functional transition is left untouched — a context that
+        // merely stores a functional result is not re-mined as a transition here.
+        if (distributed.isEmpty() && centralized.isEmpty()) {
+            extractMutationEncoding(root, model, out);
         }
         return new ArrayList<>(out);
     }
@@ -115,6 +139,123 @@ public final class TransitionExtractor {
         walk(method.getBody(), null, null, null, out);
     }
 
+    // ---- mutation / GoF State encoding (F2) ----------------------------------
+
+    /**
+     * Recover transitions expressed by <em>mutating</em> a state field rather
+     * than returning the next state — the classic GoF State-pattern family:
+     * {@code this.state = new Locked();} or {@code ctx.setState(new Locked());}.
+     * The from-state is the switch arm when the method dispatches on the state
+     * field, otherwise the declaring state class (GoF callbacks); the to-state is
+     * the assigned value / mutator argument, resolved like any produced value.
+     */
+    private void extractMutationEncoding(CtType<?> root, CtModel model, Set<Transition> out) {
+        stateFieldNames = findStateFieldNames(model);
+        mutatorNames = findMutatorNames(model);
+        if (stateFieldNames.isEmpty() && mutatorNames.isEmpty()) return;
+
+        mutationMode = true;
+        try {
+            for (CtMethod<?> m : findMutationMethods(model)) {
+                CtType<?> declaring = m.getDeclaringType();
+                // GoF callback (`class Closed { void onLock(ctx){ ctx.setState(...); } }`):
+                // the from-state is the declaring state class. A method that
+                // dispatches on the state field instead leaves from null here and
+                // has it set per matched arm by walkSwitch.
+                String from = declaring != null
+                        && hierarchyQualifiedNames.contains(declaring.getQualifiedName())
+                        ? declaring.getSimpleName()
+                        : null;
+                // Mutation-style event labelling is future work (as for
+                // centralized), so the event label stays null.
+                walk(m.getBody(), from, null, null, out);
+            }
+        } finally {
+            mutationMode = false;
+        }
+    }
+
+    /** Simple names of fields whose declared type is inside the hierarchy. */
+    private Set<String> findStateFieldNames(CtModel model) {
+        Set<String> names = new LinkedHashSet<>();
+        for (CtField<?> f : model.getElements(new TypeFilter<>(CtField.class))) {
+            CtTypeReference<?> t = f.getType();
+            if (t != null && hierarchyQualifiedNames.contains(t.getQualifiedName())) {
+                names.add(f.getSimpleName());
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Simple names of <em>mutator</em> methods: a single hierarchy-typed parameter
+     * plus either a state-field assignment in the body or a conventional setter
+     * name ({@code setState}/{@code changeState}/{@code transitionTo}/{@code goTo}).
+     */
+    private Set<String> findMutatorNames(CtModel model) {
+        Set<String> names = new LinkedHashSet<>();
+        for (CtMethod<?> m : model.getElements(new TypeFilter<>(CtMethod.class))) {
+            List<CtParameter<?>> ps = m.getParameters();
+            if (ps.size() != 1) continue;
+            CtTypeReference<?> pt = ps.get(0).getType();
+            if (pt == null || !hierarchyQualifiedNames.contains(pt.getQualifiedName())) continue;
+            boolean assignsField = m.getElements(new TypeFilter<>(CtAssignment.class)).stream()
+                    .anyMatch(a -> isStateFieldWrite(a.getAssigned()));
+            if (assignsField || MUTATOR_NAMES.contains(m.getSimpleName().toLowerCase())) {
+                names.add(m.getSimpleName());
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Methods that produce a transition by mutation: they assign a state field or
+     * call a mutator. The mutators themselves are excluded — a setter merely
+     * stores its parameter and carries no next-state of its own.
+     */
+    private List<CtMethod<?>> findMutationMethods(CtModel model) {
+        List<CtMethod<?>> out = new ArrayList<>();
+        for (CtMethod<?> m : model.getElements(new TypeFilter<>(CtMethod.class))) {
+            if (m.getBody() == null) continue;
+            if (mutatorNames.contains(m.getSimpleName()) && m.getParameters().size() == 1) {
+                continue; // the setter itself
+            }
+            boolean writesField = m.getElements(new TypeFilter<>(CtAssignment.class)).stream()
+                    .anyMatch(a -> isStateFieldWrite(a.getAssigned()));
+            boolean callsMutator = m.getElements(new TypeFilter<>(CtInvocation.class)).stream()
+                    .anyMatch(this::isMutatorCall);
+            if (writesField || callsMutator) out.add(m);
+        }
+        return out;
+    }
+
+    /** Is {@code lhs} a write to a state field (a field of a hierarchy type)? */
+    private boolean isStateFieldWrite(CtExpression<?> lhs) {
+        if (lhs instanceof CtFieldAccess<?> fa) {
+            return fa.getVariable() != null && stateFieldNames.contains(fa.getVariable().getSimpleName());
+        }
+        if (lhs instanceof CtVariableAccess<?> va) {
+            return va.getVariable() != null && stateFieldNames.contains(va.getVariable().getSimpleName());
+        }
+        return false;
+    }
+
+    /** Is {@code inv} a call to a recognised state mutator? */
+    private boolean isMutatorCall(CtInvocation<?> inv) {
+        try {
+            return inv.getExecutable() != null
+                    && mutatorNames.contains(inv.getExecutable().getSimpleName());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Does {@code e} have a declared type inside the hierarchy? */
+    private boolean isHierarchyTyped(CtExpression<?> e) {
+        CtTypeReference<?> t = e.getType();
+        return t != null && hierarchyQualifiedNames.contains(t.getQualifiedName());
+    }
+
     // ---- unified control-flow walk -------------------------------------------
 
     /**
@@ -141,12 +282,22 @@ public final class TransitionExtractor {
             handleValue(ret.getReturnedExpression(), from, event, guard, out);
         } else if (node instanceof CtYieldStatement ys) {
             handleValue(ys.getExpression(), from, event, guard, out);
-        } else if (node instanceof CtAssignment<?, ?>) {
-            // A bare assignment statement is a *mutation* site, not a produced
-            // value. The field-mutation / setter encoding (F2) is out of v1 scope;
-            // treating the whole assignment as a returned value here only produced
-            // a spurious unresolved edge. Reassigned locals (F1) are read directly
-            // by the reaching-definitions pass, so nothing resolvable is lost.
+        } else if (node instanceof CtAssignment<?, ?> asg) {
+            // F2: an assignment to the *state field* is a transition site; the RHS
+            // is the next-state expression (`this.state = new Locked();`). A bare
+            // assignment to any other variable is a local mutation — read directly
+            // by the F1 reaching-definitions pass — and not a produced value here.
+            if (mutationMode && isStateFieldWrite(asg.getAssigned())) {
+                handleValue(asg.getAssignment(), from, event, guard, out);
+            }
+        } else if (node instanceof CtInvocation<?> inv && mutationMode && isMutatorCall(inv)) {
+            // F2: ctx.setState(new Locked()) — the hierarchy-typed argument is the
+            // next state (from-state is the enclosing arm / declaring state class).
+            for (CtExpression<?> arg : inv.getArguments()) {
+                if (isHierarchyTyped(arg) || inv.getArguments().size() == 1) {
+                    handleValue(arg, from, event, guard, out);
+                }
+            }
         } else if (node instanceof CtExpression<?> expr) {
             // arrow-arm expression body: case X -> new A();  (statement is itself
             // an expression) or  case X -> switch (event) { ... };

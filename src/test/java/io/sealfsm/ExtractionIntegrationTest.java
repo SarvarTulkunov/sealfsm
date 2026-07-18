@@ -158,6 +158,40 @@ class ExtractionIntegrationTest {
         assertFalse(blindSelfLoop, "reassigned local must not emit an unguarded self-loop");
     }
 
+    @Test
+    void gofContextMutationConvergesWithFunctionalDoor() {
+        // F2: the GoF State pattern drives transitions by *mutating* a state field
+        //   class Closed { void handle(ctx, e){ if (e instanceof Lock) ctx.setState(new Locked()); else ctx.setState(new Open()); } }
+        // rather than returning the next state. The walker must treat a mutator
+        // call (ctx.setState(...)) as a transition site, attribute the from-state
+        // to the declaring state class, and resolve the argument as the target —
+        // recovering the *same* edge set as the return-based examples/door.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/gofcontext"));
+        StateMachine m = single(r);
+
+        assertEquals(Set.of("Open", "Closed", "Locked"), stateIds(m));
+
+        // Same resolved edge set as the functional examples/door.
+        assertTrue(hasResolved(m, "Closed", "Locked"), "Closed -> Locked (guarded, via setState)");
+        assertTrue(hasResolved(m, "Closed", "Open"), "Closed -> Open (else, via setState)");
+        assertTrue(hasResolved(m, "Open", "Closed"), "Open -> Closed (via setState)");
+        assertTrue(hasResolved(m, "Locked", "Closed"), "Locked -> Closed (guarded, via setState)");
+        assertTrue(hasResolved(m, "Locked", "Locked"), "Locked -> Locked (self-loop, setState(this))");
+
+        // The guarded branch carries its if-condition.
+        Transition guarded = m.transitions().stream()
+                .filter(t -> t.from().equals("Closed") && "Locked".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(guarded.guard(), "mutation target should record its guard");
+        assertTrue(guarded.guard().contains("Lock"), "guard should reference the if-condition");
+
+        // The mutation argument was always resolvable — no honest edge is lost.
+        assertEquals(0, m.unresolvedTransitionCount(), "every setState target is resolvable");
+
+        // Initial state comes from the context's field initializer, as in door.
+        assertEquals("Closed", m.initialState().orElse(null));
+    }
+
     // ---- negative control --------------------------------------------------
 
     @Test
