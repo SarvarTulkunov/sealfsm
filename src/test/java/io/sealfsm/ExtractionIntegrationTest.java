@@ -89,6 +89,40 @@ class ExtractionIntegrationTest {
         assertEquals("Closed", m.initialState().orElse(null));
     }
 
+    @Test
+    void turnstileCentralizedWithImperativeIfGuards() {
+        // Exercises next-states produced *inside* an `if` within a switch arm:
+        //   case Locked l -> { if (event instanceof Coin) yield new Unlocked(); yield l; }
+        // A flat return/yield scan drops the guarded branch; the control-flow
+        // walker must recover it and attach the if-condition as the guard.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/turnstile"));
+        StateMachine m = r.machines().stream()
+                .filter(sm -> sm.name().equals("Turnstile"))
+                .findFirst().orElseThrow();
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(Set.of("Locked", "Unlocked"), stateIds(m));
+
+        assertTrue(hasResolved(m, "Locked", "Unlocked"), "Locked -> Unlocked (guarded, inside if)");
+        assertTrue(hasResolved(m, "Locked", "Locked"), "Locked -> Locked (fall-through self-loop)");
+        assertTrue(hasResolved(m, "Unlocked", "Locked"), "Unlocked -> Locked (guarded, inside if)");
+        assertTrue(hasResolved(m, "Unlocked", "Unlocked"), "Unlocked -> Unlocked (fall-through self-loop)");
+
+        // The value produced inside the `if` must carry the condition as a guard.
+        Transition guarded = m.transitions().stream()
+                .filter(t -> t.from().equals("Locked") && "Unlocked".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(guarded.guard(), "if-guarded transition should record its condition");
+        assertTrue(guarded.guard().contains("Coin"), "guard should reference the if-condition");
+
+        // The fall-through self-loop must carry the negated guard, keeping the
+        // two Locked-origin edges mutually exclusive.
+        Transition fallThrough = m.transitions().stream()
+                .filter(t -> t.from().equals("Locked") && "Locked".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(fallThrough.guard(), "fall-through branch should record the negated condition");
+    }
+
     // ---- negative control --------------------------------------------------
 
     @Test

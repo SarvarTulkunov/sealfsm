@@ -65,6 +65,16 @@ public final class TransitionResolver {
             return out;
         }
 
+        // (State) x  ->  an explicit cast to a *concrete* state pins the target,
+        // overriding whatever the underlying expression's static type would say
+        // (e.g. `return (Locked) current;` where `current` is typed as the root).
+        // Spoon attaches casts to the expression itself rather than a wrapper node.
+        Candidate viaCast = fromCast(expr, guard);
+        if (viaCast != null) {
+            out.add(viaCast);
+            return out;
+        }
+
         // new Green()
         if (expr instanceof CtConstructorCall<?> cc) {
             out.add(fromTypeRef(cc.getType(), guard, expr));
@@ -103,6 +113,24 @@ public final class TransitionResolver {
         // anything else
         out.add(Candidate.unresolved(guard, safeText(expr)));
         return out;
+    }
+
+    /**
+     * If {@code expr} carries an explicit cast to a concrete state (not the
+     * abstract root), that cast determines the target. Returns {@code null} when
+     * there is no such cast, so the caller falls through to normal resolution.
+     */
+    private Candidate fromCast(CtExpression<?> expr, String guard) {
+        List<CtTypeReference<?>> casts = expr.getTypeCasts();
+        if (casts == null) return null;
+        for (CtTypeReference<?> cast : casts) {
+            if (cast == null) continue;
+            String q = cast.getQualifiedName();
+            if (!q.equals(rootQualifiedName) && hierarchyQualifiedNames.contains(q)) {
+                return Candidate.of(cast.getSimpleName(), guard);
+            }
+        }
+        return null;
     }
 
     private Candidate fromTypeRef(CtTypeReference<?> ref, String guard, CtExpression<?> raw) {

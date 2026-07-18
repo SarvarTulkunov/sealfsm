@@ -82,17 +82,44 @@ The tool is built around that asymmetry. Anything it cannot resolve on the trans
 - **Distributed** (classic State pattern): each state class has a transition method returning the hierarchy type. Example: `examples/traffic` — `Red.next()` returns `new Green()`.
 - **Centralized** (single transition function): a pattern-matching `switch` over the current state. Example: `examples/door` — `DoorMachine.transition(Door current, Event event)`.
 
-### TransitionResolver — what it handles
+## Covered transition logic cases
+
+Transition extraction runs in two layers. The **control-flow walker** (`TransitionExtractor`) descends a method body and decides *which* expressions produce a next state and *under what guard* control reaches them. Each such expression is then handed to the **expression resolver** (`TransitionResolver`), which decides *which concrete state* it yields. Both layers are documented below; anything either layer cannot handle becomes a **recorded unresolved edge**, never a silent drop.
+
+### Layer 1 — control-flow walker (`TransitionExtractor`)
+
+A single recursive, guard-carrying traversal handles both encodings. It descends the control-flow structure rather than flat-scanning for `return`/`yield`, so guards and nested producers are recovered precisely.
+
+| Control-flow shape | Handling |
+|--------------------|----------|
+| **Distributed method** (`Red.next()` on a state class) | `from` = declaring state class; `event` = method name (neutral names like `next`/`transition`/`step`/`advance`/`tick` → no label) |
+| **Centralized method** (`transition(State, Event)`) | `from` = matched type-pattern per switch arm; `event` = `null` (v1 scope line) |
+| **Type-pattern switch arm** (`case Locked l -> …`) | Arm's matched type becomes the `from`-state |
+| **Guarded pattern** (`case Locked l when …`) | `when` clause becomes the transition guard |
+| **Enclosing `if`** | Condition becomes the guard; its negation guards the `else`/fall-through branch |
+| **Value produced inside an `if`** (`if (e instanceof Coin) yield new Unlocked();`) | Recovered with the `if` condition as guard — not dropped |
+| **Guardless fall-through** (`if (cond) yield A; yield B;`) | `B` is guarded by `!(cond)` — mutually-exclusive guards threaded across sibling statements |
+| **Nested switch in an arm** (switch-over-event within switch-over-state) | Descended into, inheriting the arm's `from`-state |
+| **Arrow-arm expression body** (`case X -> new A();`) | Resolved directly as a produced value |
+| **`return` / `yield` / arrow forms** | All normalised to the same value-production path |
+| **Unrecognised switch case / unknown source** | Recorded as an unresolved (or undetermined-origin) edge **plus** a diagnostic |
+| **Loops, try/catch, local declarations** | Intentionally not descended for value production (reassigned locals are a v1 scope line) |
+
+### Layer 2 — expression resolver (`TransitionResolver`)
+
+Given one produced expression, resolve the concrete target state(s).
 
 | Expression shape | Result | Example |
 |-----------------|--------|---------|
 | `new Green()` | Resolved to `Green` | Direct construction |
+| `(Locked) current` | Resolved to `Locked` | Explicit cast to a concrete state pins the target (overrides the root-typed static type) |
 | `return this` | Self-loop to `from`-state | State pattern identity |
 | `return current` (root-typed variable) | Self-loop to `from`-state | Centralized `return current;` |
 | `cond ? a : b` | Two guarded transitions | `(event instanceof Lock) ? new Locked() : new Open()` |
 | Variable typed as concrete state | Resolved to that state | `Locked l = ...; return l;` |
 | `static final X INSTANCE = new X()` | Resolved via initializer | Singleton states |
 | `return helper()` | **Unresolved** (recorded) | Inter-procedural — v1 scope line |
+| Reassigned local | **Unresolved** (recorded) | Only declaration-site initializers resolve — v1 scope line |
 | Anything else | **Unresolved** (recorded) | Raw text preserved in `note` |
 
 ## Build
@@ -176,9 +203,12 @@ The `--returns` flag is especially useful: it shows the exact `CtExpression` sub
 |---------|----------|-----------------|
 | `examples/traffic` | distributed | 3 states; Red→Green→Yellow→Red; initial **Red**; 0 unresolved |
 | `examples/door` | centralized | 3 states; guarded + self-loop transitions; initial **Closed** |
+| `examples/turnstile` | centralized | 2 states; imperative `if`-guarded arms with fall-through self-loops |
 | `examples/shape` | — (negative) | **rejected** as a plain sum type |
 
 The `examples/door` case deliberately exercises the hardest patterns: type-pattern `from`-states, constructor-call targets, a guarded ternary transition, and a `return current;` self-loop.
+
+The `examples/turnstile` case targets the control-flow walker directly: each switch arm contains an imperative `if (event instanceof …) yield new X();` followed by a fall-through `yield` of the current state. It verifies that values produced *inside* an `if` are recovered with the condition as guard, and that the guardless fall-through is guarded by the negated condition.
 
 `sample-output/` contains the reference DOT/SCXML that the tool should produce. After building, `diff` your output against these to verify correctness.
 
@@ -242,6 +272,7 @@ src/test/java/io/sealfsm/
 examples/
 ├── traffic/    # distributed State pattern (TrafficLight)
 ├── door/       # centralized switch (Door + sealed Event)
+├── turnstile/  # centralized switch with if-guarded arms + fall-through
 └── shape/      # negative control (plain sum type)
 sample-output/  # reference DOT/SCXML for diffing
 ```
