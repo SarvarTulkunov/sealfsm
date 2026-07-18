@@ -123,6 +123,41 @@ class ExtractionIntegrationTest {
         assertNotNull(fallThrough.guard(), "fall-through branch should record the negated condition");
     }
 
+    @Test
+    void reassignedLocalDoesNotEmitFalseSelfLoop() {
+        // F1: the next state is computed through a reassigned, root-typed local
+        //   case Closed c -> { Gate next = current; if (event instanceof Push) next = new Open(); yield next; }
+        // The naive resolver reads `next`'s declared type (the sealed root) and
+        // emits a single *unguarded* self-loop, discarding the real `-> Open`
+        // edge. The reaching-definitions pass must recover both edges with their
+        // mutually-exclusive guards and must NOT emit a blind self-loop.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/localvar"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(Set.of("Open", "Closed"), stateIds(m));
+
+        // Real targets, recovered through the reassignment, are present...
+        assertTrue(hasResolved(m, "Closed", "Open"), "Closed -> Open (guarded, via reassigned local)");
+        assertTrue(hasResolved(m, "Open", "Closed"), "Open -> Closed (guarded, via reassigned local)");
+        // ...as are the else-branch self-loops.
+        assertTrue(hasResolved(m, "Closed", "Closed"), "Closed -> Closed (else self-loop)");
+        assertTrue(hasResolved(m, "Open", "Open"), "Open -> Open (else self-loop)");
+
+        // The guarded edge carries the if-condition.
+        Transition guarded = m.transitions().stream()
+                .filter(t -> t.from().equals("Closed") && "Open".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(guarded.guard(), "reassignment target should record its guard");
+        assertTrue(guarded.guard().contains("Push"), "guard should reference the if-condition");
+
+        // Every self-loop must be guarded (the else path). A guardless self-loop
+        // is exactly the false, confidently-resolved edge F1 is about.
+        boolean blindSelfLoop = m.transitions().stream()
+                .anyMatch(t -> t.isResolved() && t.from().equals(t.to()) && t.guard() == null);
+        assertFalse(blindSelfLoop, "reassigned local must not emit an unguarded self-loop");
+    }
+
     // ---- negative control --------------------------------------------------
 
     @Test

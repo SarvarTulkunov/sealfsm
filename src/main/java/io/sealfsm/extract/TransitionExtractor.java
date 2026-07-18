@@ -3,19 +3,25 @@ package io.sealfsm.extract;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.model.Transition;
 import spoon.reflect.code.CtAbstractSwitch;
+import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtBlock;
 import spoon.reflect.code.CtCase;
 import spoon.reflect.code.CtExpression;
+import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtIf;
+import spoon.reflect.code.CtLocalVariable;
 import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtStatement;
 import spoon.reflect.code.CtSwitch;
 import spoon.reflect.code.CtSwitchExpression;
+import spoon.reflect.code.CtVariableAccess;
 import spoon.reflect.code.CtYieldStatement;
 import spoon.reflect.declaration.CtElement;
 import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtType;
+import spoon.reflect.declaration.CtVariable;
 import spoon.reflect.reference.CtTypeReference;
+import spoon.reflect.reference.CtVariableReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.ArrayList;
@@ -135,6 +141,12 @@ public final class TransitionExtractor {
             handleValue(ret.getReturnedExpression(), from, event, guard, out);
         } else if (node instanceof CtYieldStatement ys) {
             handleValue(ys.getExpression(), from, event, guard, out);
+        } else if (node instanceof CtAssignment<?, ?>) {
+            // A bare assignment statement is a *mutation* site, not a produced
+            // value. The field-mutation / setter encoding (F2) is out of v1 scope;
+            // treating the whole assignment as a returned value here only produced
+            // a spurious unresolved edge. Reassigned locals (F1) are read directly
+            // by the reaching-definitions pass, so nothing resolvable is lost.
         } else if (node instanceof CtExpression<?> expr) {
             // arrow-arm expression body: case X -> new A();  (statement is itself
             // an expression) or  case X -> switch (event) { ... };
@@ -197,9 +209,181 @@ public final class TransitionExtractor {
             walkSwitch(sw, from, event, guard, out);
             return;
         }
+        // F1: a read of a *reassigned local* must not be resolved from its
+        // declared type — a root-typed local (e.g. `Door next = current;`) would
+        // otherwise yield a false, guardless self-loop while the real target of an
+        // intervening `next = new Locked();` is lost. Recover the local's reaching
+        // definitions (each under its own path guard) instead.
+        if (value instanceof CtVariableAccess<?> va && isReassignedLocal(va)) {
+            handleReassignedLocal(va, from, event, guard, out);
+            return;
+        }
         for (TransitionResolver.Candidate cand : resolver.resolve(value, from)) {
             emit(from, event, merge(guard, cand.guard()), cand, out);
         }
+    }
+
+    // ---- F1: reaching-definitions for reassigned locals ----------------------
+
+    /** A candidate value of a local, with the path guard under which it is live. */
+    private record Def(CtExpression<?> rhs, String guard) {}
+
+    /**
+     * True when {@code va} reads a <em>local</em> variable that is assigned
+     * somewhere in its method. Such a read is intercepted before the resolver so
+     * its declared type never fabricates a self-loop; a non-reassigned local (a
+     * pattern binding, a single-init local) keeps the ordinary resolver path.
+     */
+    private boolean isReassignedLocal(CtVariableAccess<?> va) {
+        CtVariableReference<?> vref = va.getVariable();
+        if (vref == null || !(vref.getDeclaration() instanceof CtLocalVariable<?>)) {
+            return false;
+        }
+        return TransitionResolver.isReassigned(vref);
+    }
+
+    /**
+     * Resolve a reassigned local by intra-procedural, flow-sensitive reaching
+     * definitions over its declaring block. Each reaching right-hand side is fed
+     * back through {@link #handleValue} so constructor calls, self-loops
+     * ({@code current}), ternaries — and unresolvable helpers — are all handled
+     * uniformly. If the structured analysis cannot model the control flow, the
+     * whole read is emitted as one unresolved edge rather than guessed.
+     */
+    private void handleReassignedLocal(CtVariableAccess<?> va, String from, String event,
+                                       String guard, Set<Transition> out) {
+        CtVariableReference<?> vref = va.getVariable();
+        CtVariable<?> decl = vref == null ? null : vref.getDeclaration();
+        CtBlock<?> scope = decl == null ? null : decl.getParent(CtBlock.class);
+        List<Def> defs = scope == null ? null : reachingDefs(scope, va, decl, new ArrayList<>());
+        if (defs == null || defs.isEmpty()) {
+            out.add(Transition.unresolved(from == null ? "<unknown>" : from, event, guard, safeText(va)));
+            return;
+        }
+        for (Def d : defs) {
+            handleValue(d.rhs(), from, event, merge(guard, d.guard()), out);
+        }
+    }
+
+    /**
+     * Reaching definitions of {@code decl} at the point of {@code use}, threading
+     * the incoming set {@code in} through the structured control flow of the
+     * declaring block. Returns {@code null} — meaning "cannot prove" — when a
+     * construct outside the modelled subset (loops, try, nested switch) encloses
+     * the use.
+     */
+    private List<Def> reachingDefs(CtElement scope, CtVariableAccess<?> use,
+                                   CtVariable<?> decl, List<Def> in) {
+        if (scope instanceof CtReturn<?> || scope instanceof CtYieldStatement
+                || scope instanceof CtExpression<?>) {
+            // the use is the returned / yielded / arrow expression: value == `in`
+            return in;
+        }
+        if (scope instanceof CtBlock<?> block) {
+            List<Def> cur = in;
+            for (CtStatement st : block.getStatements()) {
+                if (contains(st, use)) {
+                    return reachingDefs(st, use, decl, cur);
+                }
+                cur = transfer(st, cur, decl);
+                if (cur == null) return null;
+            }
+            return cur;
+        }
+        if (scope instanceof CtIf ctIf) {
+            if (contains(ctIf.getThenStatement(), use)) {
+                return reachingDefs(ctIf.getThenStatement(), use, decl, in);
+            }
+            if (contains(ctIf.getElseStatement(), use)) {
+                return reachingDefs(ctIf.getElseStatement(), use, decl, in);
+            }
+            return null; // use sits in the condition — not modelled
+        }
+        return null; // loop / try / switch enclosing the use — bail
+    }
+
+    /**
+     * Transfer function for one statement: the reaching set after {@code st}
+     * executes, given the set {@code in} before it. An unconditional write kills
+     * all prior definitions; an {@code if} joins its branches, conjoining each
+     * side's guard with the (negated) condition. Returns {@code null} when the
+     * variable is written inside an unmodelled construct.
+     */
+    private List<Def> transfer(CtStatement st, List<Def> in, CtVariable<?> decl) {
+        String name = decl.getSimpleName();
+        if (st instanceof CtLocalVariable<?> lv) {
+            if (name.equals(lv.getSimpleName())) {
+                List<Def> out = new ArrayList<>();
+                CtExpression<?> init = lv.getDefaultExpression();
+                if (init != null) out.add(new Def(init, null));
+                return out; // declaration (re)binds the name
+            }
+            return in;
+        }
+        if (st instanceof CtAssignment<?, ?> asg) {
+            if (writesTo(asg.getAssigned(), name)) {
+                List<Def> out = new ArrayList<>();
+                out.add(new Def(asg.getAssignment(), null)); // kills all prior on this path
+                return out;
+            }
+            return in;
+        }
+        if (st instanceof CtBlock<?> block) {
+            List<Def> cur = in;
+            for (CtStatement s : block.getStatements()) {
+                cur = transfer(s, cur, decl);
+                if (cur == null) return null;
+            }
+            return cur;
+        }
+        if (st instanceof CtIf ctIf) {
+            boolean thenWrites = writesSomewhere(ctIf.getThenStatement(), name);
+            boolean elseWrites = writesSomewhere(ctIf.getElseStatement(), name);
+            if (!thenWrites && !elseWrites) return in; // neither branch touches it
+            List<Def> outThen = transferBranch(ctIf.getThenStatement(), in, decl);
+            List<Def> outElse = transferBranch(ctIf.getElseStatement(), in, decl);
+            if (outThen == null || outElse == null) return null;
+            String c = safeText(ctIf.getCondition());
+            List<Def> merged = new ArrayList<>();
+            for (Def d : outThen) merged.add(new Def(d.rhs(), merge(c, d.guard())));
+            for (Def d : outElse) merged.add(new Def(d.rhs(), merge(negate(c), d.guard())));
+            return merged;
+        }
+        // Unmodelled statement: safe to skip only if it leaves the variable alone.
+        return writesSomewhere(st, name) ? null : in;
+    }
+
+    private List<Def> transferBranch(CtStatement branch, List<Def> in, CtVariable<?> decl) {
+        return branch == null ? in : transfer(branch, in, decl);
+    }
+
+    /** Does {@code lhs} write the local named {@code name} (and not a field of that name)? */
+    private static boolean writesTo(CtExpression<?> lhs, String name) {
+        return lhs instanceof CtVariableAccess<?> va
+                && !(lhs instanceof CtFieldAccess<?>)
+                && va.getVariable() != null
+                && name.equals(va.getVariable().getSimpleName());
+    }
+
+    /** Is the local named {@code name} assigned anywhere within {@code stmt}? */
+    private static boolean writesSomewhere(CtStatement stmt, String name) {
+        if (stmt == null) return false;
+        for (CtAssignment<?, ?> a : stmt.getElements(new TypeFilter<>(CtAssignment.class))) {
+            if (writesTo(a.getAssigned(), name)) return true;
+        }
+        return false;
+    }
+
+    /** Is {@code node} the same element as, or a descendant of, {@code ancestor}? */
+    private static boolean contains(CtElement ancestor, CtElement node) {
+        if (ancestor == null || node == null) return false;
+        CtElement cur = node;
+        while (cur != null) {
+            if (cur == ancestor) return true;
+            if (!cur.isParentInitialized()) return false;
+            cur = cur.getParent();
+        }
+        return false;
     }
 
     /**

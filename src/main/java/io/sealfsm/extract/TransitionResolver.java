@@ -1,14 +1,18 @@
 package io.sealfsm.extract;
 
+import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtConditional;
 import spoon.reflect.code.CtConstructorCall;
 import spoon.reflect.code.CtExpression;
+import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtThisAccess;
 import spoon.reflect.code.CtVariableAccess;
+import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtVariable;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.reference.CtVariableReference;
+import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -152,7 +156,12 @@ public final class TransitionResolver {
             // `current` selector parameter, e.g. `return current;`) means "stay
             // in the matched state" -> self-loop to the from-state.
             if (dq.equals(rootQualifiedName)) {
-                if (fromSimpleName != null) {
+                // The "root-typed read means stay in the matched state" shortcut is
+                // sound only for the *unmodified* selector (e.g. `current`). A
+                // reassigned variable would fabricate a proven self-loop, so it is
+                // left unresolved here; reassigned *locals* are recovered upstream
+                // by the extractor's reaching-definitions pass (see F1).
+                if (fromSimpleName != null && !isReassigned(vref)) {
                     return Candidate.of(fromSimpleName, guard);
                 }
                 return Candidate.unresolved(guard, safeText(raw));
@@ -172,6 +181,33 @@ public final class TransitionResolver {
             }
         }
         return Candidate.unresolved(guard, safeText(raw));
+    }
+
+    /**
+     * True when the variable named by {@code vref} is written by some assignment
+     * in its declaring method. Keeps the "root-typed read → self-loop" shortcut
+     * restricted to the <em>unmodified</em> selector: a reassigned variable would
+     * otherwise be reported as a false, proven self-loop (see finding F1). This is
+     * package-visible so the extractor's reaching-definitions pass reuses the same
+     * notion of "reassigned".
+     */
+    static boolean isReassigned(CtVariableReference<?> vref) {
+        if (vref == null) return false;
+        CtVariable<?> decl = vref.getDeclaration();
+        if (decl == null) return false;
+        CtMethod<?> method = decl.getParent(CtMethod.class);
+        if (method == null) return false;
+        String name = vref.getSimpleName();
+        for (CtAssignment<?, ?> a : method.getElements(new TypeFilter<>(CtAssignment.class))) {
+            CtExpression<?> lhs = a.getAssigned();
+            if (lhs instanceof CtVariableAccess<?> vw
+                    && !(lhs instanceof CtFieldAccess<?>)
+                    && vw.getVariable() != null
+                    && name.equals(vw.getVariable().getSimpleName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String combine(String existing, String added) {

@@ -99,11 +99,12 @@ A single recursive, guard-carrying traversal handles both encodings. It descends
 | **Enclosing `if`** | Condition becomes the guard; its negation guards the `else`/fall-through branch |
 | **Value produced inside an `if`** (`if (e instanceof Coin) yield new Unlocked();`) | Recovered with the `if` condition as guard — not dropped |
 | **Guardless fall-through** (`if (cond) yield A; yield B;`) | `B` is guarded by `!(cond)` — mutually-exclusive guards threaded across sibling statements |
+| **Reassigned local** (`Gate next = current; if (e) next = new Open(); yield next;`) | Flow-sensitive **reaching-definitions** over the declaring block: each reaching value is resolved under its own path guard, so the guarded target and the else self-loop are both recovered — never a blind self-loop (finding F1) |
 | **Nested switch in an arm** (switch-over-event within switch-over-state) | Descended into, inheriting the arm's `from`-state |
 | **Arrow-arm expression body** (`case X -> new A();`) | Resolved directly as a produced value |
 | **`return` / `yield` / arrow forms** | All normalised to the same value-production path |
 | **Unrecognised switch case / unknown source** | Recorded as an unresolved (or undetermined-origin) edge **plus** a diagnostic |
-| **Loops, try/catch, local declarations** | Intentionally not descended for value production (reassigned locals are a v1 scope line) |
+| **Loops, try/catch** | Intentionally not descended for value production; a variable written inside one makes the reaching-definitions pass fall back to an unresolved edge (v1 scope line) |
 
 ### Layer 2 — expression resolver (`TransitionResolver`)
 
@@ -119,7 +120,7 @@ Given one produced expression, resolve the concrete target state(s).
 | Variable typed as concrete state | Resolved to that state | `Locked l = ...; return l;` |
 | `static final X INSTANCE = new X()` | Resolved via initializer | Singleton states |
 | `return helper()` | **Unresolved** (recorded) | Inter-procedural — v1 scope line |
-| Reassigned local | **Unresolved** (recorded) | Only declaration-site initializers resolve — v1 scope line |
+| Reassigned local (`next = …; return next;`) | Resolved per reaching definition | Handled upstream by the walker's reaching-definitions pass (Layer 1); only a write inside a loop/try leaves it unresolved |
 | Anything else | **Unresolved** (recorded) | Raw text preserved in `note` |
 
 ## Build
@@ -204,6 +205,7 @@ The `--returns` flag is especially useful: it shows the exact `CtExpression` sub
 | `examples/traffic` | distributed | 3 states; Red→Green→Yellow→Red; initial **Red**; 0 unresolved |
 | `examples/door` | centralized | 3 states; guarded + self-loop transitions; initial **Closed** |
 | `examples/turnstile` | centralized | 2 states; imperative `if`-guarded arms with fall-through self-loops |
+| `examples/localvar` | centralized | 2 states; next state via a **reassigned root-typed local** — guarded edge + else self-loop, no blind self-loop (finding F1) |
 | `examples/shape` | — (negative) | **rejected** as a plain sum type |
 
 The `examples/door` case deliberately exercises the hardest patterns: type-pattern `from`-states, constructor-call targets, a guarded ternary transition, and a `return current;` self-loop.
@@ -233,7 +235,7 @@ mvn test
 ## Known limitations (v1 scope)
 
 - **Inter-procedural targets** (`return helper();`) are recorded as unresolved, not chased.
-- **Reassigned locals** along a control-flow path are not tracked; only declaration-site initializers resolve.
+- **Reassigned locals** are tracked by a flow-sensitive reaching-definitions pass over straight-line + `if`/`else` code (finding F1); a variable written inside a loop, `try`, or nested switch still falls back to an unresolved edge.
 - **Event labels** are taken from method names in the distributed style; centralized-style event labelling and independent enumeration of a sealed `Event` alphabet are future work.
 - **Initial-state detection** is heuristic (field initializer, else the unique source-only state) and is flagged when it fails.
 
@@ -273,6 +275,7 @@ examples/
 ├── traffic/    # distributed State pattern (TrafficLight)
 ├── door/       # centralized switch (Door + sealed Event)
 ├── turnstile/  # centralized switch with if-guarded arms + fall-through
+├── localvar/   # reassigned root-typed local (reaching-definitions, F1)
 └── shape/      # negative control (plain sum type)
 sample-output/  # reference DOT/SCXML for diffing
 ```
