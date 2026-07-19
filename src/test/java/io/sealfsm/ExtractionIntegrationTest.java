@@ -273,6 +273,77 @@ class ExtractionIntegrationTest {
         assertEquals(2, stoppedToPlaying, "Play and Pause must be two distinct edges, not collapsed into one");
     }
 
+    @Test
+    void overlappingAndNonExhaustiveGuardsAreDiagnosed() {
+        // F5: two guarded state-field mutations in the same arm
+        //   if (coins >= 1) this.state = new Vending();
+        //   if (coins > 0)  this.state = new Idle();
+        // do not serialise into exclusive guards (assignments do not terminate
+        // the arm), so both edges are emitted with their raw, overlapping guards.
+        // The guard IR must flag the overlap (nondeterminism) and the uncovered
+        // coins <= 0 (non-exhaustiveness) — while keeping BOTH edges.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/nondeterministic"));
+        StateMachine m = single(r);
+
+        assertEquals(Set.of("Idle", "Vending"), stateIds(m));
+
+        // The invariant: diagnostics never remove an edge. Both overlapping edges
+        // out of Idle are still present.
+        assertTrue(hasResolved(m, "Idle", "Vending"), "Idle -> Vending still present");
+        assertTrue(hasResolved(m, "Idle", "Idle"), "Idle -> Idle (guarded self-loop) still present");
+
+        // Nondeterminism WARN for the overlapping guards from Idle.
+        boolean nondeterminism = r.diagnostics().stream()
+                .anyMatch(d -> d.severity() == ExtractionResult.Severity.WARN
+                        && d.message().toLowerCase().contains("nondetermin"));
+        assertTrue(nondeterminism, "overlapping guards should raise a nondeterminism WARN");
+
+        // Non-exhaustiveness WARN for the uncovered coins <= 0.
+        boolean coverageGap = r.diagnostics().stream()
+                .anyMatch(d -> d.severity() == ExtractionResult.Severity.WARN
+                        && d.message().toLowerCase().contains("non-exhaustive"));
+        assertTrue(coverageGap, "a numeric coverage gap should raise a non-exhaustiveness WARN");
+    }
+
+    @Test
+    void exhaustiveGuardsAreNotFalselyFlagged() {
+        // Precision guard for F5: the door's mutually-exclusive instanceof guards
+        //   Closed -> Locked [event instanceof Lock] / Closed -> Open [else]
+        // must NOT be reported as nondeterministic or non-exhaustive.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/door"));
+        boolean spurious = r.diagnostics().stream()
+                .anyMatch(d -> d.severity() == ExtractionResult.Severity.WARN
+                        && (d.message().toLowerCase().contains("nondetermin")
+                            || d.message().toLowerCase().contains("non-exhaustive")));
+        assertFalse(spurious, "exclusive guards must not raise guard-reasoning warnings");
+    }
+
+    @Test
+    void tryCatchAndLoopBodiesAreDescended() {
+        // F6: producers inside try/catch and a loop body were previously dropped.
+        //   case Running r -> { try { yield new Done(); } catch (Exception e) { yield new Failed(); } }
+        //   case Waiting w -> { while (retry()) { yield new Running(); } yield w; }
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/errorhandling"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(Set.of("Running", "Done", "Failed", "Waiting"), stateIds(m));
+
+        // The normal try-body producer.
+        assertTrue(hasResolved(m, "Running", "Done"), "Running -> Done (inside try body)");
+        // The error transition from the catch, carrying an exception guard.
+        assertTrue(hasResolved(m, "Running", "Failed"), "Running -> Failed (inside catch)");
+        Transition errorEdge = m.transitions().stream()
+                .filter(t -> t.from().equals("Running") && "Failed".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(errorEdge.guard(), "catch producer should carry a guard");
+        assertTrue(errorEdge.guard().toLowerCase().contains("exception"),
+                "catch guard should mark the transition as exceptional");
+
+        // The loop-body producer.
+        assertTrue(hasResolved(m, "Waiting", "Running"), "Waiting -> Running (inside while body)");
+    }
+
     // ---- negative control --------------------------------------------------
 
     @Test

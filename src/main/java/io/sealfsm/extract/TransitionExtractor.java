@@ -8,15 +8,18 @@ import spoon.reflect.code.CtAbstractSwitch;
 import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtBlock;
 import spoon.reflect.code.CtCase;
+import spoon.reflect.code.CtCatch;
 import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtIf;
 import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtLocalVariable;
+import spoon.reflect.code.CtLoop;
 import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtStatement;
 import spoon.reflect.code.CtSwitch;
 import spoon.reflect.code.CtSwitchExpression;
+import spoon.reflect.code.CtTry;
 import spoon.reflect.code.CtVariableAccess;
 import spoon.reflect.code.CtYieldStatement;
 import spoon.reflect.declaration.CtElement;
@@ -492,14 +495,32 @@ public final class TransitionExtractor {
                     handleValue(arg, from, event, guard, out);
                 }
             }
+        } else if (node instanceof CtTry tryStmt) {
+            // F6: descend exceptional flow. The try body runs under the normal
+            // guard; each catch under a synthetic "exception" guard (carrying the
+            // caught type) so a catch-block producer — the classic error
+            // transition, e.g. `catch (...) { yield new Failed(); }` — is
+            // recovered rather than silently dropped. The finally block, which
+            // always runs, is descended under the normal guard.
+            walk(tryStmt.getBody(), from, event, guard, out);
+            for (CtCatch cc : tryStmt.getCatchers()) {
+                walk(cc.getBody(), from, event, merge(guard, catchGuard(cc)), out);
+            }
+            walk(tryStmt.getFinalizer(), from, event, guard, out);
+        } else if (node instanceof CtLoop loop) {
+            // F6: a loop merely repeats the same transitions, so descend its body
+            // under the loop's entry condition. This is also the silent-miss
+            // enabler for F1/F2 — a producer or state mutation inside the loop
+            // would otherwise vanish with no unresolved marker.
+            walk(loop.getBody(), from, event, merge(guard, loopGuard(loop)), out);
         } else if (node instanceof CtExpression<?> expr) {
             // arrow-arm expression body: case X -> new A();  (statement is itself
             // an expression) or  case X -> switch (event) { ... };
             handleValue(expr, from, event, guard, out);
         }
-        // loops, try/catch, local-variable declarations and plain statements do
-        // not directly produce a next state (reassigned locals are a scope line),
-        // so they are intentionally not descended for value production.
+        // local-variable declarations and other plain statements do not directly
+        // produce a next state (reassigned locals are a scope line), so they are
+        // intentionally not descended for value production.
     }
 
     /**
@@ -895,6 +916,32 @@ public final class TransitionExtractor {
     private String caseGuard(CtCase<?> c) {
         Object guard = tryMethod(c, "getGuard");
         return guard == null ? null : safeText(guard);
+    }
+
+    /**
+     * Synthetic guard for a catch-block producer (F6): {@code "exception"}, with
+     * the caught type in parentheses when it can be read. Attribution of the
+     * catch is best-effort and never throws.
+     */
+    private String catchGuard(CtCatch cc) {
+        Object param = tryMethod(cc, "getParameter");
+        Object type = param == null ? null : tryMethod(param, "getType");
+        if (type instanceof CtTypeReference<?> ref) {
+            return "exception (" + ref.getSimpleName() + ")";
+        }
+        return "exception";
+    }
+
+    /**
+     * The entry condition of a loop (F6), used as the guard on producers inside
+     * the body. {@code while}/{@code do} expose {@code getLoopingExpression};
+     * {@code for} exposes {@code getExpression}; {@code for-each} has neither and
+     * yields a {@code null} (unconditional) guard.
+     */
+    private String loopGuard(CtLoop loop) {
+        Object cond = tryMethod(loop, "getLoopingExpression");
+        if (cond == null) cond = tryMethod(loop, "getExpression");
+        return cond == null ? null : safeText(cond);
     }
 
     // ---- misc -----------------------------------------------------------------

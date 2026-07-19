@@ -1,5 +1,6 @@
 package io.sealfsm;
 
+import io.sealfsm.analyze.GuardAnalysis;
 import io.sealfsm.detect.SealedHierarchyDetector;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
@@ -69,6 +70,13 @@ public final class Analyzer {
             }
             for (String d : te.diagnostics()) {
                 result.warn(root.getQualifiedName(), d);
+            }
+            // F5: guard-level defect detection over the recovered edges —
+            // overlapping guards (possible nondeterminism) and numeric coverage
+            // gaps (possible missing transition). Diagnostics only: no edge is
+            // removed or merged, preserving the record-everything invariant.
+            for (String w : GuardAnalysis.check(machine)) {
+                result.warn(root.getQualifiedName(), w);
             }
 
             detectInitialState(root, machine, model)
