@@ -18,6 +18,15 @@ import java.util.Set;
  */
 public final class StateMachine {
 
+    /**
+     * Synthetic source used for <em>initial-state edges</em> (finding F7): a
+     * producer reached on the path where the selector matches none of the
+     * permitted subtypes (machine entry) is recorded as an edge from this
+     * pseudo-state rather than mis-attributed to a real state or dropped. It is
+     * deliberately not a member of {@link #allStates()}.
+     */
+    public static final String INITIAL_PSEUDO_STATE = "<initial>";
+
     /** How transitions are encoded in the analysed source. */
     public enum Encoding {
         /** Classic State pattern: each state class has its own transition method(s). */

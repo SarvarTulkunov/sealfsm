@@ -2,10 +2,13 @@ package io.sealfsm.extract;
 
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
+import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.Transition;
 import spoon.reflect.CtModel;
+import spoon.reflect.code.BinaryOperatorKind;
 import spoon.reflect.code.CtAbstractSwitch;
 import spoon.reflect.code.CtAssignment;
+import spoon.reflect.code.CtBinaryOperator;
 import spoon.reflect.code.CtBlock;
 import spoon.reflect.code.CtCase;
 import spoon.reflect.code.CtCatch;
@@ -13,6 +16,7 @@ import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtIf;
 import spoon.reflect.code.CtInvocation;
+import spoon.reflect.code.CtLambda;
 import spoon.reflect.code.CtLocalVariable;
 import spoon.reflect.code.CtLoop;
 import spoon.reflect.code.CtReturn;
@@ -20,6 +24,7 @@ import spoon.reflect.code.CtStatement;
 import spoon.reflect.code.CtSwitch;
 import spoon.reflect.code.CtSwitchExpression;
 import spoon.reflect.code.CtTry;
+import spoon.reflect.code.CtTypeAccess;
 import spoon.reflect.code.CtVariableAccess;
 import spoon.reflect.code.CtYieldStatement;
 import spoon.reflect.declaration.CtElement;
@@ -85,7 +90,16 @@ public final class TransitionExtractor {
 
     private final TransitionResolver resolver;
     private final Set<String> hierarchyQualifiedNames;
+    private final String rootQualifiedName;
     private final List<String> diagnostics = new ArrayList<>();
+
+    // F7: functional-callable walk context. The selector is the root-typed value
+    // the current callable dispatches on (a parameter, threaded so `instanceof`
+    // tests and `return <selector>` resolve against it); the concrete-state names
+    // seed the entry from-set (every permitted subtype the selector could be).
+    // Both are set only while a functional callable is walked.
+    private CtVariable<?> selector = null;
+    private Set<String> concreteStateSimpleNames = Set.of();
 
     // F2: mutation-encoding context, populated only while the GoF/mutation
     // fallback runs (a hierarchy with no return-based transition method). Left
@@ -109,6 +123,7 @@ public final class TransitionExtractor {
 
     public TransitionExtractor(Set<String> hierarchyQualifiedNames, String rootQualifiedName) {
         this.hierarchyQualifiedNames = hierarchyQualifiedNames;
+        this.rootQualifiedName = rootQualifiedName;
         this.resolver = new TransitionResolver(hierarchyQualifiedNames, rootQualifiedName);
     }
 
@@ -125,6 +140,17 @@ public final class TransitionExtractor {
         Set<Transition> out = new LinkedHashSet<>();
         List<CtMethod<?>> distributed = StateMachineClassifier.findDistributedTransitionMethods(root);
         List<CtMethod<?>> centralized = StateMachineClassifier.findCentralizedTransitionMethods(root, model);
+        // F7: transition callables expressed as lambdas / anonymous-class methods.
+        List<CtElement> functional = StateMachineClassifier.findFunctionalTransitionCallables(root, model);
+
+        // The concrete states the selector can be, used to seed the functional
+        // walk's entry from-set (finding F7).
+        this.concreteStateSimpleNames = new LinkedHashSet<>();
+        for (CtType<?> t : StateMachineClassifier.hierarchyTypes(root)) {
+            if (!t.getQualifiedName().equals(rootQualifiedName)) {
+                concreteStateSimpleNames.add(t.getSimpleName());
+            }
+        }
 
         // F3: a transition function that is *invoked* by another transition
         // function is an inter-procedural helper — its return values are folded
@@ -138,11 +164,14 @@ public final class TransitionExtractor {
         for (CtMethod<?> m : centralized) {
             if (!helperSignatures.contains(m.getSignature())) extractCentralized(m, out);
         }
+        for (CtElement callable : functional) {
+            extractFunctional(callable, out);
+        }
         // F2: GoF / field-mutation encoding. Run only as a fallback when no
         // return-based transition method exists, so a hierarchy that already
         // exposes a functional transition is left untouched — a context that
         // merely stores a functional result is not re-mined as a transition here.
-        if (distributed.isEmpty() && centralized.isEmpty()) {
+        if (distributed.isEmpty() && centralized.isEmpty() && functional.isEmpty()) {
             extractMutationEncoding(root, model, out);
         }
         if (interProcResolvedEdges > 0) {
@@ -244,6 +273,252 @@ public final class TransitionExtractor {
                 eventQualifiedNames.add(ref.getQualifiedName());
             }
             alphabet.addAll(symbols);
+        }
+    }
+
+    // ---- functional transition callables (F7) --------------------------------
+
+    /**
+     * Walk a transition callable supplied as a functional value — a lambda or an
+     * anonymous-class method — rather than a named function. The algorithm is the
+     * same as for a named centralized function (dispatch on a selector, produce
+     * the next state per arm); only the <em>mechanism</em> differs: the from-state
+     * is attributed through {@code if (selector instanceof T)} tests instead of a
+     * {@code switch}, and the event label is the enclosing method's name.
+     *
+     * <p>The selector is the callable's root-typed input. At entry it could be any
+     * permitted subtype, or nothing yet ({@link StateMachine#INITIAL_PSEUDO_STATE
+     * machine entry}); each {@code instanceof} test narrows this from-set as the
+     * walk descends.
+     */
+    private void extractFunctional(CtElement callable, Set<Transition> out) {
+        List<CtParameter<?>> params = callableParameters(callable);
+        CtVariable<?> sel = selectorParameter(params);
+        if (sel == null) {
+            // No hierarchy-typed input: not a dispatch we can attribute. Record
+            // nothing rather than guess — the callable is left as a gap.
+            return;
+        }
+        CtElement body = callableBody(callable);
+        if (body == null) return;
+
+        this.selector = sel;
+        try {
+            walkFunctional(body, FromCtx.all(concreteStateSimpleNames), functionalEventLabel(callable), null, out);
+        } finally {
+            this.selector = null;
+        }
+    }
+
+    /**
+     * The from-context of a functional-callable walk: the set of concrete states
+     * the selector may still be on this path, plus whether the machine-entry
+     * residual (selector matched no permitted subtype) is included. A single
+     * producer fires one edge per possible from-state.
+     */
+    private record FromCtx(Set<String> states, boolean entry) {
+        static FromCtx all(Set<String> states) {
+            return new FromCtx(new LinkedHashSet<>(states), true);
+        }
+        static FromCtx of(String state) {
+            return new FromCtx(new LinkedHashSet<>(Set.of(state)), false);
+        }
+        FromCtx without(String t) {
+            Set<String> s = new LinkedHashSet<>(states);
+            s.remove(t);
+            return new FromCtx(s, entry);
+        }
+    }
+
+    /**
+     * Descend a functional callable's control flow, attributing the from-state
+     * through {@code instanceof} dispatch and threading the entry/residual set.
+     */
+    private void walkFunctional(CtElement node, FromCtx ctx, String event, String guard, Set<Transition> out) {
+        if (node == null) return;
+
+        if (node instanceof CtBlock<?> block) {
+            walkFunctionalBlock(block, ctx, event, guard, out);
+        } else if (node instanceof CtIf ctIf) {
+            String subtype = selectorInstanceOfSubtype(ctIf.getCondition());
+            if (subtype != null) {
+                // Type test on the selector: the then-branch runs with from = T and
+                // the instanceof itself is NOT recorded as a data guard (F7 rule 3).
+                walkFunctional(ctIf.getThenStatement(), FromCtx.of(subtype), event, guard, out);
+                if (ctIf.getElseStatement() != null) {
+                    walkFunctional(ctIf.getElseStatement(), ctx.without(subtype), event, guard, out);
+                }
+            } else {
+                // Ordinary data guard: split the path condition, from-set unchanged.
+                String cond = safeText(ctIf.getCondition());
+                walkFunctional(ctIf.getThenStatement(), ctx, event, merge(guard, cond), out);
+                walkFunctional(ctIf.getElseStatement(), ctx, event, merge(guard, negate(cond)), out);
+            }
+        } else if (node instanceof CtSwitch<?> sw) {
+            // A switch inside the callable dispatches on the state itself; reuse the
+            // shared switch attribution (from = matched pattern), ignoring the set.
+            walkSwitch(sw, null, event, guard, out);
+        } else if (node instanceof CtReturn<?> ret) {
+            handleFunctionalValue(ret.getReturnedExpression(), ctx, event, guard, out);
+        } else if (node instanceof CtYieldStatement ys) {
+            handleFunctionalValue(ys.getExpression(), ctx, event, guard, out);
+        } else if (node instanceof CtExpression<?> expr && isHierarchyTyped(expr)) {
+            // An expression statement / arrow body whose static type is within the
+            // hierarchy is a producer. Every other bare statement — a void call, a
+            // collection mutation, a flag write — is an ACTION and skipped (F7
+            // rule 6): the exclusion is derived from the type, not enumerated.
+            handleFunctionalValue(expr, ctx, event, guard, out);
+        }
+    }
+
+    /**
+     * Walk a functional block, threading the entry/residual from-set and the
+     * data-guard fall-through across siblings. When an {@code if (selector
+     * instanceof T)} definitely terminates its then-branch, subsequent siblings
+     * exclude T from the residual; when it falls through, T stays reachable and
+     * the set is unchanged (F7 rule 4).
+     */
+    private void walkFunctionalBlock(CtBlock<?> block, FromCtx ctx, String event,
+                                     String guard, Set<Transition> out) {
+        FromCtx acc = ctx;
+        String accGuard = guard;
+        for (CtStatement st : block.getStatements()) {
+            walkFunctional(st, acc, event, accGuard, out);
+            if (st instanceof CtIf ctIf) {
+                String subtype = selectorInstanceOfSubtype(ctIf.getCondition());
+                boolean noElse = ctIf.getElseStatement() == null;
+                boolean thenTerminates = alwaysTerminates(ctIf.getThenStatement());
+                if (subtype != null) {
+                    if (noElse && thenTerminates) acc = acc.without(subtype);
+                } else if (noElse && thenTerminates) {
+                    accGuard = merge(accGuard, negate(safeText(ctIf.getCondition())));
+                }
+            } else if (alwaysTerminates(st)) {
+                break; // remaining statements are unreachable
+            }
+        }
+    }
+
+    /** Resolve one produced value against every possible from-state in the set. */
+    private void handleFunctionalValue(CtExpression<?> value, FromCtx ctx, String event,
+                                       String guard, Set<Transition> out) {
+        if (value == null) return;
+        for (String from : ctx.states()) {
+            handleValue(value, from, event, guard, out);
+        }
+        if (ctx.entry()) {
+            handleEntryValue(value, event, guard, out);
+        }
+    }
+
+    /**
+     * A producer reached on the entry residual (selector matched no permitted
+     * subtype) establishes the machine's <em>initial</em> state: emit it as an
+     * edge from {@link StateMachine#INITIAL_PSEUDO_STATE} (F7 rule 4). A bare
+     * selector return here is the identity — there is no concrete initial target —
+     * and is skipped rather than fabricated as a self-loop.
+     */
+    private void handleEntryValue(CtExpression<?> value, String event, String guard, Set<Transition> out) {
+        if (isSelectorExpr(value)) return;
+        if (value instanceof CtSwitchExpression<?, ?> sw) {
+            walkFunctional(sw, new FromCtx(Set.of(), true), event, guard, out);
+            return;
+        }
+        for (TransitionResolver.Candidate cand : resolver.resolve(value, null)) {
+            String g = merge(guard, cand.guard());
+            if (cand.resolved()) {
+                out.add(Transition.resolved(StateMachine.INITIAL_PSEUDO_STATE, cand.targetSimpleName(), event, g));
+            } else {
+                out.add(Transition.unresolved(StateMachine.INITIAL_PSEUDO_STATE, event, g, cand.raw()));
+            }
+        }
+    }
+
+    // ---- selector / instanceof attribution (shared F7 rule) ------------------
+
+    /**
+     * If {@code cond} is {@code <selector> instanceof T} where T is a permitted
+     * subtype, return T's simple name; otherwise {@code null}. This is the single
+     * type-test → from-state rule shared with the {@code switch} case attribution:
+     * whether the type test is written as a {@code switch} pattern or an
+     * {@code instanceof} does not change which subtype it selects.
+     */
+    private String selectorInstanceOfSubtype(CtExpression<?> cond) {
+        if (!(cond instanceof CtBinaryOperator<?> bin)) return null;
+        if (bin.getKind() != BinaryOperatorKind.INSTANCEOF) return null;
+        if (!isSelectorExpr(bin.getLeftHandOperand())) return null;
+        CtTypeReference<?> t = instanceofType(bin.getRightHandOperand());
+        if (t != null && hierarchyQualifiedNames.contains(t.getQualifiedName())
+                && !t.getQualifiedName().equals(rootQualifiedName)) {
+            return t.getSimpleName();
+        }
+        return null;
+    }
+
+    /**
+     * The type an {@code instanceof} tests for, whether unbound
+     * ({@code x instanceof T}, a {@link CtTypeAccess}) or a bound type pattern
+     * ({@code x instanceof T t}, read reflectively via {@link #patternType}).
+     */
+    private CtTypeReference<?> instanceofType(CtExpression<?> rhs) {
+        if (rhs == null) return null;
+        if (rhs instanceof CtTypeAccess<?> ta) return ta.getAccessedType();
+        CtTypeReference<?> pt = patternType(rhs);
+        if (pt != null) return pt;
+        return rhs.getType();
+    }
+
+    /** True when {@code e} reads the current selector variable. */
+    private boolean isSelectorExpr(CtExpression<?> e) {
+        if (selector == null || !(e instanceof CtVariableAccess<?> va) || va.getVariable() == null) {
+            return false;
+        }
+        CtVariableReference<?> vref = va.getVariable();
+        if (vref.getDeclaration() == selector) return true;
+        return selector.getSimpleName().equals(vref.getSimpleName());
+    }
+
+    private List<CtParameter<?>> callableParameters(CtElement callable) {
+        if (callable instanceof CtMethod<?> m) return m.getParameters();
+        if (callable instanceof CtLambda<?> l) return l.getParameters();
+        return List.of();
+    }
+
+    private CtElement callableBody(CtElement callable) {
+        if (callable instanceof CtMethod<?> m) return m.getBody();
+        if (callable instanceof CtLambda<?> l) {
+            return l.getBody() != null ? l.getBody() : l.getExpression();
+        }
+        return null;
+    }
+
+    /**
+     * The selector parameter: the input whose declared type is the sealed root
+     * (the value the callable dispatches on). Falls back to any hierarchy-typed
+     * parameter if none is exactly the root.
+     */
+    private CtVariable<?> selectorParameter(List<CtParameter<?>> params) {
+        for (CtParameter<?> p : params) {
+            CtTypeReference<?> t = p.getType();
+            if (t != null && rootQualifiedName.equals(t.getQualifiedName())) return p;
+        }
+        for (CtParameter<?> p : params) {
+            CtTypeReference<?> t = p.getType();
+            if (t != null && hierarchyQualifiedNames.contains(t.getQualifiedName())) return p;
+        }
+        return null;
+    }
+
+    /**
+     * Event label for a functional callable (F7 rule 7): the simple name of the
+     * enclosing method that supplies it (neutral names elided as elsewhere).
+     */
+    private String functionalEventLabel(CtElement callable) {
+        try {
+            CtMethod<?> enclosing = callable.getParent(CtMethod.class);
+            return enclosing == null ? null : eventName(enclosing);
+        } catch (Throwable t) {
+            return null;
         }
     }
 

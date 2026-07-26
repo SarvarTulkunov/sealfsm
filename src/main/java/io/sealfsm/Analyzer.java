@@ -107,6 +107,15 @@ public final class Analyzer {
     private Optional<String> detectInitialState(CtType<?> root, StateMachine machine, CtModel model) {
         Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
 
+        // F7: a callable that produces a state on the machine-entry residual has
+        // already named the initial state explicitly (an edge from the initial
+        // pseudo-state). That is a direct signal, so it wins over the heuristics.
+        for (Transition t : machine.transitions()) {
+            if (StateMachine.INITIAL_PSEUDO_STATE.equals(t.from())) {
+                return Optional.of(StateMachine.INITIAL_PSEUDO_STATE);
+            }
+        }
+
         for (CtField<?> field : model.getElements(new TypeFilter<>(CtField.class))) {
             CtTypeReference<?> ft = field.getType();
             if (ft == null || !hierarchy.contains(ft.getQualifiedName())) continue;

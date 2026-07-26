@@ -344,6 +344,56 @@ class ExtractionIntegrationTest {
         assertTrue(hasResolved(m, "Waiting", "Running"), "Waiting -> Running (inside while body)");
     }
 
+    @Test
+    void instanceofDispatchAndFunctionalCallablesAreExtracted() {
+        // F7: the transition functions are anonymous BiFunctions (not named
+        // switch methods), and each dispatches on its root-typed `apply` selector
+        // with `if (current instanceof Cancelled)` rather than a switch. The
+        // walker must discover the callables by signature, attribute from-states
+        // through the instanceof test, treat the residual as machine entry, label
+        // edges with the enclosing method, and skip side-effecting actions.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/cancellation"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(Set.of("Pending", "Cancelled"), stateIds(m));
+
+        // Required resolved edges, each labelled by the enclosing method.
+        assertTrue(hasEventEdge(m, "Pending", "add", "Cancelled"), "Pending --add--> Cancelled");
+        assertTrue(hasEventEdge(m, "Cancelled", "add", "Cancelled"), "Cancelled --add--> Cancelled (self-loop)");
+        assertTrue(hasEventEdge(m, "Cancelled", "subscribe", "Cancelled"),
+                "Cancelled --subscribe--> Cancelled (self-loop)");
+        assertTrue(hasEventEdge(m, "Pending", "subscribe", "Pending"),
+                "Pending --subscribe--> Pending (self-loop)");
+
+        // Recommended initial-state edges from the entry residual.
+        String init = StateMachine.INITIAL_PSEUDO_STATE;
+        assertTrue(hasEventEdge(m, init, "add", "Cancelled"), "<initial> --add--> Cancelled");
+        assertTrue(hasEventEdge(m, init, "subscribe", "Pending"), "<initial> --subscribe--> Pending");
+        assertEquals(init, m.initialState().orElse(null), "initial state is the entry pseudo-state");
+
+        // Every recovered edge is resolved — the instanceof dispatch attributes a
+        // real from-state to each producer, so nothing is left undetermined.
+        assertEquals(0, m.unresolvedTransitionCount(), "instanceof dispatch resolves every producer");
+
+        // ABSENT: no undetermined-origin edge — the from-state is always attributed.
+        assertFalse(m.transitions().stream().anyMatch(t -> "<unknown>".equals(t.from())),
+                "no edge may have an undetermined source state");
+
+        // ABSENT: no edge touches a non-hierarchy type. Actions (cb.run(),
+        // pending.add(cb)) must never become edges; the only non-state endpoint
+        // allowed is the synthetic initial pseudo-state.
+        Set<String> allowed = Set.of("Pending", "Cancelled", init);
+        boolean foreignEndpoint = m.transitions().stream()
+                .anyMatch(t -> !allowed.contains(t.from())
+                        || (t.isResolved() && !allowed.contains(t.to())));
+        assertFalse(foreignEndpoint, "no edge may touch a non-hierarchy type (actions are not transitions)");
+
+        // The two events are the enclosing method names, recovered into Σ.
+        assertTrue(m.alphabet().contains("add") && m.alphabet().contains("subscribe"),
+                "enclosing-method event labels populate the alphabet");
+    }
+
     // ---- negative control --------------------------------------------------
 
     @Test
