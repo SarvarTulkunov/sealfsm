@@ -18,6 +18,15 @@ import java.util.Set;
  */
 public final class StateMachine {
 
+    /**
+     * Synthetic source used for <em>initial-state edges</em> (finding F7): a
+     * producer reached on the path where the selector matches none of the
+     * permitted subtypes (machine entry) is recorded as an edge from this
+     * pseudo-state rather than mis-attributed to a real state or dropped. It is
+     * deliberately not a member of {@link #allStates()}.
+     */
+    public static final String INITIAL_PSEUDO_STATE = "<initial>";
+
     /** How transitions are encoded in the analysed source. */
     public enum Encoding {
         /** Classic State pattern: each state class has its own transition method(s). */
@@ -55,6 +64,16 @@ public final class StateMachine {
     public void addTransition(Transition t) {
         transitions.add(Objects.requireNonNull(t));
         if (t.event() != null) alphabet.add(t.event());
+    }
+
+    /**
+     * Add an input symbol to the alphabet Σ independently of the transitions.
+     * Used to record the <em>complete</em>, closed-world event set enumerated
+     * from a sealed/enum event type (finding F4) — including events the
+     * transition function ignores, which therefore appear on no edge.
+     */
+    public void addAlphabetSymbol(String symbol) {
+        if (symbol != null && !symbol.isBlank()) alphabet.add(symbol);
     }
 
     public void setInitialState(String id) {

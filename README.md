@@ -8,8 +8,8 @@ SealFSM reads Java source, finds `sealed` type hierarchies that encode state mac
 
 A `sealed` interface lists its implementations in a compiler-checked `permits` clause. That makes the set of subtypes **closed and exhaustive**. SealFSM exploits this in two steps that make claims of *different strength* — keeping them separate is the whole point:
 
-1. **State enumeration is provably complete.** Every permitted subtype is a state; the `permits` clause guarantees there are no others. This is exact, not heuristic.
-2. **Transition extraction is approximate.** Transitions are recovered by intra-procedural data-flow analysis over the transition code. This is empirical and is reported with precision/recall, never presented as complete.
+1. **State enumeration is provably complete.** Every permitted subtype is a state; the `permits` clause guarantees there are no others. This is exact, not heuristic. When the *event* type is itself a sealed hierarchy or an enum, the input alphabet Σ is recovered the same exact way (finding F4) — so both the state set Q *and* Σ come soundly from the closed-world structure.
+2. **Transition extraction is approximate.** Transitions — the transition relation δ connecting states over events — are recovered by intra-procedural data-flow analysis over the transition code. This is empirical and is reported with precision/recall, never presented as complete.
 
 The tool is built around that asymmetry. Anything it cannot resolve on the transition side is **recorded as an explicit unresolved edge** (a dashed red arrow in DOT, an XML comment in SCXML) rather than silently dropped, so gaps depress recall visibly instead of masquerading as a complete model.
 
@@ -81,6 +81,7 @@ The tool is built around that asymmetry. Anything it cannot resolve on the trans
 
 - **Distributed** (classic State pattern): each state class has a transition method returning the hierarchy type. Example: `examples/traffic` — `Red.next()` returns `new Green()`.
 - **Centralized** (single transition function): a pattern-matching `switch` over the current state. Example: `examples/door` — `DoorMachine.transition(Door current, Event event)`.
+- **Mutation / GoF State** (finding F2): transitions happen by *mutating* a state field (`this.state = new Locked()`) or calling a state mutator (`ctx.setState(new Locked())`) rather than returning the next state. Recovered as a **fallback** when a hierarchy exposes no return-based transition method, so functional hierarchies are never re-mined. Example: `examples/gofcontext`. Because such a hierarchy is invisible to the structural classifier, it opts in with the `@Fsm` marker (structural detection of the GoF family is a follow-up).
 
 ## Covered transition logic cases
 
@@ -95,15 +96,19 @@ A single recursive, guard-carrying traversal handles both encodings. It descends
 | **Distributed method** (`Red.next()` on a state class) | `from` = declaring state class; `event` = method name (neutral names like `next`/`transition`/`step`/`advance`/`tick` → no label) |
 | **Centralized method** (`transition(State, Event)`) | `from` = matched type-pattern per switch arm; `event` = `null` (v1 scope line) |
 | **Type-pattern switch arm** (`case Locked l -> …`) | Arm's matched type becomes the `from`-state |
+| **Switch-over-event arm** (`case Lock l -> …` inside a `switch (event)`) | Arm's matched event becomes the transition's event label; the alphabet Σ is enumerated from the sealed/enum event type (finding F4) |
 | **Guarded pattern** (`case Locked l when …`) | `when` clause becomes the transition guard |
 | **Enclosing `if`** | Condition becomes the guard; its negation guards the `else`/fall-through branch |
 | **Value produced inside an `if`** (`if (e instanceof Coin) yield new Unlocked();`) | Recovered with the `if` condition as guard — not dropped |
 | **Guardless fall-through** (`if (cond) yield A; yield B;`) | `B` is guarded by `!(cond)` — mutually-exclusive guards threaded across sibling statements |
+| **Reassigned local** (`Gate next = current; if (e) next = new Open(); yield next;`) | Flow-sensitive **reaching-definitions** over the declaring block: each reaching value is resolved under its own path guard, so the guarded target and the else self-loop are both recovered — never a blind self-loop (finding F1) |
 | **Nested switch in an arm** (switch-over-event within switch-over-state) | Descended into, inheriting the arm's `from`-state |
 | **Arrow-arm expression body** (`case X -> new A();`) | Resolved directly as a produced value |
+| **State-field write** (`this.state = new Locked();`) | Mutation-encoding transition site (F2); the RHS is the next-state expression, resolved like a return value |
+| **State mutator call** (`ctx.setState(new Locked());`) | Mutation-encoding transition site (F2); the hierarchy-typed argument is the next state; from-state = declaring state class for GoF callbacks |
 | **`return` / `yield` / arrow forms** | All normalised to the same value-production path |
 | **Unrecognised switch case / unknown source** | Recorded as an unresolved (or undetermined-origin) edge **plus** a diagnostic |
-| **Loops, try/catch, local declarations** | Intentionally not descended for value production (reassigned locals are a v1 scope line) |
+| **Loops, try/catch** | Intentionally not descended for value production; a variable written inside one makes the reaching-definitions pass fall back to an unresolved edge (v1 scope line) |
 
 ### Layer 2 — expression resolver (`TransitionResolver`)
 
@@ -118,8 +123,8 @@ Given one produced expression, resolve the concrete target state(s).
 | `cond ? a : b` | Two guarded transitions | `(event instanceof Lock) ? new Locked() : new Open()` |
 | Variable typed as concrete state | Resolved to that state | `Locked l = ...; return l;` |
 | `static final X INSTANCE = new X()` | Resolved via initializer | Singleton states |
-| `return helper()` | **Unresolved** (recorded) | Inter-procedural — v1 scope line |
-| Reassigned local | **Unresolved** (recorded) | Only declaration-site initializers resolve — v1 scope line |
+| `return helper()` / `return factory.make()` | Resolved via bounded inter-procedural summary | The callee's return values are folded into the call site (finding F3), depth-limited to k = 2 with cycle detection; a library/abstract callee or an out-of-budget target stays **unresolved** |
+| Reassigned local (`next = …; return next;`) | Resolved per reaching definition | Handled upstream by the walker's reaching-definitions pass (Layer 1); only a write inside a loop/try leaves it unresolved |
 | Anything else | **Unresolved** (recorded) | Raw text preserved in `note` |
 
 ## Build
@@ -204,11 +209,17 @@ The `--returns` flag is especially useful: it shows the exact `CtExpression` sub
 | `examples/traffic` | distributed | 3 states; Red→Green→Yellow→Red; initial **Red**; 0 unresolved |
 | `examples/door` | centralized | 3 states; guarded + self-loop transitions; initial **Closed** |
 | `examples/turnstile` | centralized | 2 states; imperative `if`-guarded arms with fall-through self-loops |
+| `examples/localvar` | centralized | 2 states; next state via a **reassigned root-typed local** — guarded edge + else self-loop, no blind self-loop (finding F1) |
+| `examples/gofcontext` | mutation / GoF | 3 states; transitions via `ctx.setState(...)` field mutation; recovers the **same edge set** as `examples/door` (finding F2) |
+| `examples/factory` | centralized | 3 states; arms **delegate to helper/factory methods**; resolved via bounded inter-procedural summaries, out-of-budget target stays unresolved (finding F3) |
+| `examples/eventalphabet` | centralized | 3 states; nested `switch (event)` — recovers Σ = {Play, Pause, Stop, Skip} from the sealed event type and labels each edge with its event (finding F4) |
 | `examples/shape` | — (negative) | **rejected** as a plain sum type |
 
 The `examples/door` case deliberately exercises the hardest patterns: type-pattern `from`-states, constructor-call targets, a guarded ternary transition, and a `return current;` self-loop.
 
 The `examples/turnstile` case targets the control-flow walker directly: each switch arm contains an imperative `if (event instanceof …) yield new X();` followed by a fall-through `yield` of the current state. It verifies that values produced *inside* an `if` are recovered with the condition as guard, and that the guardless fall-through is guarded by the negated condition.
+
+The `examples/gofcontext` case is the GoF State pattern: the `PortalContext` holds a state field and each state's `handle(ctx, event)` method transitions by calling `ctx.setState(new …())`. It proves the mutation encoding converges on the same FSM as the return-based `examples/door`. (It carries an `@Fsm` marker because a hierarchy whose transitions are pure field mutations is not recognised by the structural classifier — detecting that family automatically is future work.)
 
 `sample-output/` contains the reference DOT/SCXML that the tool should produce. After building, `diff` your output against these to verify correctness.
 
@@ -232,9 +243,10 @@ mvn test
 
 ## Known limitations (v1 scope)
 
-- **Inter-procedural targets** (`return helper();`) are recorded as unresolved, not chased.
-- **Reassigned locals** along a control-flow path are not tracked; only declaration-site initializers resolve.
-- **Event labels** are taken from method names in the distributed style; centralized-style event labelling and independent enumeration of a sealed `Event` alphabet are future work.
+- **Inter-procedural targets** (`return helper();`, `return factory.make();`) are chased with bounded return-value summaries (finding F3), depth-limited to k = 2 with cycle detection and reported as a separate, precision-sensitive count in diagnostics; a library/abstract callee, a callee whose returns hide inside a switch/loop, or a target beyond the budget stays unresolved.
+- **Reassigned locals** are tracked by a flow-sensitive reaching-definitions pass over straight-line + `if`/`else` code (finding F1); a variable written inside a loop, `try`, or nested switch still falls back to an unresolved edge.
+- **Mutation / GoF State** transitions (field write or `setState` call) are recovered (finding F2), but only as a fallback and only once the hierarchy is classified as an FSM — a pure-mutation hierarchy currently needs the `@Fsm` marker, since detecting the GoF family structurally (without false-positiving on mutable-field sum types) is future work.
+- **Event labels & alphabet Σ.** The alphabet is enumerated exactly and completely from a sealed/enum event parameter — the same closed-world trick used for states (finding F4) — and a `switch (event)` labels each edge with its matched event. Still open: attributing events carried by `instanceof`/ternary guards (as in `examples/door`, whose Σ is recovered but whose edges stay guard-labelled) and mutation-style (GoF) event labelling.
 - **Initial-state detection** is heuristic (field initializer, else the unique source-only state) and is flagged when it fails.
 
 ## Project layout
@@ -273,6 +285,10 @@ examples/
 ├── traffic/    # distributed State pattern (TrafficLight)
 ├── door/       # centralized switch (Door + sealed Event)
 ├── turnstile/  # centralized switch with if-guarded arms + fall-through
+├── localvar/   # reassigned root-typed local (reaching-definitions, F1)
+├── gofcontext/ # GoF State pattern: setState field mutation (F2)
+├── factory/    # inter-procedural delegate + factory helpers (F3)
+├── eventalphabet/ # switch-over-event: recovers Σ + labels edges (F4)
 └── shape/      # negative control (plain sum type)
 sample-output/  # reference DOT/SCXML for diffing
 ```

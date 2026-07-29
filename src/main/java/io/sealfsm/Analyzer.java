@@ -1,5 +1,6 @@
 package io.sealfsm;
 
+import io.sealfsm.analyze.GuardAnalysis;
 import io.sealfsm.detect.SealedHierarchyDetector;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
@@ -62,8 +63,20 @@ public final class Analyzer {
             for (Transition t : te.extract(root, model)) {
                 machine.addTransition(t);
             }
+            // F4: register the closed-world event alphabet Σ, so it is complete
+            // even for events the transition function ignores (no edge carries them).
+            for (String symbol : te.alphabet()) {
+                machine.addAlphabetSymbol(symbol);
+            }
             for (String d : te.diagnostics()) {
                 result.warn(root.getQualifiedName(), d);
+            }
+            // F5: guard-level defect detection over the recovered edges —
+            // overlapping guards (possible nondeterminism) and numeric coverage
+            // gaps (possible missing transition). Diagnostics only: no edge is
+            // removed or merged, preserving the record-everything invariant.
+            for (String w : GuardAnalysis.check(machine)) {
+                result.warn(root.getQualifiedName(), w);
             }
 
             detectInitialState(root, machine, model)
@@ -93,6 +106,15 @@ public final class Analyzer {
      */
     private Optional<String> detectInitialState(CtType<?> root, StateMachine machine, CtModel model) {
         Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
+
+        // F7: a callable that produces a state on the machine-entry residual has
+        // already named the initial state explicitly (an edge from the initial
+        // pseudo-state). That is a direct signal, so it wins over the heuristics.
+        for (Transition t : machine.transitions()) {
+            if (StateMachine.INITIAL_PSEUDO_STATE.equals(t.from())) {
+                return Optional.of(StateMachine.INITIAL_PSEUDO_STATE);
+            }
+        }
 
         for (CtField<?> field : model.getElements(new TypeFilter<>(CtField.class))) {
             CtTypeReference<?> ft = field.getType();
