@@ -1021,22 +1021,47 @@ public final class TransitionExtractor {
         return out;
     }
 
-    /** Is {@code lhs} a write to a state field (a field of a hierarchy type)? */
+    /**
+     * Is {@code lhs} a write to <em>this</em> hierarchy's state field?
+     *
+     * <p>The field <em>name</em> is only a candidate filter. Unrelated machines
+     * analysed in the same model routinely both call their field {@code state},
+     * and matching on the name alone made every such machine absorb the other's
+     * assignments as edges with an undetermined source — polluting the unresolved
+     * count with transitions that belong to a different automaton. The declared
+     * type is what actually decides, so it is checked here; the name lookup merely
+     * avoids resolving types for every assignment in the model.
+     *
+     * <p>Under {@code noClasspath} an unresolvable field type falls back to the
+     * name match, which is the previous behaviour and no worse than it.
+     */
     private boolean isStateFieldWrite(CtExpression<?> lhs) {
-        if (lhs instanceof CtFieldAccess<?> fa) {
-            return fa.getVariable() != null && stateFieldNames.contains(fa.getVariable().getSimpleName());
+        if (!(lhs instanceof CtVariableAccess<?> va) || va.getVariable() == null) {
+            return false;
         }
-        if (lhs instanceof CtVariableAccess<?> va) {
-            return va.getVariable() != null && stateFieldNames.contains(va.getVariable().getSimpleName());
-        }
-        return false;
+        CtVariableReference<?> vref = va.getVariable();
+        if (!stateFieldNames.contains(vref.getSimpleName())) return false;
+        CtTypeReference<?> declared = vref.getType();
+        if (declared == null) return true; // type unresolvable — keep the name match
+        return hierarchyQualifiedNames.contains(declared.getQualifiedName());
     }
 
-    /** Is {@code inv} a call to a recognised state mutator? */
+    /**
+     * Is {@code inv} a call to a recognised state mutator of <em>this</em>
+     * hierarchy? Same reasoning as {@link #isStateFieldWrite}: two machines that
+     * both expose a {@code setState} must not claim each other's calls, so the
+     * mutator's parameter type has to sit inside the hierarchy.
+     */
     private boolean isMutatorCall(CtInvocation<?> inv) {
         try {
-            return inv.getExecutable() != null
-                    && mutatorNames.contains(inv.getExecutable().getSimpleName());
+            CtExecutableReference<?> exe = inv.getExecutable();
+            if (exe == null || !mutatorNames.contains(exe.getSimpleName())) return false;
+            List<CtTypeReference<?>> params = exe.getParameters();
+            if (params == null || params.isEmpty()) return true; // unresolvable — keep the name match
+            for (CtTypeReference<?> p : params) {
+                if (p != null && hierarchyQualifiedNames.contains(p.getQualifiedName())) return true;
+            }
+            return false;
         } catch (Throwable t) {
             return false;
         }

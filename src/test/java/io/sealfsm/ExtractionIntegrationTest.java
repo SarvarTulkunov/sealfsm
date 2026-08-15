@@ -595,6 +595,60 @@ class ExtractionIntegrationTest {
         assertTrue(explained, "rejection should name the compositional guard");
     }
 
+    // ---- analysis scope isolation ------------------------------------------
+
+    @Test
+    void mutationMachinesDoNotAbsorbEachOthersAssignments() {
+        // Regression: the mutation encoding identified state fields and mutators by
+        // simple NAME across the whole model, because `ctx.setState(...)` returns
+        // void and offers nothing typed to anchor on. Both PortalContext and
+        // VendMachine call their field `state`, so analysing them together made
+        // each machine swallow the other's assignments as edges with an
+        // undetermined source — Portal acquired transitions guarded by `coins >= 1`.
+        //
+        // The pollution is one-directional (a foreign type can never resolve to a
+        // state of this hierarchy) so it never invented a wrong *resolved* edge,
+        // but it inflated the unresolved count and corrupted per-corpus recall.
+        // Analysing the two together must now give exactly what analysing each
+        // alone gives.
+        StateMachine portalAlone = named(new Analyzer().analyze(modelOf("examples/gofcontext")), "Portal");
+        StateMachine vendAlone = named(new Analyzer().analyze(modelOf("examples/nondeterministic")), "Vend");
+
+        Launcher launcher = new Launcher();
+        launcher.addInputResource("examples/gofcontext");
+        launcher.addInputResource("examples/nondeterministic");
+        launcher.getEnvironment().setComplianceLevel(17);
+        launcher.getEnvironment().setNoClasspath(true);
+        launcher.getEnvironment().setCommentEnabled(false);
+        launcher.buildModel();
+        ExtractionResult together = new Analyzer().analyze(launcher.getModel());
+
+        StateMachine portal = named(together, "Portal");
+        StateMachine vend = named(together, "Vend");
+
+        assertEquals(edgeSet(portalAlone), edgeSet(portal),
+                "Portal's edges must not depend on what else is in the model");
+        assertEquals(edgeSet(vendAlone), edgeSet(vend),
+                "Vend's edges must not depend on what else is in the model");
+
+        // The signature of the old bug: an edge with no attributable source.
+        assertFalse(portal.transitions().stream().anyMatch(t -> "<unknown>".equals(t.from())),
+                "no edge from another machine may leak in");
+        assertFalse(vend.transitions().stream().anyMatch(t -> "<unknown>".equals(t.from())),
+                "no edge from another machine may leak in");
+        assertEquals(0, portal.unresolvedTransitionCount());
+        assertEquals(0, vend.unresolvedTransitionCount());
+    }
+
+    private StateMachine named(ExtractionResult r, String name) {
+        return r.machines().stream().filter(m -> m.name().equals(name))
+                .findFirst().orElseThrow(() -> new AssertionError("no machine named " + name));
+    }
+
+    private Set<String> edgeSet(StateMachine m) {
+        return m.transitions().stream().map(Transition::toString).collect(Collectors.toSet());
+    }
+
     // ---- combined ----------------------------------------------------------
 
     @Test

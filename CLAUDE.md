@@ -145,6 +145,13 @@ Resolution order in `fromVariable`, and *the order is load-bearing*:
 
 Each resolved candidate carries a `SuccessorForm` (CONSTRUCTION / SINGLETON_FIELD / ENUM_CONSTANT / SELF / LOCAL_VARIABLE / CAST), aggregated onto the machine. This is the axis **orthogonal to `Encoding`**: encoding = where dispatch lives (two positions), form = how the successor is spelled. A carrier-returning per-state method is DISTRIBUTED dispatch, not an encoding of its own.
 
+### ScxmlSerializer (serialize/ScxmlSerializer.java)
+Transitions are emitted inside the `<state>` matching their source id, so anything sourced at a **pseudo-state** needs `emitPseudoStates`:
+- machine entry (`<initial>`) becomes a real `<state id="_initial">`, because the document's `initial` attribute must resolve to a declared element;
+- an undetermined source (`<unknown>`/`<entry>`) becomes a trailing comment — it is a gap, not a state, and inventing a `<state>` for it would put a fiction in the model.
+
+`scxmlId()` maps `<initial>` → `_initial`: the raw form is not a legal XML name. Every emitted `initial`/`target` must resolve to a declared `<state>` — losing an edge here would break the "unresolved transitions are never dropped" invariant silently, since DOT would still show it.
+
 ### Analyzer (Analyzer.java)
 Initial-state heuristics (priority order):
 1. A field typed as the hierarchy initialized with `new Concrete()` (e.g. `private TrafficLight current = new Red()`)
@@ -172,7 +179,8 @@ These are acknowledged limitations, not bugs. Do not "fix" them without explicit
 - Carrier arguments are descended ONE level only; a successor computed by a helper stays unresolved (deliberate, see `carrierMode`)
 - **The encoding axis has exactly TWO positions** — DISTRIBUTED (polymorphic per-state dispatch) and CENTRALIZED (a single switch) — plus MIXED for "both, or undetermined". Do not add a third. How the successor is *written* is the separate `SuccessorForm` axis; a new spelling extends that enum, never `Encoding`.
 - `Encoding.DISTRIBUTED` is kept as the name for polymorphic per-state dispatch rather than renaming to `POLYMORPHIC_DISPATCH`, to keep committed reference output and thesis prose stable. The two terms mean the same position on the axis.
-- `findMutationMethods` (F2) matches state fields and mutators by *name* across the whole model, so analysing `examples/` as one source dir bleeds `Vend`'s guards into `Portal`. Per-example runs are unaffected; pre-existing.
+
+**Analysis must be scope-isolated.** Two machines in one model must produce exactly the edges they produce alone — `ExtractionIntegrationTest.mutationMachinesDoNotAbsorbEachOthersAssignments` pins this. The F2 mutation path is the fragile one (a void mutator gives it nothing typed to anchor on), so `isStateFieldWrite`/`isMutatorCall` use the field/parameter **type** to decide and the name only to prefilter. Never relax that back to a name-only match: two machines that both call their field `state` then swallow each other's assignments.
 
 ## What to work on next (likely tasks)
 
