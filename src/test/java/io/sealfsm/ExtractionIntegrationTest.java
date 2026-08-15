@@ -2,6 +2,7 @@ package io.sealfsm;
 
 import io.sealfsm.model.ExtractionResult;
 import io.sealfsm.model.StateMachine;
+import io.sealfsm.model.SuccessorForm;
 import io.sealfsm.model.Transition;
 import org.junit.jupiter.api.Test;
 import spoon.Launcher;
@@ -14,6 +15,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -394,15 +396,203 @@ class ExtractionIntegrationTest {
                 "enclosing-method event labels populate the alphabet");
     }
 
-    // ---- negative control --------------------------------------------------
+    // ---- polymorphic carrier (F8) ------------------------------------------
+
+    @Test
+    void tcpPolymorphicCarrierEncoding() {
+        // F8: the RFC 9293 TCP machine in the polymorphic State pattern. Each of
+        // the 11 permitted subtypes overrides `Transition on(Event)`, and the
+        // successor is an ARGUMENT to a carrier factory rather than the returned
+        // value:  return Transition.to(new LastAck(), Action.SND_FIN);
+        // No method returns TcpState, so the hierarchy-returning recognizers see
+        // nothing and the whole machine was previously lost as a "plain sum type".
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/tcp"));
+
+        // `tcp.Event` is Σ, not a state hierarchy: exactly one machine, not two.
+        StateMachine m = single(r);
+        assertEquals("TcpState", m.name());
+        // Dispatch lives in a per-state method, so this is DISTRIBUTED dispatch.
+        // The carrier is a property of the successor *form*, not of the encoding —
+        // the two axes are reported separately.
+        assertEquals(StateMachine.Encoding.DISTRIBUTED, m.encoding());
+
+        // States remain the exact, provably-complete part: the permits clause.
+        assertEquals(Set.of("Closed", "Listen", "SynSent", "SynReceived", "Established",
+                        "FinWait1", "FinWait2", "CloseWait", "Closing", "LastAck", "TimeWait"),
+                stateIds(m));
+
+        // Targets recovered from inside the carrier's argument list, spanning the
+        // three-way handshake, both close paths and the simultaneous-close path.
+        assertTrue(hasResolved(m, "Closed", "Listen"), "Closed -> Listen (passive OPEN)");
+        assertTrue(hasResolved(m, "Closed", "SynSent"), "Closed -> SynSent (active OPEN)");
+        assertTrue(hasResolved(m, "Listen", "SynReceived"), "Listen -> SynReceived (rcv SYN)");
+        assertTrue(hasResolved(m, "SynSent", "Established"), "SynSent -> Established (rcv SYN,ACK)");
+        assertTrue(hasResolved(m, "Established", "CloseWait"), "Established -> CloseWait (rcv FIN)");
+        assertTrue(hasResolved(m, "CloseWait", "LastAck"), "CloseWait -> LastAck (CLOSE)");
+        assertTrue(hasResolved(m, "FinWait1", "Closing"), "FinWait1 -> Closing (simultaneous close)");
+        assertTrue(hasResolved(m, "Closing", "TimeWait"), "Closing -> TimeWait (rcv ACK of FIN)");
+        assertTrue(hasResolved(m, "LastAck", "Closed"), "LastAck -> Closed (rcv ACK of FIN)");
+
+        // `Transition.ignore(this)` is a self-loop, not an unresolved target.
+        assertTrue(hasResolved(m, "TimeWait", "TimeWait"), "TimeWait self-loop (ignore(this))");
+        assertTrue(hasResolved(m, "Established", "Established"), "Established self-loop (ignore(this))");
+
+        // The event is recovered from the guard, not from the method name: `on`
+        // labels nothing, but `event == UserCall.CLOSE` and `event instanceof
+        // SegmentArrival` do.
+        assertTrue(hasEventEdge(m, "CloseWait", "UserCall.CLOSE", "LastAck"),
+                "CloseWait --UserCall.CLOSE--> LastAck");
+        assertTrue(hasEventEdge(m, "TimeWait", "Timeout.TIME_WAIT_2MSL", "Closed"),
+                "TimeWait --Timeout.TIME_WAIT_2MSL--> Closed");
+        assertTrue(hasEventEdge(m, "Established", "SegmentArrival", "Closed"),
+                "Established --SegmentArrival--> Closed (RST)");
+
+        // A disjunction of event tests is two inputs of Σ, not one compound label:
+        //   if (event == UserCall.CLOSE || event == Timeout.USER)
+        assertTrue(hasEventEdge(m, "SynSent", "UserCall.CLOSE", "Closed"), "SynSent --CLOSE--> Closed");
+        assertTrue(hasEventEdge(m, "SynSent", "Timeout.USER", "Closed"), "SynSent --USER timeout--> Closed");
+
+        // The data predicate stays a guard, separate from the event label.
+        Transition rstAbort = m.transitions().stream()
+                .filter(t -> t.from().equals("Established") && "Closed".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(rstAbort.guard(), "the RST branch should record its condition");
+        assertTrue(rstAbort.guard().contains("rst()"), "guard should be the data test, not the event test");
+
+        // Σ is enumerated from the sealed Event type, expanding enum members into
+        // their constants — the granularity the guards actually test.
+        assertTrue(m.alphabet().contains("SegmentArrival"), "record event in Σ");
+        assertTrue(m.alphabet().contains("UserCall.PASSIVE_OPEN"), "enum constant in Σ");
+        assertTrue(m.alphabet().contains("Timeout.RETRANSMISSION"),
+                "an event no edge names must still be in Σ");
+
+        // The from-state is the declaring class, so it is never undetermined.
+        assertFalse(m.transitions().stream().anyMatch(t -> "<unknown>".equals(t.from())),
+                "the declaring class always fixes the source state");
+        assertEquals("Closed", m.initialState().orElse(null));
+
+        // Actions (Action.SIGNAL_ABORT, ...) are carrier payload, not states: no
+        // edge may touch anything outside the hierarchy.
+        Set<String> ids = stateIds(m);
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> !ids.contains(t.from()) || (t.isResolved() && !ids.contains(t.to()))),
+                "no edge may touch a non-state type");
+    }
+
+    // ---- successor forms (the axis orthogonal to encoding) ------------------
+
+    @Test
+    void everySuccessorFormResolvesToAPermittedSubtype() {
+        // The successor of a transition may be written in any of several ways, and
+        // resolving them is one uniform sub-procedure independent of where dispatch
+        // lives. This fixture holds the encoding fixed (per-state methods returning
+        // a carrier) and varies only the spelling.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/valueforms"));
+        StateMachine m = single(r);
+
+        // A permitted `enum` contributes its constants as states: they are as
+        // compiler-checked-exhaustive as a permits clause, and transitions name
+        // them individually, so collapsing them into one state would merge
+        // genuinely distinct states.
+        assertEquals(Set.of("Idle", "Armed", "Firing", "Phase", "RAMP", "PEAK"), stateIds(m));
+
+        // new Firing(), held in a local and returned through the carrier.
+        assertTrue(hasResolved(m, "Armed", "Firing"), "Armed -> Firing (local variable)");
+        // A singleton declared with the CONCRETE state as its type.
+        assertTrue(hasResolved(m, "Idle", "Armed"), "Idle -> Armed (singleton, concrete-typed)");
+        // A singleton declared as the abstract ROOT: only its initializer pins it.
+        // Reading the declared type instead would have produced a false self-loop.
+        assertTrue(hasResolved(m, "Firing", "Idle"), "Firing -> Idle (singleton, root-typed)");
+        assertTrue(hasResolved(m, "Phase", "Idle"), "Phase -> Idle (singleton, root-typed)");
+        // Enum constants, qualified and bare.
+        assertTrue(hasResolved(m, "Armed", "RAMP"), "Armed -> RAMP (qualified enum constant)");
+        assertTrue(hasResolved(m, "Phase", "PEAK"), "Phase -> PEAK (bare enum constant)");
+        // `this` through the carrier.
+        assertTrue(hasResolved(m, "Idle", "Idle"), "Idle self-loop (this)");
+
+        // Each edge records HOW its successor was written.
+        assertEquals(Set.of(SuccessorForm.SINGLETON_FIELD, SuccessorForm.ENUM_CONSTANT,
+                        SuccessorForm.LOCAL_VARIABLE, SuccessorForm.SELF),
+                m.successorForms());
+
+        // No form may be resolved to a state outside the machine.
+        Set<String> ids = stateIds(m);
+        assertFalse(m.transitions().stream().anyMatch(t -> t.isResolved() && !ids.contains(t.to())),
+                "every resolved successor must be a state of this machine");
+    }
+
+    @Test
+    void aSuccessorComputedByAHelperStaysUnresolved() {
+        // `return Step.to(Router.pick(tick));` — the identity of the successor
+        // cannot be established without leaving the method. The soundness
+        // invariant says record it, do not guess it, and do not drop it.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/valueforms"));
+        StateMachine m = single(r);
+
+        assertTrue(m.transitions().stream().anyMatch(t -> t.from().equals("Firing") && !t.isResolved()),
+                "the helper-computed successor must be recorded as unresolved");
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> t.from().equals("Firing") && t.isResolved()
+                                && ("Armed".equals(t.to()) || "Firing".equals(t.to()))),
+                "the helper's own returns must not leak in as resolved edges");
+    }
+
+    @Test
+    void defaultBranchIsRecordedAsAnOtherwiseEdge() {
+        // A fall-through / else with no event test is a legitimate transition that
+        // fires when nothing else does. It must be marked as the default edge —
+        // distinguishing "fires otherwise" from "no event was recovered" — and
+        // never treated as an error or dropped.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/tcp"));
+        StateMachine m = single(r);
+
+        Transition fallThrough = m.transitions().stream()
+                .filter(t -> t.from().equals("Established") && "Established".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertTrue(fallThrough.isOtherwise(), "the trailing ignore(this) is the default edge");
+        assertNull(fallThrough.event(), "a default edge carries no event");
+        assertNotNull(fallThrough.guard(), "it still carries the residual of the guards before it");
+
+        // An edge an event DID select is not a default edge, even though it also
+        // sits on a fall-through path.
+        Transition evented = m.transitions().stream()
+                .filter(t -> "UserCall.CLOSE".equals(t.event()) && t.from().equals("Established"))
+                .findFirst().orElseThrow();
+        assertFalse(evented.isOtherwise(), "an event-selected edge is not the default edge");
+
+        // Every state has exactly one way out when nothing matches — no state was
+        // left with its default branch dropped.
+        for (String id : stateIds(m)) {
+            assertTrue(m.transitions().stream().anyMatch(t -> t.from().equals(id) && t.isOtherwise()),
+                    "state " + id + " should keep its default edge");
+        }
+    }
+
+    // ---- negative controls -------------------------------------------------
 
     @Test
     void shapeSumTypeIsRejected() {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/shape"));
         assertTrue(r.isEmpty(), "a plain sum type must not be classified as an FSM");
         boolean explained = r.diagnostics().stream()
-                .anyMatch(d -> d.message().toLowerCase().contains("sum type"));
+                .anyMatch(d -> d.message().toLowerCase().contains("no hierarchy-returning or carrier-based"));
         assertTrue(explained, "rejection reason should be reported");
+    }
+
+    @Test
+    void treeBuilderIsRejectedBySiblingNestedGuard() {
+        // Precision guard for F8. `treebuilder.Expr` is shaped exactly like the
+        // carrier encoding — one consistently-named method per permitted subtype,
+        // returning a non-hierarchy carrier (`Rewrite`) that wraps Expr values —
+        // yet it is a recursive tree rewrite, not an automaton. The difference is
+        // positional: `new Add(l.result(), r.result())` NESTS hierarchy values
+        // inside a bigger hierarchy node instead of producing a peer of the
+        // current one.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/treebuilder"));
+        assertTrue(r.isEmpty(), "a compositional sealed type must not be classified as an FSM");
+        boolean explained = r.diagnostics().stream()
+                .anyMatch(d -> d.message().toLowerCase().contains("composed into one another"));
+        assertTrue(explained, "rejection should name the compositional guard");
     }
 
     // ---- combined ----------------------------------------------------------
@@ -413,6 +603,25 @@ class ExtractionIntegrationTest {
         List<String> names = r.machines().stream().map(StateMachine::name).toList();
         assertTrue(names.contains("TrafficLight"));
         assertTrue(names.contains("Door"));
+        assertTrue(names.contains("TcpState"), "the carrier-encoded machine is recognised in the corpus");
         assertFalse(names.contains("Shape"), "Shape must be excluded");
+        assertFalse(names.contains("Expr"), "the compositional tree builder must be excluded");
+        assertFalse(names.contains("Event"), "an event alphabet is not a state hierarchy");
+
+        // Stratification, on both axes. The encoding axis has exactly two
+        // positions and the corpus exercises both...
+        Set<StateMachine.Encoding> encodings = r.machines().stream()
+                .map(StateMachine::encoding).collect(Collectors.toSet());
+        assertTrue(encodings.contains(StateMachine.Encoding.DISTRIBUTED));
+        assertTrue(encodings.contains(StateMachine.Encoding.CENTRALIZED));
+
+        // ...while the orthogonal successor-form axis is what separates the
+        // carrier-encoded machines from the plain ones.
+        Set<SuccessorForm> forms = r.machines().stream()
+                .flatMap(m -> m.successorForms().stream()).collect(Collectors.toSet());
+        assertTrue(forms.contains(SuccessorForm.CONSTRUCTION));
+        assertTrue(forms.contains(SuccessorForm.SELF));
+        assertTrue(forms.contains(SuccessorForm.SINGLETON_FIELD));
+        assertTrue(forms.contains(SuccessorForm.ENUM_CONSTANT));
     }
 }

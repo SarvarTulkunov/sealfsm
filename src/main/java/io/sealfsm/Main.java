@@ -2,6 +2,8 @@ package io.sealfsm;
 
 import io.sealfsm.model.ExtractionResult;
 import io.sealfsm.model.StateMachine;
+import io.sealfsm.model.SuccessorForm;
+import io.sealfsm.model.Transition;
 import io.sealfsm.serialize.DotSerializer;
 import io.sealfsm.serialize.ScxmlSerializer;
 import spoon.Launcher;
@@ -11,7 +13,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Command-line driver.
@@ -90,21 +95,63 @@ public final class Main {
         System.out.println();
         System.out.printf("Found %d state machine(s); wrote %d file(s) to %s%n",
                 result.machines().size(), written, out.toAbsolutePath());
-        System.out.println("-".repeat(72));
-        System.out.printf("%-28s %-12s %7s %7s %10s%n",
-                "MACHINE", "ENCODING", "STATES", "TRANS", "RESOLVED");
+        System.out.println("-".repeat(96));
+        System.out.printf("%-22s %-12s %6s %6s %9s  %s%n",
+                "MACHINE", "DISPATCH", "STATES", "TRANS", "RESOLVED", "SUCCESSOR FORMS");
         for (StateMachine m : result.machines()) {
-            System.out.printf("%-28s %-12s %7d %7d %9s%n",
-                    truncate(m.name(), 28),
+            System.out.printf("%-22s %-12s %6d %6d %9s  %s%n",
+                    truncate(m.name(), 22),
                     m.encoding(),
                     m.allStates().size(),
                     m.transitions().size(),
-                    m.resolvedTransitionCount() + "/" + m.transitions().size());
+                    m.resolvedTransitionCount() + "/" + m.transitions().size(),
+                    formList(m));
         }
+        printEncodingRollup(result);
         if (!quiet && !result.diagnostics().isEmpty()) {
             System.out.println("-".repeat(72));
             System.out.println("Diagnostics:");
             result.diagnostics().forEach(d -> System.out.println("  " + d));
+        }
+    }
+
+    /** The successor spellings a machine's edges used, compactly. */
+    private static String formList(StateMachine m) {
+        if (m.successorForms().isEmpty()) return "-";
+        return m.successorForms().stream().map(Enum::name).sorted().collect(Collectors.joining(","));
+    }
+
+    /**
+     * Totals along both axes. State enumeration is exact everywhere, but transition
+     * recovery is not, and its accuracy varies independently with where dispatch
+     * lives and with how the successor is written — so the resolved/total figures
+     * are broken out per dispatch position AND per successor form rather than
+     * pooled. A recall gap can then be attributed to the thing that caused it.
+     */
+    private static void printEncodingRollup(ExtractionResult result) {
+        if (result.machines().size() < 2) return;
+        Map<StateMachine.Encoding, int[]> byDispatch = new EnumMap<>(StateMachine.Encoding.class);
+        Map<SuccessorForm, Integer> byForm = new EnumMap<>(SuccessorForm.class);
+        for (StateMachine m : result.machines()) {
+            int[] acc = byDispatch.computeIfAbsent(m.encoding(), k -> new int[3]);
+            acc[0]++;                                             // machines
+            acc[1] += (int) m.resolvedTransitionCount();          // resolved edges
+            acc[2] += m.transitions().size();                     // total edges
+            for (Transition t : m.transitions()) {
+                if (t.form() != null) byForm.merge(t.form(), 1, Integer::sum);
+            }
+        }
+        System.out.println("-".repeat(96));
+        System.out.printf("%-22s %-12s %6s %6s %9s%n",
+                "BY DISPATCH", "", "MACHINES", "TRANS", "RESOLVED");
+        byDispatch.forEach((enc, acc) ->
+                System.out.printf("%-22s %-12s %6d %6d %9s%n",
+                        "", enc, acc[0], acc[2], acc[1] + "/" + acc[2]));
+        if (!byForm.isEmpty()) {
+            System.out.printf("%-22s %s%n", "BY SUCCESSOR FORM",
+                    byForm.entrySet().stream()
+                            .map(e -> e.getKey() + "=" + e.getValue())
+                            .collect(Collectors.joining("  ")));
         }
     }
 

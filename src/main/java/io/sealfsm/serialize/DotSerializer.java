@@ -82,7 +82,13 @@ public final class DotSerializer {
 
     private static String edgeLabel(Transition t) {
         StringBuilder sb = new StringBuilder();
-        if (t.event() != null) sb.append(t.event());
+        if (t.event() != null) {
+            sb.append(t.event());
+        } else if (t.isOtherwise()) {
+            // The default edge: it fires when no labelled transition does. Naming it
+            // distinguishes "fires on anything else" from "no event was recovered".
+            sb.append("otherwise");
+        }
         if (t.guard() != null) sb.append(" [").append(t.guard()).append(']');
         return sb.toString().trim();
     }

@@ -27,13 +27,29 @@ public final class StateMachine {
      */
     public static final String INITIAL_PSEUDO_STATE = "<initial>";
 
-    /** How transitions are encoded in the analysed source. */
+    /**
+     * Where transition dispatch <em>lives</em> in the analysed source. This is the
+     * encoding axis, and it has exactly two positions.
+     *
+     * <p>How the successor is <em>written</em> — bare {@code new H()}, a singleton
+     * field, an enum constant, {@code this}, a local, or a value handed to a
+     * carrier object — is a separate axis, {@link SuccessorForm}, resolved by one
+     * uniform sub-procedure under either encoding. In particular the polymorphic
+     * State pattern that returns {@code Transition.to(new LastAck(), ...)} is
+     * {@link #DISTRIBUTED} dispatch with a carrier-wrapped successor, not an
+     * encoding of its own: the dispatch site is identical to a per-state method
+     * returning the hierarchy type, and only the spelling of the result differs.
+     */
     public enum Encoding {
-        /** Classic State pattern: each state class has its own transition method(s). */
+        /**
+         * Polymorphic, per-state dispatch (classic State pattern): each permitted
+         * subtype owns a transition method. The successor may be returned directly
+         * or wrapped in a carrier — see {@link SuccessorForm}.
+         */
         DISTRIBUTED,
-        /** A single transition function, typically a pattern-matching switch. */
+        /** Centralized dispatch: a single transition function, typically a pattern-matching switch. */
         CENTRALIZED,
-        /** Both styles detected, or undetermined. */
+        /** Both dispatch positions detected, or undetermined. */
         MIXED
     }
 
@@ -43,6 +59,7 @@ public final class StateMachine {
     private final List<State> topLevelStates = new ArrayList<>();
     private final List<Transition> transitions = new ArrayList<>();
     private final Set<String> alphabet = new LinkedHashSet<>(); // event labels
+    private final Set<SuccessorForm> successorForms = new LinkedHashSet<>();
     private String initialState;          // state id; may be null if undetected
 
     public StateMachine(String name, String qualifiedName, Encoding encoding) {
@@ -64,6 +81,17 @@ public final class StateMachine {
     public void addTransition(Transition t) {
         transitions.add(Objects.requireNonNull(t));
         if (t.event() != null) alphabet.add(t.event());
+        if (t.form() != null) successorForms.add(t.form());
+    }
+
+    /**
+     * The successor spellings this machine's edges actually used — the second,
+     * orthogonal axis to {@link #encoding()}. Reported alongside the encoding so a
+     * recall gap can be attributed to the form that caused it (say, a singleton
+     * that would not resolve) rather than to the encoding it appeared under.
+     */
+    public Set<SuccessorForm> successorForms() {
+        return Collections.unmodifiableSet(successorForms);
     }
 
     /**

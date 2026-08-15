@@ -73,6 +73,12 @@ public final class ScxmlSerializer {
               .append(" -->\n");
             return;
         }
+        // An SCXML transition with no `event` is already the eventless/default one,
+        // which is exactly the "otherwise" edge; the comment records that this is
+        // deliberate rather than an event the analyzer failed to recover.
+        if (t.event() == null && t.isOtherwise()) {
+            sb.append(indent).append("<!-- default (otherwise) transition -->\n");
+        }
         sb.append(indent).append("<transition");
         if (t.event() != null) sb.append(" event=\"").append(attr(t.event())).append('"');
         if (t.guard() != null) sb.append(" cond=\"").append(attr(t.guard())).append('"');

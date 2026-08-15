@@ -54,6 +54,19 @@ public final class StateMachineClassifier {
                     "explicit @Fsm/@StateMachine marker");
         }
 
+        // Precision gate, ahead of every structural signal: a hierarchy whose
+        // members are composed into one another is a recursive data type, and a
+        // recursive data type's "next" is a child, not a successor state. This
+        // sinks tree builders, exhaustive folds and tag-dispatched deserializers
+        // regardless of which recognizer would otherwise have claimed them — a
+        // record component of the hierarchy type, for instance, gives such a type
+        // an accessor that looks exactly like a per-state transition method.
+        if (CarrierTransitionDetector.composesItself(root)) {
+            return Classification.no(
+                    "hierarchy members are composed into one another (a hierarchy value is a "
+                            + "construction argument of another) — a recursive data type, not a state machine");
+        }
+
         List<CtMethod<?>> distributed = findDistributedTransitionMethods(root);
         List<CtMethod<?>> centralized = findCentralizedTransitionMethods(root, model);
         // F7: a transition function need not be a named method — it may be a lambda
@@ -77,8 +90,29 @@ public final class StateMachineClassifier {
             return Classification.yes(Encoding.DISTRIBUTED,
                     distributed.size() + " per-state transition method(s)");
         }
+        // F8: nothing returns the hierarchy type, but each permitted subtype may
+        // still own its transition logic and hand the successor to a *carrier*
+        // (`Transition.to(new LastAck(), ...)`). Checked last, so a hierarchy the
+        // existing recognizers already accept keeps its existing classification
+        // and the widening can only add machines, never reclassify one.
+        //
+        // The result is DISTRIBUTED, not an encoding of its own: dispatch lives in
+        // a per-state method either way, and only the *spelling* of the successor
+        // differs — which is the orthogonal SuccessorForm axis, recorded per edge.
+        if (CarrierTransitionDetector.qualifies(root)) {
+            return Classification.yes(Encoding.DISTRIBUTED, carrierReason(root));
+        }
         return Classification.no(
-                "sealed type has no methods returning the hierarchy type — looks like a plain sum type");
+                "no hierarchy-returning or carrier-based transition method found "
+                        + "(may be Σ/event type or externally dispatched)");
+    }
+
+    /** Reason text for a carrier-encoded machine, naming the shared method when there is one. */
+    private static String carrierReason(CtType<?> root) {
+        List<CtMethod<?>> carriers = CarrierTransitionDetector.findCarrierTransitionMethods(root);
+        String shared = CarrierTransitionDetector.consistentMethodName(carriers);
+        return carriers.size() + " carrier-based per-state transition method(s)"
+                + (shared == null ? "" : " (all named '" + shared + "')");
     }
 
     private Encoding detectEncoding(CtType<?> root, CtModel model) {
@@ -88,6 +122,7 @@ public final class StateMachineClassifier {
         if (dist && central) return Encoding.MIXED;
         if (central) return Encoding.CENTRALIZED;
         if (dist) return Encoding.DISTRIBUTED;
+        if (CarrierTransitionDetector.qualifies(root)) return Encoding.DISTRIBUTED;
         return Encoding.MIXED; // annotated but shapeless; extractor will report gaps
     }
 
