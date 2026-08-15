@@ -33,6 +33,10 @@ public final class ScxmlSerializer {
     private static final String NS = "http://www.w3.org/2005/07/scxml";
 
     public String serialize(StateMachine m) {
+        Set<String> composites = new HashSet<>();
+        for (State s : m.allStates()) {
+            if (s.isComposite() && !s.children().isEmpty()) composites.add(s.id());
+        }
         StringBuilder sb = new StringBuilder();
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         sb.append("<scxml xmlns=\"").append(NS).append("\" version=\"1.0\"");
@@ -48,9 +52,9 @@ public final class ScxmlSerializer {
           .append(" -->\n");
 
         for (State s : m.topLevelStates()) {
-            emitState(m, s, sb, "  ");
+            emitState(m, s, sb, "  ", composites);
         }
-        emitPseudoStates(m, sb, "  ");
+        emitPseudoStates(m, sb, "  ", composites);
         sb.append("</scxml>\n");
         return sb.toString();
     }
@@ -71,7 +75,8 @@ public final class ScxmlSerializer {
      *       already get, and for the same reason.</li>
      * </ul>
      */
-    private void emitPseudoStates(StateMachine m, StringBuilder sb, String indent) {
+    private void emitPseudoStates(StateMachine m, StringBuilder sb, String indent,
+                                  Set<String> composites) {
         Set<String> realIds = new HashSet<>();
         for (State s : m.allStates()) realIds.add(s.id());
 
@@ -91,7 +96,7 @@ public final class ScxmlSerializer {
             sb.append(indent).append("<state id=\"")
               .append(attr(scxmlId(StateMachine.INITIAL_PSEUDO_STATE))).append("\">\n");
             for (Transition t : entry) {
-                emitTransition(t, sb, indent + "  ");
+                emitTransition(t, sb, indent + "  ", composites);
             }
             sb.append(indent).append("</state>\n");
         }
@@ -112,7 +117,8 @@ public final class ScxmlSerializer {
         }
     }
 
-    private void emitState(StateMachine m, State s, StringBuilder sb, String indent) {
+    private void emitState(StateMachine m, State s, StringBuilder sb, String indent,
+                           Set<String> composites) {
         boolean composite = s.isComposite() && !s.children().isEmpty();
         sb.append(indent).append("<state id=\"").append(attr(s.id())).append('"');
 
@@ -125,18 +131,18 @@ public final class ScxmlSerializer {
         // Outgoing transitions whose source is this state.
         for (Transition t : m.transitions()) {
             if (!t.from().equals(s.id())) continue;
-            emitTransition(t, sb, indent + "  ");
+            emitTransition(t, sb, indent + "  ", composites);
         }
 
         if (composite) {
             for (State child : s.children()) {
-                emitState(m, child, sb, indent + "  ");
+                emitState(m, child, sb, indent + "  ", composites);
             }
         }
         sb.append(indent).append("</state>\n");
     }
 
-    private void emitTransition(Transition t, StringBuilder sb, String indent) {
+    private void emitTransition(Transition t, StringBuilder sb, String indent, Set<String> composites) {
         if (!t.isResolved()) {
             sb.append(indent).append("<!-- unresolved transition")
               .append(t.event() != null ? " on event '" + esc(t.event()) + "'" : "")
@@ -150,10 +156,24 @@ public final class ScxmlSerializer {
         if (t.event() == null && t.isOtherwise()) {
             sb.append(indent).append("<!-- default (otherwise) transition -->\n");
         }
+
+        // A self-transition on a COMPOSITE must be internal (no target). With a
+        // target, SCXML exits and re-enters the composite, landing on its initial
+        // child — so `Phase -> Phase` would silently mean "go to RAMP" even when
+        // the machine was in PEAK. The recovered edge came from `stay(this)`,
+        // whose meaning is precisely "keep the current child".
+        boolean compositeSelfLoop = t.from().equals(t.to()) && composites.contains(t.from());
+        if (compositeSelfLoop) {
+            sb.append(indent).append("<!-- internal self-transition: the active child state is preserved -->\n");
+        }
+
         sb.append(indent).append("<transition");
         if (t.event() != null) sb.append(" event=\"").append(attr(t.event())).append('"');
         if (t.guard() != null) sb.append(" cond=\"").append(attr(t.guard())).append('"');
-        sb.append(" target=\"").append(attr(scxmlId(t.to()))).append("\"/>\n");
+        if (!compositeSelfLoop) {
+            sb.append(" target=\"").append(attr(scxmlId(t.to()))).append('"');
+        }
+        sb.append("/>\n");
     }
 
     /**

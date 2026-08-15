@@ -145,6 +145,15 @@ Resolution order in `fromVariable`, and *the order is load-bearing*:
 
 Each resolved candidate carries a `SuccessorForm` (CONSTRUCTION / SINGLETON_FIELD / ENUM_CONSTANT / SELF / LOCAL_VARIABLE / CAST), aggregated onto the machine. This is the axis **orthogonal to `Encoding`**: encoding = where dispatch lives (two positions), form = how the successor is spelled. A carrier-returning per-state method is DISTRIBUTED dispatch, not an encoding of its own.
 
+### Composite states (both serializers)
+A composite state is a permitted subtype that is itself sealed, **or an enum** (its constants become children). `topLevelStates()` is exactly the `permits` clause; `allStates()` is the flattened count the summary prints — so `Signal` reports 6 states for a 4-member `permits` clause, and that is correct, not a miscount.
+
+Two things composites break if handled naively:
+- **DOT**: `cluster_X` is not a node. Naming it in an edge makes Graphviz invent a second node with the same label, so the diagram shows the state twice. Edges touching a composite attach to an invisible `__anchor_X` inside the cluster and clip with `lhead`/`ltail` (needs `compound=true`). Clipping is suppressed when both ends are inside the same cluster — Graphviz warns and ignores it there.
+- **SCXML**: a self-transition on a composite with a `target` *exits and re-enters*, landing on the initial child. A `stay(this)` self-loop must be emitted **without a target** (internal transition) or a machine in PEAK silently jumps to RAMP.
+
+Verify renders with `dot -Tsvg out/X.dot -o /dev/null` — it must print no warnings.
+
 ### ScxmlSerializer (serialize/ScxmlSerializer.java)
 Transitions are emitted inside the `<state>` matching their source id, so anything sourced at a **pseudo-state** needs `emitPseudoStates`:
 - machine entry (`<initial>`) becomes a real `<state id="_initial">`, because the document's `initial` attribute must resolve to a declared element;

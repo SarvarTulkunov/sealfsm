@@ -54,6 +54,43 @@ class ScxmlSerializerTest {
         assertTrue(xml.contains("<!-- unresolved transition on event 'transfer'"));
     }
 
+    @Test
+    void selfTransitionOnACompositeIsInternal() throws Exception {
+        // Regression: `<transition target="Active"/>` on the composite Active
+        // EXITS and re-enters it, so SCXML lands on its initial child (Talking) —
+        // meaning a machine sitting in OnHold would silently jump to Talking. The
+        // edge came from `stay(this)`, whose meaning is "keep the current child",
+        // so it must be an internal transition with no target at all.
+        StateMachine m = compositeSample();
+        m.addTransition(Transition.resolved("Active", "Active", null, "else").asOtherwise());
+
+        String xml = new ScxmlSerializer().serialize(m);
+        var doc = parse(xml);
+        assertTrue(xml.contains("internal self-transition"), "the intent should be recorded");
+
+        var transitions = doc.getElementsByTagName("transition");
+        boolean found = false;
+        for (int i = 0; i < transitions.getLength(); i++) {
+            var e = (org.w3c.dom.Element) transitions.item(i);
+            if ("else".equals(e.getAttribute("cond"))) {
+                found = true;
+                assertEquals("", e.getAttribute("target"),
+                        "a composite self-loop must carry no target");
+            }
+        }
+        assertTrue(found, "the self-transition must still be emitted");
+    }
+
+    @Test
+    void selfTransitionOnALeafKeepsItsTarget() throws Exception {
+        // The complement: a leaf state has no children to preserve, so its
+        // self-loop stays an ordinary targeted transition.
+        StateMachine m = compositeSample();
+        m.addTransition(Transition.resolved("Idle", "Idle", "ignore", null));
+        String xml = new ScxmlSerializer().serialize(m);
+        assertTrue(xml.contains("<transition event=\"ignore\" target=\"Idle\"/>"));
+    }
+
     // ---- pseudo-state sources ----------------------------------------------
 
     /** A machine whose entry point is the synthetic pseudo-state (the F7 shape). */
