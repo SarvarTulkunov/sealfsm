@@ -1,8 +1,10 @@
 package io.sealfsm.extract;
 
 import io.sealfsm.detect.CarrierTransitionDetector;
+import io.sealfsm.detect.DispatchCommitDetector;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
+import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.Transition;
 import spoon.reflect.CtModel;
@@ -47,6 +49,7 @@ import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -134,6 +137,22 @@ public final class TransitionExtractor {
     // "<ownerQualifiedName>#<CONSTANT>" -> the Σ symbol that constant contributes,
     // recorded while Σ is enumerated so edge labels and Σ cannot drift apart.
     private final Map<String, String> eventSymbolByConstant = new LinkedHashMap<>();
+    // Set while walking the arm of a switch-over-event whose label DECONSTRUCTS the
+    // event (`case Send(Signal s) ->`). An inner switch on that binding refines the
+    // label from the event family to the exact input, `Send` -> `Send.HEADERS`.
+    private ComponentEvent componentEvent = null;
+
+    /**
+     * An event arm that bound one of the event's components, so a nested switch on
+     * that binding can be recognised and its arms composed back into full Σ symbols.
+     *
+     * @param prefix             the event the outer arm matched, e.g. {@code Send}
+     * @param boundName          the name the component was bound to, e.g. {@code s}
+     * @param enumQualifiedName  the component's enum type, checked so an unrelated
+     *                           switch that happens to reuse the name is not claimed
+     */
+    private record ComponentEvent(String prefix, String boundName, String enumQualifiedName) {
+    }
 
     // F8: polymorphic-carrier walk context. While set, the walker descends one
     // level into carrier call arguments and inter-procedural folding is disabled —
@@ -148,6 +167,14 @@ public final class TransitionExtractor {
     // a single-threaded recursive walk.
     private boolean otherwisePath = false;
 
+    // The commit mechanisms actually exercised while extracting this machine, and
+    // the states a dispatch arm (or a per-state transition method) selected. The
+    // latter is what makes "terminal" a claim about a state the analysis SAW —
+    // a state no arm matched has no outbound edges merely because none were
+    // recovered, and calling that terminal would dress a recall gap as a result.
+    private final Set<CommitForm> commitForms = new LinkedHashSet<>();
+    private final Set<String> dispatchedStates = new LinkedHashSet<>();
+
     public TransitionExtractor(Set<String> hierarchyQualifiedNames, String rootQualifiedName) {
         this.hierarchyQualifiedNames = hierarchyQualifiedNames;
         this.rootQualifiedName = rootQualifiedName;
@@ -161,6 +188,20 @@ public final class TransitionExtractor {
     /** The event alphabet Σ recovered from sealed/enum event parameters (F4). */
     public Set<String> alphabet() {
         return alphabet;
+    }
+
+    /** How this machine's dispatch committed its successors — the third axis. */
+    public Set<CommitForm> commitForms() {
+        return commitForms;
+    }
+
+    /**
+     * The states a dispatch arm (or a per-state transition method) selected. A
+     * state in this set with no outbound edge is genuinely absorbing; a state
+     * outside it simply was not reached by the analysis.
+     */
+    public Set<String> dispatchedStates() {
+        return dispatchedStates;
     }
 
     public List<Transition> extract(CtType<?> root, CtModel model) {
@@ -188,11 +229,28 @@ public final class TransitionExtractor {
         for (CtMethod<?> m : distributed) {
             if (!helperSignatures.contains(m.getSignature())) extractDistributed(m, out);
         }
+        Set<String> walkedMethods = new HashSet<>();
         for (CtMethod<?> m : centralized) {
-            if (!helperSignatures.contains(m.getSignature())) extractCentralized(m, out);
+            if (!helperSignatures.contains(m.getSignature())) {
+                extractCentralized(m, out);
+                walkedMethods.add(methodKey(m));
+            }
         }
         for (CtElement callable : functional) {
             extractFunctional(callable, out);
+        }
+        // The widened centralized recognizer: a switch over the hierarchy whose
+        // result is committed as a hierarchy value, wherever it is hosted. Hosts
+        // the signature-based recognizer already walked are skipped so one body is
+        // never walked twice (harmless for the edge set, which is a Set, but it
+        // would double-count the inter-procedural fold statistic).
+        for (DispatchCommitDetector.Producer p : DispatchCommitDetector.find(root, model)) {
+            if (walkedMethods.contains(methodKey(p.host()))
+                    || helperSignatures.contains(p.host().getSignature())) {
+                commitForms.add(p.commit());
+                continue;
+            }
+            extractCommitDispatch(p, out);
         }
         // F8: per-state methods that return a *carrier* wrapping the successor.
         // Run whenever such a method exists, not only when the lists above are
@@ -249,6 +307,10 @@ public final class TransitionExtractor {
     private void extractDistributed(CtMethod<?> method, Set<Transition> out) {
         CtType<?> declaring = method.getDeclaringType();
         if (declaring == null) return;
+        commitForms.add(CommitForm.VALUE_RETURN);
+        // The declaring class IS the source state — exact, no data-flow needed —
+        // so it counts as dispatched even when the body produces nothing.
+        dispatchedStates.add(declaring.getSimpleName());
         // The from-state is fixed to the declaring class; a switch inside the
         // body dispatches on the event, not on the state, so from is preserved.
         walk(method.getBody(), declaring.getSimpleName(), eventName(method), null, out);
@@ -256,7 +318,35 @@ public final class TransitionExtractor {
 
     // ---- centralized (single transition function) ----------------------------
 
+    /**
+     * Walk a transition producer discovered by the <em>widened</em> centralized
+     * recognizer: a switch over the hierarchy whose result is committed as a
+     * hierarchy value, hosted anywhere and installed by return, by field write or
+     * through a local accumulator.
+     *
+     * <p>Only the dispatch switch is walked, never the whole host body. That bound
+     * matters: {@code handleEvent} in the field-mutation idiom ends with
+     * {@code return this.currentState;}, and walking the body would read that
+     * trailing return as a producer with no attributable source and emit a
+     * fictitious unresolved edge. The switch is where the transition relation is;
+     * everything around it is plumbing.
+     */
+    private void extractCommitDispatch(DispatchCommitDetector.Producer producer, Set<Transition> out) {
+        commitForms.add(producer.commit());
+        // Σ comes from the host's event parameter exactly as for a named
+        // transition function, so a nested switch-over-event can label its arms.
+        enumerateEventAlphabet(producer.host());
+        walkSwitch(producer.dispatch(), null, null, null, out);
+    }
+
+    /** Declaring type + signature: unique across the model, unlike a bare signature. */
+    private static String methodKey(CtMethod<?> m) {
+        CtType<?> declaring = m.getDeclaringType();
+        return (declaring == null ? "?" : declaring.getQualifiedName()) + "#" + m.getSignature();
+    }
+
     private void extractCentralized(CtMethod<?> method, Set<Transition> out) {
+        commitForms.add(CommitForm.VALUE_RETURN);
         // F4: recover the closed-world event alphabet Σ from the event parameter
         // (and register the event type so a nested switch-over-event can label
         // each arm). Done before the walk so walkSwitch sees eventQualifiedNames.
@@ -333,15 +423,67 @@ public final class TransitionExtractor {
         CtType<?> member = ref.getTypeDeclaration();
         if (member instanceof CtEnum<?> en && !en.getEnumValues().isEmpty()) {
             for (CtEnumValue<?> v : en.getEnumValues()) {
-                String symbol = ref.getSimpleName() + "." + v.getSimpleName();
+                String symbol = composedSymbol(ref.getSimpleName(), v.getSimpleName());
                 out.add(symbol);
                 eventSymbolByConstant.put(
                         constantKey(ref.getQualifiedName(), v.getSimpleName()), symbol);
             }
-        } else {
-            out.add(ref.getSimpleName());
+            return out;
         }
+        // A member that *carries* an enum — `record Send(Signal signal)` — is not one
+        // input but a family of them. The real input is the pair, so Σ is the pair:
+        // {Send.HEADERS, Send.PUSH_PROMISE, ...}. This is the same closed-world move
+        // as the enum-member case one level down, and it is what makes an event
+        // modelled as `Send(HEADERS)` comparable with one modelled as a flat
+        // `SEND_HEADERS` constant — the two spellings then yield the same |Σ|.
+        //
+        // Deliberately NOT registered in eventSymbolByConstant: that table is keyed
+        // by the constant's owning type, and the same `Signal.HEADERS` occurs under
+        // both `Send` and `Recv`. The prefix is only knowable at the pattern that
+        // deconstructed the event, so the label is composed there instead.
+        CtEnum<?> component = soleEnumComponent(member);
+        if (component != null) {
+            for (CtEnumValue<?> v : component.getEnumValues()) {
+                out.add(composedSymbol(ref.getSimpleName(), v.getSimpleName()));
+            }
+            return out;
+        }
+        out.add(ref.getSimpleName());
         return out;
+    }
+
+    /**
+     * The single enum-typed component of an event member, or {@code null} when it
+     * has none or several. Several is ambiguous — nothing in the shape says which
+     * one discriminates the input — so Σ stays at the member itself rather than
+     * guessing one.
+     */
+    private static CtEnum<?> soleEnumComponent(CtType<?> member) {
+        if (member == null) return null;
+        CtEnum<?> found = null;
+        try {
+            for (CtField<?> f : member.getFields()) {
+                if (f.isStatic()) continue;
+                CtTypeReference<?> t = f.getType();
+                CtType<?> decl = t == null ? null : t.getTypeDeclaration();
+                if (decl instanceof CtEnum<?> en && !en.getEnumValues().isEmpty()) {
+                    if (found != null) return null; // ambiguous
+                    found = en;
+                }
+            }
+        } catch (Throwable ignored) {
+            return null;
+        }
+        return found;
+    }
+
+    /**
+     * How a qualified event symbol is spelled, in ONE place. Σ enumeration and edge
+     * labelling both go through it, so the alphabet and the labels cannot drift
+     * apart into two spellings of the same input.
+     */
+    private static String composedSymbol(String prefix, String constant) {
+        return prefix + "." + constant;
     }
 
     private static String constantKey(String ownerQualifiedName, String constant) {
@@ -374,6 +516,7 @@ public final class TransitionExtractor {
         CtElement body = callableBody(callable);
         if (body == null) return;
 
+        commitForms.add(CommitForm.VALUE_RETURN);
         this.selector = sel;
         try {
             walkFunctional(body, FromCtx.all(concreteStateSimpleNames), functionalEventLabel(callable), null, out);
@@ -630,6 +773,8 @@ public final class TransitionExtractor {
                 if (ret != null && hierarchyQualifiedNames.contains(ret.getQualifiedName())) {
                     continue; // returns the hierarchy type — the distributed walker owns it
                 }
+                commitForms.add(CommitForm.POLY_CARRIER);
+                dispatchedStates.add(declaring.getSimpleName());
                 // Σ and the event-parameter names are per-method, and drive the
                 // event attribution performed by splitEventCondition below.
                 enumerateEventAlphabet(m);
@@ -733,10 +878,9 @@ public final class TransitionExtractor {
                                    String guard, Set<Transition> out) {
         boolean overEvent = isEventDispatch(sw);
         for (CtCase<?> c : sw.getCases()) {
-            String caseEvent = event;
-            if (overEvent) {
-                String ev = caseEventName(c);
-                if (ev != null) caseEvent = ev; // default arm keeps the inherited event
+            List<String> caseEvents = overEvent ? caseEventNames(c) : List.of();
+            if (caseEvents.isEmpty()) {
+                caseEvents = Collections.singletonList(event); // default arm inherits
             }
             String caseGuard = merge(guard, caseGuard(c));
             boolean prev = otherwisePath;
@@ -744,8 +888,10 @@ public final class TransitionExtractor {
             // residual of every labelled arm — the default edge.
             if (c.getCaseExpressions().isEmpty()) otherwisePath = true;
             try {
-                for (CtStatement st : c.getStatements()) {
-                    walkCarrier(st, from, caseEvent, caseGuard, out);
+                for (String caseEvent : caseEvents) {
+                    for (CtStatement st : c.getStatements()) {
+                        walkCarrier(st, from, caseEvent, caseGuard, out);
+                    }
                 }
             } finally {
                 otherwisePath = prev;
@@ -947,6 +1093,7 @@ public final class TransitionExtractor {
         if (stateFieldNames.isEmpty() && mutatorNames.isEmpty()) return;
 
         mutationMode = true;
+        commitForms.add(CommitForm.FIELD_MUTATION);
         try {
             for (CtMethod<?> m : findMutationMethods(model)) {
                 CtType<?> declaring = m.getDeclaringType();
@@ -958,6 +1105,7 @@ public final class TransitionExtractor {
                         && hierarchyQualifiedNames.contains(declaring.getQualifiedName())
                         ? declaring.getSimpleName()
                         : null;
+                if (from != null) dispatchedStates.add(from);
                 // Mutation-style event labelling is future work (as for
                 // centralized), so the event label stays null.
                 walk(m.getBody(), from, null, null, out);
@@ -1479,14 +1627,28 @@ public final class TransitionExtractor {
      * each arm's from-state is the matched type pattern. When it dispatches on the
      * event type (finding F4), each arm's event label is the matched event —
      * mirroring the state case exactly. Otherwise both are inherited.
+     *
+     * <p>A multi-label arm ({@code case SEND_RST_STREAM, RECV_RST_STREAM -> ...})
+     * is walked once <em>per label</em>. Those are distinct inputs of Σ that happen
+     * to share a body, so collapsing them into one edge would silently drop every
+     * label but the first — the same reasoning that makes a disjunction of event
+     * tests several edges in the carrier walk.
+     *
+     * <p>A third dispatch kind appears one level further in: when an event arm
+     * deconstructs its event ({@code case Send(Signal s) ->}) and its body switches
+     * on the binding, that inner switch selects the <em>component</em>, and the two
+     * levels together name one input. Its arms are labelled with the composed
+     * symbol {@code Send.HEADERS} rather than with the bare family {@code Send},
+     * which is what lets an event modelled as a record-plus-enum be compared with
+     * the same event modelled as a flat constant.
      */
     private void walkSwitch(CtAbstractSwitch<?> sw, String from, String event,
                             String guard, Set<Transition> out) {
         boolean overState = isStateDispatch(sw);
         boolean overEvent = !overState && isEventDispatch(sw);
+        boolean overComponent = !overState && !overEvent && isComponentDispatch(sw);
         for (CtCase<?> c : sw.getCases()) {
             String caseFrom = from;
-            String caseEvent = event;
             if (overState) {
                 caseFrom = caseFromState(c);
                 if (caseFrom == null) {
@@ -1494,16 +1656,120 @@ public final class TransitionExtractor {
                             + truncate(safeText(c)));
                     // fall through with a null from so produced targets are still
                     // recorded (as undetermined-origin) rather than dropped.
+                } else {
+                    // The arm matched this state, so anything it fails to produce is
+                    // an absence the analysis observed rather than one it missed.
+                    dispatchedStates.add(caseFrom);
                 }
-            } else if (overEvent) {
-                String ev = caseEventName(c);
-                if (ev != null) caseEvent = ev; // default/unmatched arm keeps inherited event
+            }
+            List<String> caseEvents = overEvent ? caseEventNames(c)
+                    : overComponent ? componentEventNames(c)
+                    : List.<String>of();
+            if (caseEvents.isEmpty()) {
+                // Not an event dispatch, or an unlabelled `default` arm: the
+                // inherited event label carries through unchanged. Inside a
+                // component switch that inherited label is the bare family name
+                // (`Send`), which is the honest reading — the arm fires for every
+                // component value the labelled arms did not name.
+                caseEvents = Collections.singletonList(event); // may hold null
             }
             String caseGuard = merge(guard, caseGuard(c));
-            for (CtStatement st : c.getStatements()) {
-                walk(st, caseFrom, caseEvent, caseGuard, out);
+            // If this arm deconstructed its event, remember the binding so a switch
+            // on it inside the arm body refines the label instead of inheriting it.
+            ComponentEvent binding = overEvent && caseEvents.size() == 1
+                    ? componentBindingOf(c, caseEvents.get(0)) : null;
+            ComponentEvent savedComponent = componentEvent;
+            if (binding != null) componentEvent = binding;
+            try {
+                for (String caseEvent : caseEvents) {
+                    for (CtStatement st : c.getStatements()) {
+                        walk(st, caseFrom, caseEvent, caseGuard, out);
+                    }
+                }
+            } finally {
+                componentEvent = savedComponent;
             }
         }
+    }
+
+    /**
+     * Is this switch selecting the component bound by the enclosing event arm?
+     * Matched on the binding's NAME and its enum TYPE together: a record-pattern
+     * binding has no resolvable declaration in the Spoon model (verified — the
+     * inner selector's {@code getDeclaration()} is {@code null}), so identity
+     * comparison is unavailable, and the name alone would claim an unrelated
+     * switch that happened to reuse a one-letter variable.
+     */
+    private boolean isComponentDispatch(CtAbstractSwitch<?> sw) {
+        ComponentEvent ctx = componentEvent;
+        if (ctx == null) return false;
+        CtExpression<?> sel;
+        try {
+            sel = sw.getSelector();
+        } catch (Throwable t) {
+            return false;
+        }
+        if (!(sel instanceof CtVariableAccess<?> va) || va.getVariable() == null) return false;
+        if (!ctx.boundName().equals(va.getVariable().getSimpleName())) return false;
+        CtTypeReference<?> t = sel.getType();
+        return t != null && ctx.enumQualifiedName().equals(t.getQualifiedName());
+    }
+
+    /**
+     * The binding a record-pattern event arm introduced, or {@code null} when the
+     * arm binds no single enum component. Requiring exactly one keeps this in step
+     * with {@link #soleEnumComponent}: where Σ declined to expand, the label
+     * declines to compose, so the two can never describe different alphabets.
+     */
+    private ComponentEvent componentBindingOf(CtCase<?> c, String prefix) {
+        if (prefix == null) return null;
+        try {
+            for (CtExpression<?> ce : c.getCaseExpressions()) {
+                Object pattern = tryMethod(ce, "getPattern");
+                if (pattern == null) continue;
+                if (!(tryMethod(pattern, "getPatternList") instanceof List<?> subs)) continue;
+                ComponentEvent found = null;
+                for (Object sub : subs) {
+                    Object variable = tryMethod(sub, "getVariable");
+                    if (variable == null) continue;
+                    if (!(tryMethod(variable, "getSimpleName") instanceof String name)) continue;
+                    if (!(tryMethod(variable, "getType") instanceof CtTypeReference<?> t)) continue;
+                    if (!(t.getTypeDeclaration() instanceof CtEnum<?> en)
+                            || en.getEnumValues().isEmpty()) {
+                        continue;
+                    }
+                    if (found != null) return null; // several enum components — ambiguous
+                    found = new ComponentEvent(prefix, name, t.getQualifiedName());
+                }
+                if (found != null) return found;
+            }
+        } catch (Throwable ignored) {
+            // best effort: no binding simply means the arm keeps its family label
+        }
+        return null;
+    }
+
+    /**
+     * The Σ symbols an arm of a component switch matches: the enclosing event
+     * prefix joined to each matched constant. A composed symbol is emitted only if
+     * Σ already contains it — Σ is enumerated from the types and is the authority,
+     * so a label can never name an input the alphabet does not have. When it does
+     * not, the arm falls back to inheriting the bare family label.
+     */
+    private List<String> componentEventNames(CtCase<?> c) {
+        List<String> out = new ArrayList<>();
+        ComponentEvent ctx = componentEvent;
+        if (ctx == null) return out;
+        try {
+            for (CtExpression<?> ce : c.getCaseExpressions()) {
+                if (!(ce instanceof CtFieldAccess<?> fa) || fa.getVariable() == null) continue;
+                String composed = composedSymbol(ctx.prefix(), fa.getVariable().getSimpleName());
+                if (alphabet.contains(composed)) out.add(composed);
+            }
+        } catch (Throwable ignored) {
+            // best effort — an unreadable label keeps the inherited event
+        }
+        return out;
     }
 
     private void emit(String from, String event, String guard,
@@ -1616,27 +1882,45 @@ public final class TransitionExtractor {
     }
 
     /**
-     * The event matched by a switch-over-event arm (F4): the type pattern for a
-     * sealed event ({@code case Lock l ->}) or the constant name for an enum
-     * event ({@code case LOCK ->}). Returns {@code null} for a {@code default}
-     * arm, so the inherited event label is kept.
+     * The events matched by a switch-over-event arm (F4), in label order: a type
+     * pattern for a sealed event ({@code case Lock l ->}) or a constant for an
+     * enum event ({@code case SEND_HEADERS ->}). Returns an empty list for a
+     * {@code default} arm, so the inherited event label is kept.
+     *
+     * <p>The enum-constant case is checked <em>first</em>, and the order is
+     * load-bearing. A constant read carries the enum's own type, so asking
+     * {@link #patternType} first answers "the event type" — labelling every arm of
+     * {@code switch (event)} with the name of the enum instead of the constant it
+     * matched, and collapsing the whole alphabet to a single symbol.
      */
-    private String caseEventName(CtCase<?> c) {
+    private List<String> caseEventNames(CtCase<?> c) {
+        List<String> out = new ArrayList<>();
         try {
             for (CtExpression<?> ce : c.getCaseExpressions()) {
+                String constant = enumConstantSymbol(ce);
+                if (constant != null) {
+                    out.add(constant);
+                    continue;
+                }
+                // A constant outside Σ (or unresolvable under noClasspath) still
+                // names itself; the bare simple name is what the source says.
+                if (ce instanceof CtFieldAccess<?> fa && fa.getVariable() != null) {
+                    out.add(fa.getVariable().getSimpleName());
+                    continue;
+                }
                 CtTypeReference<?> t = patternType(ce);
                 if (t != null && eventQualifiedNames.contains(t.getQualifiedName())) {
-                    return t.getSimpleName();
+                    out.add(t.getSimpleName());
+                    continue;
                 }
-                // enum constant label: `case LOCK ->` reads the constant.
                 if (ce instanceof CtVariableAccess<?> va && va.getVariable() != null) {
-                    return va.getVariable().getSimpleName();
+                    out.add(va.getVariable().getSimpleName());
                 }
             }
         } catch (Throwable ignored) {
-            // best effort — fall through to null (keep inherited event)
+            // best effort — an unreadable label keeps the inherited event
         }
-        return null;
+        return out;
     }
 
     /** Guarded-pattern {@code when} clause, if present and supported. */

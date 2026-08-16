@@ -18,7 +18,7 @@ class ScxmlSerializerTest {
 
     private StateMachine compositeSample() {
         StateMachine m = new StateMachine("Phone",
-                "examples.phone.Phone", StateMachine.Encoding.DISTRIBUTED);
+                "examples.phone.Phone", StateMachine.Encoding.POLYMORPHIC);
         State idle = new State("Idle", "examples.phone.Idle", false);
         State active = new State("Active", "examples.phone.Active", true); // composite
         active.addChild(new State("Talking", "examples.phone.Talking", false));
@@ -36,6 +36,36 @@ class ScxmlSerializerTest {
     void producesWellFormedXml() {
         String xml = new ScxmlSerializer().serialize(compositeSample());
         assertDoesNotThrow(() -> parse(xml), "SCXML output must be well-formed XML");
+    }
+
+    @Test
+    void terminalLeafBecomesFinalButACompositeNeverDoes() throws Exception {
+        // <final> is SCXML's spelling of an absorbing state, and it may contain
+        // neither transitions nor children — which fits a terminal leaf exactly.
+        // A composite is a different matter: it may have no outbound edge of its
+        // own while its children have plenty, and <final> cannot hold them, so
+        // emitting one would delete part of the machine from the document.
+        StateMachine m = new StateMachine("Latch",
+                "examples.barefield.Latch", StateMachine.Encoding.CENTRALIZED_DISPATCH);
+        State idle = new State("Idle", "examples.barefield.Idle", false);
+        State fired = new State("Fired", "examples.barefield.Fired", false);
+        State group = new State("Group", "examples.barefield.Group", true); // composite
+        group.addChild(new State("Inner", "examples.barefield.Inner", false));
+        m.addTopLevelState(idle);
+        m.addTopLevelState(fired);
+        m.addTopLevelState(group);
+        m.addTransition(Transition.resolved("Idle", "Fired", "TRIGGER", null));
+        m.addTransition(Transition.resolved("Inner", "Idle", "RESET", null));
+        m.markTerminalStates(java.util.Set.of("Idle", "Fired", "Group", "Inner"));
+        m.setInitialState("Idle");
+
+        String xml = new ScxmlSerializer().serialize(m);
+        assertDoesNotThrow(() -> parse(xml), "SCXML output must stay well-formed");
+        assertTrue(xml.contains("<final id=\"Fired\">"), "the terminal leaf is <final>");
+        assertTrue(xml.contains("</final>"));
+        assertTrue(xml.contains("<state id=\"Idle\">"), "a state with an exit stays <state>");
+        assertTrue(xml.contains("<state id=\"Group\" initial=\"Inner\">"),
+                "a composite stays <state> so its children survive");
     }
 
     @Test
@@ -96,7 +126,7 @@ class ScxmlSerializerTest {
     /** A machine whose entry point is the synthetic pseudo-state (the F7 shape). */
     private StateMachine entryPseudoStateSample() {
         StateMachine m = new StateMachine("Request",
-                "examples.req.Request", StateMachine.Encoding.CENTRALIZED);
+                "examples.req.Request", StateMachine.Encoding.CENTRALIZED_DISPATCH);
         m.addTopLevelState(new State("Pending", "examples.req.Pending", false));
         m.addTopLevelState(new State("Cancelled", "examples.req.Cancelled", false));
         m.addTransition(Transition.resolved("Pending", "Cancelled", "add", null));
@@ -146,7 +176,7 @@ class ScxmlSerializerTest {
         // It must stay visible (it depresses recall) without adding a fiction to
         // the model, so it is a comment rather than a <state>.
         StateMachine m = new StateMachine("Gapped",
-                "examples.gap.Gapped", StateMachine.Encoding.CENTRALIZED);
+                "examples.gap.Gapped", StateMachine.Encoding.CENTRALIZED_DISPATCH);
         m.addTopLevelState(new State("Only", "examples.gap.Only", false));
         m.addTransition(Transition.unresolved("<unknown>", null, "coins > 0", "ctx.set(x)"));
         m.setInitialState("Only");

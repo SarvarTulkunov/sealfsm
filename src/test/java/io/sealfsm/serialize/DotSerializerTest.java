@@ -16,7 +16,7 @@ class DotSerializerTest {
 
     private StateMachine sample() {
         StateMachine m = new StateMachine("TrafficLight",
-                "examples.traffic.TrafficLight", StateMachine.Encoding.DISTRIBUTED);
+                "examples.traffic.TrafficLight", StateMachine.Encoding.POLYMORPHIC);
         m.addTopLevelState(new State("Red", "examples.traffic.Red", false));
         m.addTopLevelState(new State("Green", "examples.traffic.Green", false));
         m.addTopLevelState(new State("Yellow", "examples.traffic.Yellow", false));
@@ -50,12 +50,51 @@ class DotSerializerTest {
         assertFalse(dot.contains("\"Green\" [penwidth=2"));
     }
 
+    @Test
+    void terminalStateGetsADoubleBorder() {
+        // A state the dispatch matched but from which every path rejects is
+        // absorbing, and the conventional automaton notation for that is a double
+        // border. Marking it is a positive claim, so the serializer must only
+        // reflect the flag, never re-derive it from "has no outgoing edge here".
+        StateMachine m = sample();
+        m.markTerminalStates(java.util.Set.of("Red", "Green", "Yellow"));
+        String dot = new DotSerializer().serialize(m);
+        assertFalse(dot.contains("peripheries=2"),
+                "every state has an outbound edge, so none is terminal");
+
+        StateMachine absorbing = new StateMachine("Latch",
+                "examples.barefield.Latch", StateMachine.Encoding.CENTRALIZED_DISPATCH);
+        absorbing.addTopLevelState(new State("Idle", "examples.barefield.Idle", false));
+        absorbing.addTopLevelState(new State("Fired", "examples.barefield.Fired", false));
+        absorbing.addTransition(Transition.resolved("Idle", "Fired", "TRIGGER", null));
+        absorbing.markTerminalStates(java.util.Set.of("Idle", "Fired"));
+        String out = new DotSerializer().serialize(absorbing);
+        assertTrue(out.contains("\"Fired\" [peripheries=2]"), "the absorbing state is doubled");
+        assertFalse(out.contains("\"Idle\" [peripheries=2]"), "a state with an exit is not terminal");
+    }
+
+    @Test
+    void aStateTheDispatchNeverMatchedIsNotCalledTerminal() {
+        // The distinction that keeps "terminal" honest: zero outbound edges means
+        // "absorbing" only when the analysis actually looked. A state no arm
+        // matched has no edges because none were recovered, and reporting that as
+        // terminal would dress a recall gap as a result.
+        StateMachine m = new StateMachine("Latch",
+                "examples.barefield.Latch", StateMachine.Encoding.CENTRALIZED_DISPATCH);
+        m.addTopLevelState(new State("Idle", "examples.barefield.Idle", false));
+        m.addTopLevelState(new State("Unseen", "examples.barefield.Unseen", false));
+        m.addTransition(Transition.resolved("Idle", "Idle", "RESET", null));
+        m.markTerminalStates(java.util.Set.of("Idle"));   // Unseen was never dispatched
+        assertFalse(new DotSerializer().serialize(m).contains("peripheries=2"),
+                "an unvisited state must not be reported as terminal");
+    }
+
     // ---- composite states ---------------------------------------------------
 
     /** A machine with a composite state that edges enter, leave and loop on. */
     private StateMachine compositeSample() {
         StateMachine m = new StateMachine("Signal",
-                "valueforms.Signal", StateMachine.Encoding.DISTRIBUTED);
+                "valueforms.Signal", StateMachine.Encoding.POLYMORPHIC);
         m.addTopLevelState(new State("Idle", "valueforms.Idle", false));
         State phase = new State("Phase", "valueforms.Phase", true);
         phase.addChild(new State("RAMP", "valueforms.Phase.RAMP", false));

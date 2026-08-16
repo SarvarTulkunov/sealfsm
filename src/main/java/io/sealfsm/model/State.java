@@ -24,6 +24,7 @@ public final class State {
     private final String id;            // simple type name; unique within a machine
     private final String qualifiedName; // fully-qualified type name
     private boolean initial;
+    private boolean terminal;
     private final boolean composite;
     private final List<State> children = new ArrayList<>();
 
@@ -47,6 +48,21 @@ public final class State {
 
     public void setInitial(boolean initial) {
         this.initial = initial;
+    }
+
+    /**
+     * True when the dispatch matched this state and every path out of it throws
+     * (or otherwise produces no successor): an absorbing state with zero outbound
+     * edges. Set by {@link StateMachine#markTerminalStates(java.util.Set)}, which
+     * deliberately refuses to mark a state the dispatch never mentioned — that is
+     * a recall gap, not a terminal state.
+     */
+    public boolean isTerminal() {
+        return terminal;
+    }
+
+    public void setTerminal(boolean terminal) {
+        this.terminal = terminal;
     }
 
     public boolean isComposite() {
@@ -75,6 +91,7 @@ public final class State {
 
     @Override
     public String toString() {
-        return "State{" + id + (composite ? ", composite" : "") + (initial ? ", initial" : "") + '}';
+        return "State{" + id + (composite ? ", composite" : "") + (initial ? ", initial" : "")
+                + (terminal ? ", terminal" : "") + '}';
     }
 }

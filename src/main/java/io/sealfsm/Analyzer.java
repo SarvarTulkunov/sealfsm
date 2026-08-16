@@ -7,6 +7,7 @@ import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.detect.StateMachineClassifier.Classification;
 import io.sealfsm.extract.StateExtractor;
 import io.sealfsm.extract.TransitionExtractor;
+import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.ExtractionResult;
 import io.sealfsm.model.State;
 import io.sealfsm.model.StateMachine;
@@ -68,6 +69,17 @@ public final class Analyzer {
             for (String symbol : te.alphabet()) {
                 machine.addAlphabetSymbol(symbol);
             }
+            // The commit axis, orthogonal to encoding and to successor form: how
+            // each recovered successor was installed. Reported so recall can be
+            // stratified by idiom rather than pooled per encoding.
+            for (CommitForm cf : te.commitForms()) {
+                machine.addCommitForm(cf);
+            }
+            // A state the dispatch matched but from which nothing is produced is
+            // absorbing — RFC 9113's `Closed`, whose every arm throws. A state the
+            // dispatch never matched is not: that is a recall gap, and
+            // markTerminalStates refuses to promote it.
+            machine.markTerminalStates(te.dispatchedStates());
             for (String d : te.diagnostics()) {
                 result.warn(root.getQualifiedName(), d);
             }

@@ -120,13 +120,22 @@ public final class ScxmlSerializer {
     private void emitState(StateMachine m, State s, StringBuilder sb, String indent,
                            Set<String> composites) {
         boolean composite = s.isComposite() && !s.children().isEmpty();
-        sb.append(indent).append("<state id=\"").append(attr(s.id())).append('"');
+        // SCXML's <final> is the standard spelling of an absorbing state, and it
+        // cannot contain transitions — which is precisely the condition under which
+        // the analyzer marks a state terminal. A composite is never emitted as
+        // <final> even if nothing leaves it, since <final> may hold no children.
+        String tag = (s.isTerminal() && !composite) ? "final" : "state";
+        sb.append(indent).append('<').append(tag).append(" id=\"").append(attr(s.id())).append('"');
 
         // For a composite state, default its initial child to the first one declared.
         if (composite) {
             sb.append(" initial=\"").append(attr(s.children().get(0).id())).append('"');
         }
         sb.append(">\n");
+        if ("final".equals(tag)) {
+            sb.append(indent).append("  <!-- terminal: the dispatch matched this state and every\n")
+              .append(indent).append("       path out of it rejects, so it has no outbound edge -->\n");
+        }
 
         // Outgoing transitions whose source is this state.
         for (Transition t : m.transitions()) {
@@ -139,7 +148,7 @@ public final class ScxmlSerializer {
                 emitState(m, child, sb, indent + "  ", composites);
             }
         }
-        sb.append(indent).append("</state>\n");
+        sb.append(indent).append("</").append(tag).append(">\n");
     }
 
     private void emitTransition(Transition t, StringBuilder sb, String indent, Set<String> composites) {

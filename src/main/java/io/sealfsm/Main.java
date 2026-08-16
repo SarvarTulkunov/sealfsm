@@ -95,16 +95,17 @@ public final class Main {
         System.out.println();
         System.out.printf("Found %d state machine(s); wrote %d file(s) to %s%n",
                 result.machines().size(), written, out.toAbsolutePath());
-        System.out.println("-".repeat(96));
-        System.out.printf("%-22s %-12s %6s %6s %9s  %s%n",
-                "MACHINE", "DISPATCH", "STATES", "TRANS", "RESOLVED", "SUCCESSOR FORMS");
+        System.out.println("-".repeat(112));
+        System.out.printf("%-22s %-20s %6s %6s %9s  %-28s %s%n",
+                "MACHINE", "DISPATCH", "STATES", "TRANS", "RESOLVED", "COMMIT", "SUCCESSOR FORMS");
         for (StateMachine m : result.machines()) {
-            System.out.printf("%-22s %-12s %6d %6d %9s  %s%n",
+            System.out.printf("%-22s %-20s %6d %6d %9s  %-28s %s%n",
                     truncate(m.name(), 22),
                     m.encoding(),
                     m.allStates().size(),
                     m.transitions().size(),
                     m.resolvedTransitionCount() + "/" + m.transitions().size(),
+                    commitList(m),
                     formList(m));
         }
         printEncodingRollup(result);
@@ -119,6 +120,12 @@ public final class Main {
     private static String formList(StateMachine m) {
         if (m.successorForms().isEmpty()) return "-";
         return m.successorForms().stream().map(Enum::name).sorted().collect(Collectors.joining(","));
+    }
+
+    /** How the machine's dispatch installed its successors, compactly. */
+    private static String commitList(StateMachine m) {
+        if (m.commitForms().isEmpty()) return "-";
+        return m.commitForms().stream().map(Enum::name).sorted().collect(Collectors.joining(","));
     }
 
     /**
@@ -141,11 +148,11 @@ public final class Main {
                 if (t.form() != null) byForm.merge(t.form(), 1, Integer::sum);
             }
         }
-        System.out.println("-".repeat(96));
-        System.out.printf("%-22s %-12s %6s %6s %9s%n",
+        System.out.println("-".repeat(112));
+        System.out.printf("%-22s %-20s %6s %6s %9s%n",
                 "BY DISPATCH", "", "MACHINES", "TRANS", "RESOLVED");
         byDispatch.forEach((enc, acc) ->
-                System.out.printf("%-22s %-12s %6d %6d %9s%n",
+                System.out.printf("%-22s %-20s %6d %6d %9s%n",
                         "", enc, acc[0], acc[2], acc[1] + "/" + acc[2]));
         if (!byForm.isEmpty()) {
             System.out.printf("%-22s %s%n", "BY SUCCESSOR FORM",

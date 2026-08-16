@@ -30,9 +30,15 @@ import java.util.Set;
  * <ol>
  *   <li>An explicit {@code @Fsm}/{@code @FSM}/{@code @StateMachine} annotation
  *       on the root is decisive (opt-in / ground-truth pinning).</li>
- *   <li>Otherwise, structural signals: methods that return a type within the
- *       hierarchy ({@code DISTRIBUTED}), and/or a transition function taking and
- *       returning the hierarchy type ({@code CENTRALIZED}).</li>
+ *   <li>The compositional veto: a hierarchy whose members are built out of one
+ *       another is a recursive data type, never an automaton.</li>
+ *   <li>Otherwise, structural signals, in order of specificity: methods that
+ *       return a type within the hierarchy ({@code POLYMORPHIC}), a transition
+ *       function taking and returning the hierarchy type, a functional callable
+ *       with that signature, a switch over the hierarchy whose result is
+ *       committed as a hierarchy value ({@code CENTRALIZED_DISPATCH}), or a
+ *       per-state method handing the successor to a carrier
+ *       ({@code POLYMORPHIC}).</li>
  * </ol>
  */
 public final class StateMachineClassifier {
@@ -72,22 +78,27 @@ public final class StateMachineClassifier {
         // F7: a transition function need not be a named method — it may be a lambda
         // or an anonymous-class functional method with the same hierarchy-in /
         // hierarchy-out signature. These are centralized-style, so they count
-        // towards CENTRALIZED classification exactly as a named function would.
+        // towards CENTRALIZED_DISPATCH classification exactly as a named function would.
         List<CtElement> functional = findFunctionalTransitionCallables(root, model);
+        // A switch over the hierarchy whose result is committed as a hierarchy
+        // value, wherever it is hosted and however it is installed. This is the
+        // widened centralized recognizer; the commit requirement is what keeps
+        // exhaustive folds (switch-over-state producing a String) out.
+        List<DispatchCommitDetector.Producer> producers = DispatchCommitDetector.find(root, model);
 
         boolean hasDist = !distributed.isEmpty();
-        boolean hasCentral = !centralized.isEmpty() || !functional.isEmpty();
+        boolean hasCentral = !centralized.isEmpty() || !functional.isEmpty() || !producers.isEmpty();
 
         if (hasDist && hasCentral) {
             return Classification.yes(Encoding.MIXED,
                     "both per-state and centralized transition methods present");
         }
         if (hasCentral) {
-            return Classification.yes(Encoding.CENTRALIZED,
-                    (centralized.size() + functional.size()) + " centralized transition function(s)");
+            return Classification.yes(Encoding.CENTRALIZED_DISPATCH, centralizedReason(
+                    centralized.size() + functional.size(), producers));
         }
         if (hasDist) {
-            return Classification.yes(Encoding.DISTRIBUTED,
+            return Classification.yes(Encoding.POLYMORPHIC,
                     distributed.size() + " per-state transition method(s)");
         }
         // F8: nothing returns the hierarchy type, but each permitted subtype may
@@ -96,15 +107,34 @@ public final class StateMachineClassifier {
         // existing recognizers already accept keeps its existing classification
         // and the widening can only add machines, never reclassify one.
         //
-        // The result is DISTRIBUTED, not an encoding of its own: dispatch lives in
+        // The result is POLYMORPHIC, not an encoding of its own: dispatch lives in
         // a per-state method either way, and only the *spelling* of the successor
         // differs — which is the orthogonal SuccessorForm axis, recorded per edge.
         if (CarrierTransitionDetector.qualifies(root)) {
-            return Classification.yes(Encoding.DISTRIBUTED, carrierReason(root));
+            return Classification.yes(Encoding.POLYMORPHIC, carrierReason(root));
         }
+        // Abstention, stated as abstention. The old wording ("looks like a plain
+        // sum type") asserted a positive classification the analysis had not made:
+        // a sealed type reaches this line just as readily by being the event
+        // alphabet Σ, or by being dispatched somewhere the recognizers cannot see.
         return Classification.no(
-                "no hierarchy-returning or carrier-based transition method found "
-                        + "(may be Σ/event type or externally dispatched)");
+                "no transition producer found (may be event/Σ type or unresolved dispatch)");
+    }
+
+    /**
+     * Reason text for centralized dispatch, naming the commit form(s) so the
+     * classification says which idiom was recognised rather than only that one was.
+     */
+    private static String centralizedReason(int functionCount,
+                                            List<DispatchCommitDetector.Producer> producers) {
+        if (producers.isEmpty()) {
+            return functionCount + " centralized transition function(s)";
+        }
+        Set<String> commits = new LinkedHashSet<>();
+        for (DispatchCommitDetector.Producer p : producers) commits.add(p.commit().name());
+        int total = functionCount + producers.size();
+        return total + " centralized transition function(s), committing via "
+                + String.join("/", commits);
     }
 
     /** Reason text for a carrier-encoded machine, naming the shared method when there is one. */
@@ -118,11 +148,12 @@ public final class StateMachineClassifier {
     private Encoding detectEncoding(CtType<?> root, CtModel model) {
         boolean dist = !findDistributedTransitionMethods(root).isEmpty();
         boolean central = !findCentralizedTransitionMethods(root, model).isEmpty()
-                || !findFunctionalTransitionCallables(root, model).isEmpty();
+                || !findFunctionalTransitionCallables(root, model).isEmpty()
+                || !DispatchCommitDetector.find(root, model).isEmpty();
         if (dist && central) return Encoding.MIXED;
-        if (central) return Encoding.CENTRALIZED;
-        if (dist) return Encoding.DISTRIBUTED;
-        if (CarrierTransitionDetector.qualifies(root)) return Encoding.DISTRIBUTED;
+        if (central) return Encoding.CENTRALIZED_DISPATCH;
+        if (dist) return Encoding.POLYMORPHIC;
+        if (CarrierTransitionDetector.qualifies(root)) return Encoding.POLYMORPHIC;
         return Encoding.MIXED; // annotated but shapeless; extractor will report gaps
     }
 

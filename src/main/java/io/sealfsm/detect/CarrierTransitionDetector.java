@@ -220,6 +220,31 @@ public final class CarrierTransitionDetector {
         return name;
     }
 
+    /**
+     * The sibling-vs-nested predicate applied to a single produced value, exposed
+     * so the centralized-dispatch recognizer applies the <em>same</em> guard rather
+     * than growing a second, subtly different notion of "recursive data type".
+     * True when {@code value} <em>constructs</em> a hierarchy node out of other
+     * hierarchy values — {@code new Add(simplify(l), simplify(r))} — and false for
+     * a peer production such as {@code new SynReceived(true)}.
+     *
+     * <p>Only a {@link CtConstructorCall} counts as the nesting node, and that
+     * restriction is load-bearing. Passing the current state to a helper that
+     * computes the successor — {@code case Idle s -> fromIdle(s, event)}, the
+     * ordinary way a large centralized switch is factored — puts a hierarchy value
+     * in the argument list of a hierarchy-returning call, which is delegation, not
+     * composition. Treating an invocation as a nesting node would veto every
+     * machine written that way, including the one this predicate is meant to
+     * protect. A tree builder is recognised by the node it BUILDS, not by what it
+     * passes around.
+     */
+    public static boolean nestsHierarchyValue(CtExpression<?> value, Set<String> hierarchy) {
+        if (!(value instanceof CtConstructorCall<?> cc)) return false;
+        CtTypeReference<?> t = cc.getType();
+        if (t == null || !hierarchy.contains(t.getQualifiedName())) return false;
+        return buildsFromHierarchy(cc, hierarchy);
+    }
+
     // ---- production scanning --------------------------------------------------
 
     /** Every hierarchy value produced by the method's returned/yielded expressions. */

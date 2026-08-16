@@ -122,9 +122,17 @@ public final class DotSerializer {
             sb.append(indent).append("}\n");
         } else {
             sb.append(indent).append(q(s.id()));
+            List<String> attrs = new ArrayList<>();
             if (s.isInitial()) {
-                sb.append(" [penwidth=2, color=\"#1a73e8\"]");
+                attrs.add("penwidth=2");
+                attrs.add("color=\"#1a73e8\"");
             }
+            if (s.isTerminal()) {
+                // Double border, the conventional accepting/terminal notation: the
+                // dispatch matched this state and every path out of it throws.
+                attrs.add("peripheries=2");
+            }
+            if (!attrs.isEmpty()) sb.append(" [").append(String.join(", ", attrs)).append("]");
             sb.append(";\n");
         }
     }
