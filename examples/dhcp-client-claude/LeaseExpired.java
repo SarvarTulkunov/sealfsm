@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The lease expired before it could be renewed or rebound, forcing the client

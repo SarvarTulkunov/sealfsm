@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The client has selected an offer and broadcast a DHCPREQUEST for it, awaiting

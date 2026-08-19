@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The initial state for acquiring a new lease. The client has no valid

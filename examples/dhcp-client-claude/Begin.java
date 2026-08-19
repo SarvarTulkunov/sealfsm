@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The client begins the configuration process from an initial state, leaving

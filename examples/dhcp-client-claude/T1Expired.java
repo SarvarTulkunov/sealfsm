@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The renewal timer T1 expired, prompting the client to begin renewing its lease

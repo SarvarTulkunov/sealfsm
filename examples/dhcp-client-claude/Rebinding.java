@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The rebinding timer T2 has expired; the client is broadcasting DHCPREQUEST to

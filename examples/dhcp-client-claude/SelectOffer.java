@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The client selects one of the collected DHCPOFFER messages and requests it by

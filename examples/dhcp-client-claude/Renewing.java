@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The renewal timer T1 has expired; the client is unicasting DHCPREQUEST to the

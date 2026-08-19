@@ -35,7 +35,7 @@ The tool is built around that asymmetry. Anything it cannot resolve on the trans
  │              ▼                                      │
  │     ┌────────┴────────┐                             │
  │     ▼                 ▼                             │
- │  StateExtractor    TransitionExtractor               │
+ │  StateExtractor    TransitionExtractor              │
  │  (exact, from      (approximate, intra-             │
  │   permits)          procedural data-flow            │
  │     │               + TransitionResolver)           │
@@ -153,25 +153,48 @@ java -jar target/sealfsm.jar --src <path> [--src <path> ...] [options]
 
 ### Quick start with bundled examples
 
+The one-command path — build, run every example into its own `out/<name>/`,
+render every `.dot` to `.png` (requires Graphviz's `dot` on `PATH`), and save
+everything that was printed to `out/results.txt`:
+
+```powershell
+scripts\build-run-render.ps1
+```
+
+Useful flags: `-Example traffic` (just one example), `-SkipBuild` (reuse the
+existing jar), `-SkipTests` (faster build), `-SkipRender` (skip the PNG pass),
+`-Format dot|scxml|both`, `-IncludeDiagnostics` (also capture each example's
+`[INFO]`/`[WARN]` lines), `-ResultsFile <path>` (write the log somewhere else).
+Run `Get-Help scripts\build-run-render.ps1 -Full`
+for the complete list.
+
+Doing it by hand, for reference:
+
 ```bash
 # Build
 mvn package
 
-# Run against all examples
-java -jar target/sealfsm.jar --src examples --out out --format both
-
-# Run individual examples
+# Run each example into its own output directory — NOT one combined
+# `--src examples --out out`. Two examples are free to declare a type
+# with the same simple name (e.g. every DHCP fixture defines a
+# `DhcpState`), and Main.java names output files after the machine, not
+# the source directory: a flat --out silently lets the second run's
+# DhcpState.dot overwrite the first's. (A same-named Java *package*
+# across two example directories is worse — Spoon refuses to build the
+# model at all. Every example directory uses its own package for this
+# reason; keep that invariant when adding a new one.)
 java -jar target/sealfsm.jar --src examples/traffic --out out/traffic
 java -jar target/sealfsm.jar --src examples/door --out out/door
 java -jar target/sealfsm.jar --src examples/shape --out out/shape
 
 # Render diagrams
-dot -Tpng out/TrafficLight.dot -o TrafficLight.png
-dot -Tpng out/Door.dot -o Door.png
+dot -Tpng out/traffic/TrafficLight.dot -o TrafficLight.png
+dot -Tpng out/door/Door.dot -o Door.png
 
-# Verify against reference output
-diff out/TrafficLight.scxml sample-output/TrafficLight.scxml
-diff out/Door.dot sample-output/Door.dot
+# Verify against reference output (--strip-trailing-cr: sample-output/ is
+# checked in with CRLF: Files.writeString emits bare LF)
+diff --strip-trailing-cr out/traffic/TrafficLight.scxml sample-output/TrafficLight.scxml
+diff --strip-trailing-cr out/door/Door.dot sample-output/Door.dot
 ```
 
 ### Debugging and exploration

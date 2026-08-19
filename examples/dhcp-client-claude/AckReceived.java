@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * A DHCPACK message arrived from a server.

@@ -22,17 +22,35 @@ mvn package                    # build fat jar
 mvn test                       # run all tests
 mvn compile                    # compile only (for debug tools)
 
-# CLI
+# One command: clean build, run every examples/<name> into its own
+# out/<name>/, render every .dot to .png (needs Graphviz `dot` on PATH),
+# and save everything printed to out/results.txt (-IncludeDiagnostics to
+# also capture [INFO]/[WARN] lines, off by default)
+scripts\build-run-render.ps1
+scripts\build-run-render.ps1 -Example traffic -SkipBuild   # one example, reuse the jar
+
+# CLI, by hand
 java -jar target/sealfsm.jar --src examples/traffic --out out/traffic
-java -jar target/sealfsm.jar --src examples --out out/all --format both
 
 # Debug tools
 java -cp target/classes io.sealfsm.DebugHarness examples/traffic
 java -cp target/classes io.sealfsm.DebugAst examples/door --returns
 
 # Render diagram
-dot -Tpng out/TrafficLight.dot -o TrafficLight.png
+dot -Tpng out/traffic/TrafficLight.dot -o TrafficLight.png
 ```
+
+**Never run `--src examples --out out` as one combined invocation** (and never
+give a new `examples/<name>/` fixture a Java package another example already
+uses). Every example directory uses a distinct package for exactly this
+reason: two top-level types sharing one package makes Spoon refuse to build
+the model at all (`ModelBuildingException: The type X is already defined`),
+and even past that, `Main` names output files after the *machine*, not the
+source directory — a flat `--out` lets a second same-named machine (e.g. two
+different `DhcpState` fixtures) silently overwrite the first's `.dot`, no
+warning. `scripts\build-run-render.ps1` runs each example into its own
+`out/<name>/` and sidesteps both failure modes; use it (or per-directory `--src`
+calls) instead of the combined form.
 
 ## Tech stack
 

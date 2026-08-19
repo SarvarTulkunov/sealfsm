@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The rebinding timer T2 expired, prompting the client to begin rebinding its

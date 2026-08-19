@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The client has broadcast a DHCPDISCOVER and is collecting DHCPOFFER messages

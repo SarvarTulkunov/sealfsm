@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The client has sent a DHCPREQUEST to confirm a cached address and is awaiting

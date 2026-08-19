@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * Lifecycle state of a DHCP client, following the state-transition diagram in

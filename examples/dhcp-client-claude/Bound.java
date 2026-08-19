@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * The client holds a valid lease and is fully configured. It remains here until

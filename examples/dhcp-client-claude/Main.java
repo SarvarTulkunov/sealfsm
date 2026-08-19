@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * Drives one typical DHCP client path: acquiring a new lease and then renewing

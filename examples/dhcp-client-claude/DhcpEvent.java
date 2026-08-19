@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * An input that drives the DHCP client between states: a message received from a

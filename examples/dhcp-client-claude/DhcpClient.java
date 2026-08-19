@@ -1,4 +1,4 @@
-package dhcp;
+package dhcpclaude;
 
 /**
  * A DHCP client driven through the state machine of RFC 2131 §4.4 (Figure 5).
