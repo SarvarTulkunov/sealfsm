@@ -1,7 +1,7 @@
 digraph "Door" {
   rankdir=LR;
   labelloc="t";
-  label="Door  (CENTRALIZED)";
+  label="Door  (CENTRALIZED_DISPATCH)";
   node [shape=rectangle, style=rounded, fontname="Helvetica"];
   edge [fontname="Helvetica", fontsize=10];
 
@@ -12,9 +12,9 @@ digraph "Door" {
   "Closed" [penwidth=2, color="#1a73e8"];
   "Locked";
 
-  "Closed" -> "Locked" [label="[event instanceof Lock]"];
-  "Closed" -> "Open" [label="[!(event instanceof Lock)]"];
+  "Closed" -> "Locked" [label="[event instanceof examples.door.Lock]"];
+  "Closed" -> "Open" [label="[!(event instanceof examples.door.Lock)]"];
   "Open" -> "Closed";
-  "Locked" -> "Closed" [label="[event instanceof Unlock]"];
-  "Locked" -> "Locked" [label="[!(event instanceof Unlock)]"];
+  "Locked" -> "Closed" [label="[event instanceof examples.door.Unlock]"];
+  "Locked" -> "Locked" [label="[!(event instanceof examples.door.Unlock)]"];
 }

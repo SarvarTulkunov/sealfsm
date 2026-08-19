@@ -1,7 +1,7 @@
 digraph "TrafficLight" {
   rankdir=LR;
   labelloc="t";
-  label="TrafficLight  (DISTRIBUTED)";
+  label="TrafficLight  (POLYMORPHIC)";
   node [shape=rectangle, style=rounded, fontname="Helvetica"];
   edge [fontname="Helvetica", fontsize=10];
 

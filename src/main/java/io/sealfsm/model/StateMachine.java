@@ -27,13 +27,40 @@ public final class StateMachine {
      */
     public static final String INITIAL_PSEUDO_STATE = "<initial>";
 
-    /** How transitions are encoded in the analysed source. */
+    /**
+     * Where transition dispatch <em>lives</em> in the analysed source. This is the
+     * encoding axis, and it has exactly two positions.
+     *
+     * <p>Two further properties are deliberately <em>not</em> positions on this
+     * axis, because they vary independently of it:
+     * <ul>
+     *   <li>how the successor is <em>written</em> — bare {@code new H()}, a
+     *       singleton field, an enum constant, {@code this}, a local, or a value
+     *       handed to a carrier object — is {@link SuccessorForm};</li>
+     *   <li>how the successor is <em>installed</em> — returned, written to a
+     *       field, accumulated in a local, or wrapped in a carrier — is
+     *       {@link CommitForm}.</li>
+     * </ul>
+     * In particular the polymorphic State pattern that returns
+     * {@code Transition.to(new LastAck(), ...)} is {@link #POLYMORPHIC} dispatch
+     * with a carrier commit, not an encoding of its own: the dispatch site is
+     * identical to a per-state method returning the hierarchy type, and only the
+     * spelling and installation of the result differ.
+     */
     public enum Encoding {
-        /** Classic State pattern: each state class has its own transition method(s). */
-        DISTRIBUTED,
-        /** A single transition function, typically a pattern-matching switch. */
-        CENTRALIZED,
-        /** Both styles detected, or undetermined. */
+        /**
+         * Polymorphic, per-state dispatch (classic State pattern): each permitted
+         * subtype owns a transition method. The successor may be returned directly
+         * or wrapped in a carrier — see {@link SuccessorForm} and {@link CommitForm}.
+         */
+        POLYMORPHIC,
+        /**
+         * Centralized dispatch: one switch over the hierarchy type computes the
+         * transitions, wherever that switch is hosted and however its result is
+         * committed.
+         */
+        CENTRALIZED_DISPATCH,
+        /** Both dispatch positions detected, or undetermined. */
         MIXED
     }
 
@@ -43,6 +70,8 @@ public final class StateMachine {
     private final List<State> topLevelStates = new ArrayList<>();
     private final List<Transition> transitions = new ArrayList<>();
     private final Set<String> alphabet = new LinkedHashSet<>(); // event labels
+    private final Set<SuccessorForm> successorForms = new LinkedHashSet<>();
+    private final Set<CommitForm> commitForms = new LinkedHashSet<>();
     private String initialState;          // state id; may be null if undetected
 
     public StateMachine(String name, String qualifiedName, Encoding encoding) {
@@ -64,6 +93,55 @@ public final class StateMachine {
     public void addTransition(Transition t) {
         transitions.add(Objects.requireNonNull(t));
         if (t.event() != null) alphabet.add(t.event());
+        if (t.form() != null) successorForms.add(t.form());
+    }
+
+    /**
+     * The successor spellings this machine's edges actually used — the second,
+     * orthogonal axis to {@link #encoding()}. Reported alongside the encoding so a
+     * recall gap can be attributed to the form that caused it (say, a singleton
+     * that would not resolve) rather than to the encoding it appeared under.
+     */
+    public Set<SuccessorForm> successorForms() {
+        return Collections.unmodifiableSet(successorForms);
+    }
+
+    /**
+     * The commit mechanisms this machine's dispatch used — the third axis,
+     * orthogonal to both {@link #encoding()} and {@link #successorForms()}. Two
+     * machines can share an encoding yet differ entirely in how well their
+     * successors are recovered, because one returns its result and the other
+     * writes it to a field; reporting the commit form is what makes that
+     * difference visible in the evaluation instead of averaged away.
+     */
+    public Set<CommitForm> commitForms() {
+        return Collections.unmodifiableSet(commitForms);
+    }
+
+    /** Record a commit mechanism observed while extracting this machine. */
+    public void addCommitForm(CommitForm form) {
+        if (form != null) commitForms.add(form);
+    }
+
+    /**
+     * Mark the states with no outgoing transition at all as <em>terminal</em>.
+     *
+     * <p>Only states the dispatch actually <em>matched</em> are eligible: a state
+     * an arm selected and from which every path throws is genuinely absorbing
+     * (RFC 9113's {@code Closed} is the canonical case), whereas a state the
+     * dispatch never mentioned has no outgoing edges only because none were
+     * recovered. Calling the latter terminal would upgrade a recall gap into a
+     * positive claim, which is exactly what the soundness invariant forbids.
+     *
+     * @param dispatched ids of the states a dispatch arm (or a per-state
+     *                   transition method) selected
+     */
+    public void markTerminalStates(Set<String> dispatched) {
+        Set<String> withOutgoing = new LinkedHashSet<>();
+        for (Transition t : transitions) withOutgoing.add(t.from());
+        for (State s : allStates()) {
+            s.setTerminal(dispatched.contains(s.id()) && !withOutgoing.contains(s.id()));
+        }
     }
 
     /**

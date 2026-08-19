@@ -1,7 +1,10 @@
 package io.sealfsm.extract;
 
+import io.sealfsm.detect.CarrierTransitionDetector;
+import io.sealfsm.detect.DispatchCommitDetector;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
+import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.Transition;
 import spoon.reflect.CtModel;
@@ -12,6 +15,8 @@ import spoon.reflect.code.CtBinaryOperator;
 import spoon.reflect.code.CtBlock;
 import spoon.reflect.code.CtCase;
 import spoon.reflect.code.CtCatch;
+import spoon.reflect.code.CtConditional;
+import spoon.reflect.code.CtConstructorCall;
 import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtIf;
@@ -23,6 +28,7 @@ import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtStatement;
 import spoon.reflect.code.CtSwitch;
 import spoon.reflect.code.CtSwitchExpression;
+import spoon.reflect.code.CtThisAccess;
 import spoon.reflect.code.CtTry;
 import spoon.reflect.code.CtTypeAccess;
 import spoon.reflect.code.CtVariableAccess;
@@ -36,16 +42,20 @@ import spoon.reflect.declaration.CtParameter;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtVariable;
 import spoon.reflect.reference.CtExecutableReference;
+import spoon.reflect.reference.CtFieldReference;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.reference.CtVariableReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -114,12 +124,61 @@ public final class TransitionExtractor {
     private final Deque<String> interProcStack = new ArrayDeque<>();
     private int interProcResolvedEdges = 0;
 
+    // F9: calls to an in-model helper that provably cannot return normally. The
+    // arms they occupy carry no transition, so no edge is emitted; the count is
+    // reported as a diagnostic rather than letting them vanish unremarked.
+    private int nonReturningCalls = 0;
+
     // F4: the closed-world event alphabet Σ enumerated from the sealed/enum event
     // parameter of centralized transition functions, plus the qualified names of
     // that event type (root + members) so a switch-over-event can be recognised
     // and its arms attributed to the matched event.
     private final Set<String> alphabet = new LinkedHashSet<>();
     private final Set<String> eventQualifiedNames = new LinkedHashSet<>();
+    // Simple names of the event parameters of the method currently being walked,
+    // so `event == UserCall.CLOSE` / `event instanceof SegmentArrival` in a guard
+    // can be attributed to the event that triggers the edge (F8).
+    private Set<String> eventParamNames = new LinkedHashSet<>();
+    // "<ownerQualifiedName>#<CONSTANT>" -> the Σ symbol that constant contributes,
+    // recorded while Σ is enumerated so edge labels and Σ cannot drift apart.
+    private final Map<String, String> eventSymbolByConstant = new LinkedHashMap<>();
+    // Set while walking the arm of a switch-over-event whose label DECONSTRUCTS the
+    // event (`case Send(Signal s) ->`). An inner switch on that binding refines the
+    // label from the event family to the exact input, `Send` -> `Send.HEADERS`.
+    private ComponentEvent componentEvent = null;
+
+    /**
+     * An event arm that bound one of the event's components, so a nested switch on
+     * that binding can be recognised and its arms composed back into full Σ symbols.
+     *
+     * @param prefix             the event the outer arm matched, e.g. {@code Send}
+     * @param boundName          the name the component was bound to, e.g. {@code s}
+     * @param enumQualifiedName  the component's enum type, checked so an unrelated
+     *                           switch that happens to reuse the name is not claimed
+     */
+    private record ComponentEvent(String prefix, String boundName, String enumQualifiedName) {
+    }
+
+    // F8: polymorphic-carrier walk context. While set, the walker descends one
+    // level into carrier call arguments and inter-procedural folding is disabled —
+    // the carrier encoding is analysed strictly intra-procedurally, so a successor
+    // computed by a helper is recorded unresolved rather than chased.
+    private boolean carrierMode = false;
+
+    // True while the walk is inside an else / default / fall-through path. An edge
+    // produced there with no event label is the state's default ("otherwise")
+    // transition — a real, fully-specified edge, recorded as such rather than as a
+    // nameless leftover. Saved and restored around each descent, which is exact for
+    // a single-threaded recursive walk.
+    private boolean otherwisePath = false;
+
+    // The commit mechanisms actually exercised while extracting this machine, and
+    // the states a dispatch arm (or a per-state transition method) selected. The
+    // latter is what makes "terminal" a claim about a state the analysis SAW —
+    // a state no arm matched has no outbound edges merely because none were
+    // recovered, and calling that terminal would dress a recall gap as a result.
+    private final Set<CommitForm> commitForms = new LinkedHashSet<>();
+    private final Set<String> dispatchedStates = new LinkedHashSet<>();
 
     public TransitionExtractor(Set<String> hierarchyQualifiedNames, String rootQualifiedName) {
         this.hierarchyQualifiedNames = hierarchyQualifiedNames;
@@ -134,6 +193,20 @@ public final class TransitionExtractor {
     /** The event alphabet Σ recovered from sealed/enum event parameters (F4). */
     public Set<String> alphabet() {
         return alphabet;
+    }
+
+    /** How this machine's dispatch committed its successors — the third axis. */
+    public Set<CommitForm> commitForms() {
+        return commitForms;
+    }
+
+    /**
+     * The states a dispatch arm (or a per-state transition method) selected. A
+     * state in this set with no outbound edge is genuinely absorbing; a state
+     * outside it simply was not reached by the analysis.
+     */
+    public Set<String> dispatchedStates() {
+        return dispatchedStates;
     }
 
     public List<Transition> extract(CtType<?> root, CtModel model) {
@@ -161,23 +234,54 @@ public final class TransitionExtractor {
         for (CtMethod<?> m : distributed) {
             if (!helperSignatures.contains(m.getSignature())) extractDistributed(m, out);
         }
+        Set<String> walkedMethods = new HashSet<>();
         for (CtMethod<?> m : centralized) {
-            if (!helperSignatures.contains(m.getSignature())) extractCentralized(m, out);
+            if (!helperSignatures.contains(m.getSignature())) {
+                extractCentralized(m, out);
+                walkedMethods.add(methodKey(m));
+            }
         }
         for (CtElement callable : functional) {
             extractFunctional(callable, out);
         }
-        // F2: GoF / field-mutation encoding. Run only as a fallback when no
-        // return-based transition method exists, so a hierarchy that already
-        // exposes a functional transition is left untouched — a context that
-        // merely stores a functional result is not re-mined as a transition here.
-        if (distributed.isEmpty() && centralized.isEmpty() && functional.isEmpty()) {
+        // The widened centralized recognizer: a switch over the hierarchy whose
+        // result is committed as a hierarchy value, wherever it is hosted. Hosts
+        // the signature-based recognizer already walked are skipped so one body is
+        // never walked twice (harmless for the edge set, which is a Set, but it
+        // would double-count the inter-procedural fold statistic).
+        for (DispatchCommitDetector.Producer p : DispatchCommitDetector.find(root, model)) {
+            if (walkedMethods.contains(methodKey(p.host()))
+                    || helperSignatures.contains(p.host().getSignature())) {
+                commitForms.add(p.commit());
+                continue;
+            }
+            extractCommitDispatch(p, out);
+        }
+        // F8: per-state methods that return a *carrier* wrapping the successor.
+        // Run whenever such a method exists, not only when the lists above are
+        // empty: a hierarchy that also happens to expose one method returning the
+        // hierarchy type (a helper, a record accessor) would otherwise classify as
+        // plain distributed and silently lose every carrier edge. Methods that
+        // return the hierarchy type directly are excluded here — the distributed
+        // walker above already owns those — so the two paths never share a body.
+        extractPolymorphicCarrier(root, out);
+
+        if (distributed.isEmpty() && centralized.isEmpty() && functional.isEmpty() && out.isEmpty()) {
+            // F2: GoF / field-mutation encoding. Run only as a fallback when no
+            // return-based transition method exists, so a hierarchy that already
+            // exposes a functional transition is left untouched — a context that
+            // merely stores a functional result is not re-mined as a transition here.
             extractMutationEncoding(root, model, out);
         }
         if (interProcResolvedEdges > 0) {
             diagnostics.add(interProcResolvedEdges + " transition target(s) resolved via bounded "
                     + "inter-procedural summaries (depth ≤ " + MAX_INTERPROC_DEPTH
                     + "); precision-sensitive — audit separately");
+        }
+        if (nonReturningCalls > 0) {
+            diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
+                    + "(always throws or diverges) contributed no transition — the arms holding "
+                    + "them are undefined inputs, not unresolved targets");
         }
         return new ArrayList<>(out);
     }
@@ -213,6 +317,10 @@ public final class TransitionExtractor {
     private void extractDistributed(CtMethod<?> method, Set<Transition> out) {
         CtType<?> declaring = method.getDeclaringType();
         if (declaring == null) return;
+        commitForms.add(CommitForm.VALUE_RETURN);
+        // The declaring class IS the source state — exact, no data-flow needed —
+        // so it counts as dispatched even when the body produces nothing.
+        dispatchedStates.add(declaring.getSimpleName());
         // The from-state is fixed to the declaring class; a switch inside the
         // body dispatches on the event, not on the state, so from is preserved.
         walk(method.getBody(), declaring.getSimpleName(), eventName(method), null, out);
@@ -220,7 +328,35 @@ public final class TransitionExtractor {
 
     // ---- centralized (single transition function) ----------------------------
 
+    /**
+     * Walk a transition producer discovered by the <em>widened</em> centralized
+     * recognizer: a switch over the hierarchy whose result is committed as a
+     * hierarchy value, hosted anywhere and installed by return, by field write or
+     * through a local accumulator.
+     *
+     * <p>Only the dispatch switch is walked, never the whole host body. That bound
+     * matters: {@code handleEvent} in the field-mutation idiom ends with
+     * {@code return this.currentState;}, and walking the body would read that
+     * trailing return as a producer with no attributable source and emit a
+     * fictitious unresolved edge. The switch is where the transition relation is;
+     * everything around it is plumbing.
+     */
+    private void extractCommitDispatch(DispatchCommitDetector.Producer producer, Set<Transition> out) {
+        commitForms.add(producer.commit());
+        // Σ comes from the host's event parameter exactly as for a named
+        // transition function, so a nested switch-over-event can label its arms.
+        enumerateEventAlphabet(producer.host());
+        walkSwitch(producer.dispatch(), null, null, null, out);
+    }
+
+    /** Declaring type + signature: unique across the model, unlike a bare signature. */
+    private static String methodKey(CtMethod<?> m) {
+        CtType<?> declaring = m.getDeclaringType();
+        return (declaring == null ? "?" : declaring.getQualifiedName()) + "#" + m.getSignature();
+    }
+
     private void extractCentralized(CtMethod<?> method, Set<Transition> out) {
+        commitForms.add(CommitForm.VALUE_RETURN);
         // F4: recover the closed-world event alphabet Σ from the event parameter
         // (and register the event type so a nested switch-over-event can label
         // each arm). Done before the walk so walkSwitch sees eventQualifiedNames.
@@ -248,6 +384,7 @@ public final class TransitionExtractor {
      * a switch-over-event's arms to the matched event).
      */
     private void enumerateEventAlphabet(CtMethod<?> method) {
+        eventParamNames = new LinkedHashSet<>();
         for (CtParameter<?> p : method.getParameters()) {
             CtTypeReference<?> pt = p.getType();
             if (pt == null || hierarchyQualifiedNames.contains(pt.getQualifiedName())) {
@@ -258,22 +395,109 @@ public final class TransitionExtractor {
 
             List<String> symbols = new ArrayList<>();
             if (decl instanceof CtEnum<?> en) {
-                for (CtEnumValue<?> v : en.getEnumValues()) symbols.add(v.getSimpleName());
+                // The parameter is itself the enum, so a guard names the constant
+                // bare (`tick == Tick.ARM` selects `ARM`).
+                for (CtEnumValue<?> v : en.getEnumValues()) {
+                    symbols.add(v.getSimpleName());
+                    eventSymbolByConstant.put(constantKey(pt.getQualifiedName(), v.getSimpleName()),
+                            v.getSimpleName());
+                }
             } else if (SpoonCompat.isSealed(decl)) {
                 for (CtTypeReference<?> ref : SpoonCompat.permittedTypes(decl)) {
-                    symbols.add(ref.getSimpleName());
+                    symbols.addAll(eventSymbolsFor(ref));
                 }
             } else {
                 continue; // not a closed event type — no exact Σ to recover
             }
             if (symbols.isEmpty()) continue;
 
+            eventParamNames.add(p.getSimpleName());
             eventQualifiedNames.add(pt.getQualifiedName());
             for (CtTypeReference<?> ref : SpoonCompat.permittedTypes(decl)) {
                 eventQualifiedNames.add(ref.getQualifiedName());
             }
             alphabet.addAll(symbols);
         }
+    }
+
+    /**
+     * The Σ symbols a permitted member of a sealed event type contributes. Usually
+     * the member itself, but a member that is an {@code enum} — the common shape
+     * for a family of related inputs, e.g. {@code enum UserCall implements Event}
+     * — contributes one symbol per constant ({@code UserCall.CLOSE}), because a
+     * guard tests the constant, not the enum. Σ stays exact: an enum's constants
+     * are as closed as a {@code permits} clause.
+     */
+    private List<String> eventSymbolsFor(CtTypeReference<?> ref) {
+        List<String> out = new ArrayList<>();
+        CtType<?> member = ref.getTypeDeclaration();
+        if (member instanceof CtEnum<?> en && !en.getEnumValues().isEmpty()) {
+            for (CtEnumValue<?> v : en.getEnumValues()) {
+                String symbol = composedSymbol(ref.getSimpleName(), v.getSimpleName());
+                out.add(symbol);
+                eventSymbolByConstant.put(
+                        constantKey(ref.getQualifiedName(), v.getSimpleName()), symbol);
+            }
+            return out;
+        }
+        // A member that *carries* an enum — `record Send(Signal signal)` — is not one
+        // input but a family of them. The real input is the pair, so Σ is the pair:
+        // {Send.HEADERS, Send.PUSH_PROMISE, ...}. This is the same closed-world move
+        // as the enum-member case one level down, and it is what makes an event
+        // modelled as `Send(HEADERS)` comparable with one modelled as a flat
+        // `SEND_HEADERS` constant — the two spellings then yield the same |Σ|.
+        //
+        // Deliberately NOT registered in eventSymbolByConstant: that table is keyed
+        // by the constant's owning type, and the same `Signal.HEADERS` occurs under
+        // both `Send` and `Recv`. The prefix is only knowable at the pattern that
+        // deconstructed the event, so the label is composed there instead.
+        CtEnum<?> component = soleEnumComponent(member);
+        if (component != null) {
+            for (CtEnumValue<?> v : component.getEnumValues()) {
+                out.add(composedSymbol(ref.getSimpleName(), v.getSimpleName()));
+            }
+            return out;
+        }
+        out.add(ref.getSimpleName());
+        return out;
+    }
+
+    /**
+     * The single enum-typed component of an event member, or {@code null} when it
+     * has none or several. Several is ambiguous — nothing in the shape says which
+     * one discriminates the input — so Σ stays at the member itself rather than
+     * guessing one.
+     */
+    private static CtEnum<?> soleEnumComponent(CtType<?> member) {
+        if (member == null) return null;
+        CtEnum<?> found = null;
+        try {
+            for (CtField<?> f : member.getFields()) {
+                if (f.isStatic()) continue;
+                CtTypeReference<?> t = f.getType();
+                CtType<?> decl = t == null ? null : t.getTypeDeclaration();
+                if (decl instanceof CtEnum<?> en && !en.getEnumValues().isEmpty()) {
+                    if (found != null) return null; // ambiguous
+                    found = en;
+                }
+            }
+        } catch (Throwable ignored) {
+            return null;
+        }
+        return found;
+    }
+
+    /**
+     * How a qualified event symbol is spelled, in ONE place. Σ enumeration and edge
+     * labelling both go through it, so the alphabet and the labels cannot drift
+     * apart into two spellings of the same input.
+     */
+    private static String composedSymbol(String prefix, String constant) {
+        return prefix + "." + constant;
+    }
+
+    private static String constantKey(String ownerQualifiedName, String constant) {
+        return ownerQualifiedName + "#" + constant;
     }
 
     // ---- functional transition callables (F7) --------------------------------
@@ -302,6 +526,7 @@ public final class TransitionExtractor {
         CtElement body = callableBody(callable);
         if (body == null) return;
 
+        commitForms.add(CommitForm.VALUE_RETURN);
         this.selector = sel;
         try {
             walkFunctional(body, FromCtx.all(concreteStateSimpleNames), functionalEventLabel(callable), null, out);
@@ -427,7 +652,8 @@ public final class TransitionExtractor {
         for (TransitionResolver.Candidate cand : resolver.resolve(value, null)) {
             String g = merge(guard, cand.guard());
             if (cand.resolved()) {
-                out.add(Transition.resolved(StateMachine.INITIAL_PSEUDO_STATE, cand.targetSimpleName(), event, g));
+                out.add(Transition.resolved(StateMachine.INITIAL_PSEUDO_STATE,
+                        cand.targetSimpleName(), event, g).withForm(cand.form()));
             } else {
                 out.add(Transition.unresolved(StateMachine.INITIAL_PSEUDO_STATE, event, g, cand.raw()));
             }
@@ -522,6 +748,345 @@ public final class TransitionExtractor {
         }
     }
 
+    // ---- polymorphic carrier encoding (F8) -----------------------------------
+
+    /**
+     * Recover transitions for the polymorphic State pattern with a <em>carrier</em>
+     * result (finding F8): each permitted subtype overrides a transition method
+     * that returns the successor wrapped in a non-hierarchy object rather than
+     * returning the hierarchy type itself.
+     *
+     * <pre>{@code
+     *   public Transition on(Event event) {
+     *       if (event instanceof SegmentArrival seg && seg.rst())
+     *           return Transition.to(new Closed(), Action.SIGNAL_ABORT);
+     *       if (event == UserCall.CLOSE)
+     *           return Transition.to(new LastAck(), Action.SND_FIN);
+     *       return Transition.ignore(this);
+     *   }
+     * }</pre>
+     *
+     * <p>The from-state needs no data-flow at all — it is the declaring class, and
+     * is therefore as exact as the state set itself. Only the targets are
+     * approximate, and they are recovered by descending <em>one</em> level into the
+     * carrier's argument list. That bound is deliberate: a successor produced by a
+     * helper call is recorded unresolved rather than chased, so the carrier
+     * encoding inherits the same soundness invariant as the rest of the tool.
+     */
+    private void extractPolymorphicCarrier(CtType<?> root, Set<Transition> out) {
+        carrierMode = true;
+        try {
+            for (CtMethod<?> m : CarrierTransitionDetector.findCarrierTransitionMethods(root)) {
+                CtType<?> declaring = m.getDeclaringType();
+                if (declaring == null) continue;
+                CtTypeReference<?> ret = m.getType();
+                if (ret != null && hierarchyQualifiedNames.contains(ret.getQualifiedName())) {
+                    continue; // returns the hierarchy type — the distributed walker owns it
+                }
+                commitForms.add(CommitForm.POLY_CARRIER);
+                dispatchedStates.add(declaring.getSimpleName());
+                // Σ and the event-parameter names are per-method, and drive the
+                // event attribution performed by splitEventCondition below.
+                enumerateEventAlphabet(m);
+                walkCarrier(m.getBody(), declaring.getSimpleName(), null, null, out);
+            }
+        } finally {
+            carrierMode = false;
+            eventParamNames = new LinkedHashSet<>();
+        }
+    }
+
+    /**
+     * Descend a carrier transition method, accumulating the guard and the
+     * triggering event. Structurally this is {@link #walk} with two differences:
+     * an {@code if} whose condition tests the event parameter contributes an
+     * <em>event</em> rather than a guard, and a produced value is unwrapped from
+     * its carrier by {@link #handleCarrierValue}.
+     *
+     * <p>Only {@code return}/{@code yield} produce a next state here. Every other
+     * statement — a void call, a log line, a field write — is an ACTION and is
+     * skipped, which is what keeps {@code Transition.to(new Closed(),
+     * Action.SIGNAL_ABORT)}'s action list out of the transition relation.
+     */
+    private void walkCarrier(CtElement node, String from, String event, String guard, Set<Transition> out) {
+        if (node == null) return;
+
+        if (node instanceof CtBlock<?> block) {
+            String acc = guard;
+            boolean enteredOtherwise = otherwisePath;
+            try {
+                for (CtStatement st : block.getStatements()) {
+                    walkCarrier(st, from, event, acc, out);
+                    if (st instanceof CtIf ctIf
+                            && ctIf.getElseStatement() == null
+                            && alwaysTerminates(ctIf.getThenStatement())) {
+                        // `if (c) return ...;` — every later sibling is reached only
+                        // when c is false, so the guards stay mutually exclusive.
+                        acc = merge(acc, negate(safeText(ctIf.getCondition())));
+                    } else if (alwaysTerminates(st)) {
+                        break; // remaining statements are unreachable
+                    }
+                    if (st instanceof CtIf || st instanceof CtSwitch<?>) {
+                        // Anything after a conditional is on its fall-through path:
+                        // it runs precisely when none of the branches above took.
+                        // That is the definition of the default edge, and it holds
+                        // whether or not the branch above could be negated into a
+                        // guard — `if (e instanceof Seg) { ... }` followed by
+                        // `return ignore(this);` is the common shape where it
+                        // cannot, yet the trailing return is still the default.
+                        otherwisePath = true;
+                    }
+                }
+            } finally {
+                otherwisePath = enteredOtherwise;
+            }
+        } else if (node instanceof CtIf ctIf) {
+            EventCond ec = splitEventCondition(ctIf.getCondition());
+            String thenGuard = merge(guard, ec.residual());
+            if (ec.symbols().isEmpty()) {
+                walkCarrier(ctIf.getThenStatement(), from, event, thenGuard, out);
+            } else {
+                // A disjunction of event tests (`e == CLOSE || e == USER`) triggers
+                // one edge per symbol: they are distinct inputs of Σ, not one edge
+                // with a compound label.
+                for (String sym : ec.symbols()) {
+                    walkCarrier(ctIf.getThenStatement(), from, sym, thenGuard, out);
+                }
+            }
+            // The else branch keeps the inherited event and carries the negation of
+            // the *whole* condition — negating only the residual would be wrong
+            // once part of the condition was consumed as an event.
+            if (ctIf.getElseStatement() != null) {
+                boolean prev = otherwisePath;
+                otherwisePath = true;
+                try {
+                    walkCarrier(ctIf.getElseStatement(), from, event,
+                            merge(guard, negate(safeText(ctIf.getCondition()))), out);
+                } finally {
+                    otherwisePath = prev;
+                }
+            }
+        } else if (node instanceof CtSwitch<?> sw) {
+            walkCarrierSwitch(sw, from, event, guard, out);
+        } else if (node instanceof CtReturn<?> ret) {
+            handleCarrierValue(ret.getReturnedExpression(), from, event, guard, out);
+        } else if (node instanceof CtYieldStatement ys) {
+            handleCarrierValue(ys.getExpression(), from, event, guard, out);
+        } else if (node instanceof CtTry tryStmt) {
+            walkCarrier(tryStmt.getBody(), from, event, guard, out);
+            for (CtCatch cc : tryStmt.getCatchers()) {
+                walkCarrier(cc.getBody(), from, event, merge(guard, catchGuard(cc)), out);
+            }
+            walkCarrier(tryStmt.getFinalizer(), from, event, guard, out);
+        } else if (node instanceof CtLoop loop) {
+            walkCarrier(loop.getBody(), from, event, merge(guard, loopGuard(loop)), out);
+        }
+    }
+
+    /** A switch inside a carrier method dispatches on the event, never on the state. */
+    private void walkCarrierSwitch(CtAbstractSwitch<?> sw, String from, String event,
+                                   String guard, Set<Transition> out) {
+        boolean overEvent = isEventDispatch(sw);
+        for (CtCase<?> c : sw.getCases()) {
+            List<String> caseEvents = overEvent ? caseEventNames(c) : List.of();
+            if (caseEvents.isEmpty()) {
+                caseEvents = Collections.singletonList(event); // default arm inherits
+            }
+            String caseGuard = merge(guard, caseGuard(c));
+            boolean prev = otherwisePath;
+            // A `default:` arm names no label, so whatever it produces is the
+            // residual of every labelled arm — the default edge.
+            if (c.getCaseExpressions().isEmpty()) otherwisePath = true;
+            try {
+                for (String caseEvent : caseEvents) {
+                    for (CtStatement st : c.getStatements()) {
+                        walkCarrier(st, from, caseEvent, caseGuard, out);
+                    }
+                }
+            } finally {
+                otherwisePath = prev;
+            }
+        }
+    }
+
+    /**
+     * Resolve one value returned by a carrier transition method to its target
+     * state(s), unwrapping the carrier when there is one.
+     *
+     * <p>Three cases, in order:
+     * <ol>
+     *   <li>the value <em>is</em> the successor — {@code return new Listen();} or
+     *       {@code return this;} — resolved by the ordinary resolver;</li>
+     *   <li>the value is a shallow carrier — {@code Transition.to(new LastAck(),
+     *       ...)} — so each hierarchy-typed <em>direct</em> argument is a target;</li>
+     *   <li>neither, meaning the successor cannot be determined without leaving
+     *       this method: recorded UNRESOLVED, never guessed and never dropped.</li>
+     * </ol>
+     */
+    private void handleCarrierValue(CtExpression<?> value, String from, String event,
+                                    String guard, Set<Transition> out) {
+        if (value == null) return;
+
+        // `cond ? Transition.to(new Listen()) : Transition.to(new Closed(), ...)`
+        if (value instanceof CtConditional<?> cond) {
+            String c = safeText(cond.getCondition());
+            handleCarrierValue(cond.getThenExpression(), from, event, merge(guard, c), out);
+            handleCarrierValue(cond.getElseExpression(), from, event, merge(guard, negate(c)), out);
+            return;
+        }
+        if (value instanceof CtSwitchExpression<?, ?> sw) {
+            walkCarrierSwitch(sw, from, event, guard, out);
+            return;
+        }
+        // (1) bare hierarchy value.
+        if (isCarrierStateValue(value)) {
+            handleValue(value, from, event, guard, out);
+            return;
+        }
+        // (2) shallow carrier: descend ONE level into its arguments and no further.
+        List<CtExpression<?>> args = carrierArguments(value);
+        boolean unwrapped = false;
+        for (CtExpression<?> arg : args) {
+            if (!isCarrierStateValue(arg)) continue;
+            unwrapped = true;
+            handleValue(arg, from, event, guard, out);
+        }
+        if (unwrapped) return;
+        // (3) the successor is computed elsewhere (`Transition.to(nextFor(event))`)
+        // or the shape is unrecognised. Record the gap honestly.
+        out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from,
+                event, guard, safeText(value)), event));
+    }
+
+    /** Is {@code e} a hierarchy value — {@code this}, {@code new S(...)}, or an H-typed read? */
+    private boolean isCarrierStateValue(CtExpression<?> e) {
+        if (e == null) return false;
+        if (e instanceof CtThisAccess<?>) return true;
+        if (e instanceof CtConstructorCall<?> cc) {
+            CtTypeReference<?> t = cc.getType();
+            return t != null && hierarchyQualifiedNames.contains(t.getQualifiedName());
+        }
+        return isHierarchyTyped(e);
+    }
+
+    /**
+     * The argument list of a <em>carrier</em>: a call whose own result type sits
+     * outside the hierarchy, so it wraps rather than composes states. Anything
+     * else yields an empty list, which routes the value to the unresolved branch.
+     */
+    private List<CtExpression<?>> carrierArguments(CtExpression<?> value) {
+        List<CtExpression<?>> args;
+        if (value instanceof CtInvocation<?> inv) {
+            args = new ArrayList<>(inv.getArguments());
+        } else if (value instanceof CtConstructorCall<?> cc) {
+            args = new ArrayList<>(cc.getArguments());
+        } else {
+            return List.of();
+        }
+        return isHierarchyTyped(value) ? List.of() : args;
+    }
+
+    // ---- event attribution from guards (F8) ----------------------------------
+
+    /**
+     * A condition split into the events it selects and the residual data guard.
+     * {@code event instanceof SegmentArrival seg && seg.rst()} yields the symbol
+     * {@code SegmentArrival} and the residual {@code seg.rst()}.
+     */
+    private record EventCond(Set<String> symbols, String residual) {
+        static EventCond none(String text) {
+            return new EventCond(Set.of(), text);
+        }
+    }
+
+    /**
+     * Separate the event tests in a condition from the rest of it, so the
+     * triggering input becomes the edge's Σ label and only the genuine data
+     * predicate remains as the guard.
+     *
+     * <p>Conjunction splits both sides. Disjunction only splits when <em>both</em>
+     * sides are pure event tests — {@code e == CLOSE || e == USER} is two inputs,
+     * but {@code e == CLOSE || retries > 3} is one opaque predicate and is kept
+     * whole as a guard rather than being mis-attributed to an event.
+     */
+    private EventCond splitEventCondition(CtExpression<?> cond) {
+        if (cond == null) return EventCond.none(null);
+
+        if (cond instanceof CtBinaryOperator<?> bin) {
+            BinaryOperatorKind kind = bin.getKind();
+            if (kind == BinaryOperatorKind.AND) {
+                EventCond l = splitEventCondition(bin.getLeftHandOperand());
+                EventCond r = splitEventCondition(bin.getRightHandOperand());
+                Set<String> syms = new LinkedHashSet<>(l.symbols());
+                syms.addAll(r.symbols());
+                return new EventCond(syms, merge(l.residual(), r.residual()));
+            }
+            if (kind == BinaryOperatorKind.OR) {
+                EventCond l = splitEventCondition(bin.getLeftHandOperand());
+                EventCond r = splitEventCondition(bin.getRightHandOperand());
+                boolean pure = !l.symbols().isEmpty() && !r.symbols().isEmpty()
+                        && l.residual() == null && r.residual() == null;
+                if (pure) {
+                    Set<String> syms = new LinkedHashSet<>(l.symbols());
+                    syms.addAll(r.symbols());
+                    return new EventCond(syms, null);
+                }
+                return EventCond.none(safeText(cond));
+            }
+        }
+        String symbol = eventSymbolOf(cond);
+        return symbol == null ? EventCond.none(safeText(cond))
+                              : new EventCond(new LinkedHashSet<>(Set.of(symbol)), null);
+    }
+
+    /**
+     * The Σ symbol a leaf condition names, or {@code null} when it tests something
+     * other than the event: {@code event instanceof SegmentArrival} →
+     * {@code SegmentArrival}; {@code event == UserCall.CLOSE} → {@code UserCall.CLOSE}.
+     */
+    private String eventSymbolOf(CtExpression<?> cond) {
+        if (!(cond instanceof CtBinaryOperator<?> bin)) return null;
+        BinaryOperatorKind kind = bin.getKind();
+        CtExpression<?> lhs = bin.getLeftHandOperand();
+        CtExpression<?> rhs = bin.getRightHandOperand();
+
+        if (kind == BinaryOperatorKind.INSTANCEOF) {
+            if (!isEventParamExpr(lhs)) return null;
+            CtTypeReference<?> t = instanceofType(rhs);
+            return t != null && eventQualifiedNames.contains(t.getQualifiedName())
+                    ? t.getSimpleName() : null;
+        }
+        if (kind == BinaryOperatorKind.EQ) {
+            if (isEventParamExpr(lhs)) return enumConstantSymbol(rhs);
+            if (isEventParamExpr(rhs)) return enumConstantSymbol(lhs);
+        }
+        return null;
+    }
+
+    /**
+     * The Σ symbol denoted by an enum-constant read such as {@code UserCall.CLOSE}.
+     * Looked up in the table built while Σ was enumerated rather than re-derived,
+     * so an edge label is spelled exactly as the alphabet spells it — bare
+     * ({@code ARM}) when the parameter is itself the enum, qualified
+     * ({@code UserCall.CLOSE}) when the enum is one member of a sealed event type.
+     * A constant that is not in Σ yields {@code null} and is treated as a guard.
+     */
+    private String enumConstantSymbol(CtExpression<?> e) {
+        if (!(e instanceof CtFieldAccess<?> fa) || fa.getVariable() == null) return null;
+        CtFieldReference<?> fref = fa.getVariable();
+        CtTypeReference<?> owner = fref.getDeclaringType();
+        if (owner == null) owner = fref.getType(); // noClasspath fallback: the constant's own type
+        if (owner == null) return null;
+        return eventSymbolByConstant.get(constantKey(owner.getQualifiedName(), fref.getSimpleName()));
+    }
+
+    /** True when {@code e} reads one of the current method's event parameters. */
+    private boolean isEventParamExpr(CtExpression<?> e) {
+        return e instanceof CtVariableAccess<?> va
+                && va.getVariable() != null
+                && eventParamNames.contains(va.getVariable().getSimpleName());
+    }
+
     // ---- mutation / GoF State encoding (F2) ----------------------------------
 
     /**
@@ -538,6 +1103,7 @@ public final class TransitionExtractor {
         if (stateFieldNames.isEmpty() && mutatorNames.isEmpty()) return;
 
         mutationMode = true;
+        commitForms.add(CommitForm.FIELD_MUTATION);
         try {
             for (CtMethod<?> m : findMutationMethods(model)) {
                 CtType<?> declaring = m.getDeclaringType();
@@ -549,6 +1115,7 @@ public final class TransitionExtractor {
                         && hierarchyQualifiedNames.contains(declaring.getQualifiedName())
                         ? declaring.getSimpleName()
                         : null;
+                if (from != null) dispatchedStates.add(from);
                 // Mutation-style event labelling is future work (as for
                 // centralized), so the event label stays null.
                 walk(m.getBody(), from, null, null, out);
@@ -612,22 +1179,47 @@ public final class TransitionExtractor {
         return out;
     }
 
-    /** Is {@code lhs} a write to a state field (a field of a hierarchy type)? */
+    /**
+     * Is {@code lhs} a write to <em>this</em> hierarchy's state field?
+     *
+     * <p>The field <em>name</em> is only a candidate filter. Unrelated machines
+     * analysed in the same model routinely both call their field {@code state},
+     * and matching on the name alone made every such machine absorb the other's
+     * assignments as edges with an undetermined source — polluting the unresolved
+     * count with transitions that belong to a different automaton. The declared
+     * type is what actually decides, so it is checked here; the name lookup merely
+     * avoids resolving types for every assignment in the model.
+     *
+     * <p>Under {@code noClasspath} an unresolvable field type falls back to the
+     * name match, which is the previous behaviour and no worse than it.
+     */
     private boolean isStateFieldWrite(CtExpression<?> lhs) {
-        if (lhs instanceof CtFieldAccess<?> fa) {
-            return fa.getVariable() != null && stateFieldNames.contains(fa.getVariable().getSimpleName());
+        if (!(lhs instanceof CtVariableAccess<?> va) || va.getVariable() == null) {
+            return false;
         }
-        if (lhs instanceof CtVariableAccess<?> va) {
-            return va.getVariable() != null && stateFieldNames.contains(va.getVariable().getSimpleName());
-        }
-        return false;
+        CtVariableReference<?> vref = va.getVariable();
+        if (!stateFieldNames.contains(vref.getSimpleName())) return false;
+        CtTypeReference<?> declared = vref.getType();
+        if (declared == null) return true; // type unresolvable — keep the name match
+        return hierarchyQualifiedNames.contains(declared.getQualifiedName());
     }
 
-    /** Is {@code inv} a call to a recognised state mutator? */
+    /**
+     * Is {@code inv} a call to a recognised state mutator of <em>this</em>
+     * hierarchy? Same reasoning as {@link #isStateFieldWrite}: two machines that
+     * both expose a {@code setState} must not claim each other's calls, so the
+     * mutator's parameter type has to sit inside the hierarchy.
+     */
     private boolean isMutatorCall(CtInvocation<?> inv) {
         try {
-            return inv.getExecutable() != null
-                    && mutatorNames.contains(inv.getExecutable().getSimpleName());
+            CtExecutableReference<?> exe = inv.getExecutable();
+            if (exe == null || !mutatorNames.contains(exe.getSimpleName())) return false;
+            List<CtTypeReference<?>> params = exe.getParameters();
+            if (params == null || params.isEmpty()) return true; // unresolvable — keep the name match
+            for (CtTypeReference<?> p : params) {
+                if (p != null && hierarchyQualifiedNames.contains(p.getQualifiedName())) return true;
+            }
+            return false;
         } catch (Throwable t) {
             return false;
         }
@@ -644,14 +1236,21 @@ public final class TransitionExtractor {
     /**
      * Fold a call to an in-model helper that returns the hierarchy type into its
      * possible return targets — a bounded, k-limited return-value summary. Returns
-     * {@code true} when the call was folded (its resolvable targets emitted, any
-     * unresolvable ones recorded); {@code false} when it cannot be summarised
+     * {@code true} when the call was handled — either folded (its resolvable
+     * targets emitted, any unresolvable ones recorded) or shown to produce no
+     * successor at all (F9, {@link #neverReturnsNormally}); {@code false} when it cannot be summarised
      * soundly — a library/abstract callee, a non-hierarchy return, an exhausted
      * depth budget, or a recursion cycle — leaving the caller to record it
      * unresolved (the never-guess invariant).
      */
     private boolean resolveInterprocedural(CtInvocation<?> inv, String from, String event,
                                            String guard, Set<Transition> out) {
+        if (carrierMode) {
+            // F8 scope boundary: the carrier encoding is analysed strictly
+            // intra-procedurally. A successor computed by a helper stays
+            // UNRESOLVED — never followed, never guessed.
+            return false;
+        }
         CtExecutableReference<?> exe = inv.getExecutable();
         if (exe == null) return false;
         CtTypeReference<?> ret = exe.getType();
@@ -664,6 +1263,15 @@ public final class TransitionExtractor {
         String sig = callee.getSignature();
         if (interProcStack.size() >= MAX_INTERPROC_DEPTH || interProcStack.contains(sig)) {
             return false; // depth budget exhausted or recursion cycle
+        }
+        // F9: a callee that provably cannot return normally produces no successor,
+        // so the arm holding this call carries no transition at all. This must be
+        // tested BEFORE the summarisability check below: both fire on an empty
+        // `collectReturns`, but they mean opposite things — "there is no target"
+        // versus "there is a target we could not see".
+        if (neverReturnsNormally(callee)) {
+            nonReturningCalls++;
+            return true; // handled: nothing to emit
         }
         List<GuardedExpr> returns = collectReturns(callee.getBody(), null);
         if (returns.isEmpty()) return false; // nothing summarisable (e.g. returns hidden in a switch)
@@ -684,6 +1292,35 @@ public final class TransitionExtractor {
             if (top) interProcResolvedEdges += Math.max(0, countResolved(out) - resolvedBefore);
         }
         return true;
+    }
+
+    /**
+     * F9 — true when {@code callee} provably cannot complete normally, so a call
+     * to it yields no successor state and contributes no transition.
+     *
+     * <p>This is <em>exact</em>, not a heuristic, and that is the whole reason it
+     * is allowed to suppress an edge. JLS §8.4.7 makes it a compile-time error for
+     * a method with a declared return type to have a body that can complete
+     * normally; the caller has already established that this callee's return type
+     * is the hierarchy type, so it is non-void by construction. A body containing
+     * no {@code return} anywhere therefore <em>cannot</em> return a value — it
+     * must throw or diverge. Either way there is no state to transition to.
+     *
+     * <p>It is the syntactic counterpart of the D3 rule that a {@code throw} arm
+     * produces no edge. Without it, {@code default -> throw fail(s, e)} and
+     * {@code default -> fail(s, e)} — where {@code fail} always throws — would
+     * report different transition relations for the same machine, turning a
+     * spelling difference into an apparent recall gap.
+     *
+     * <p>The scan is deliberately whole-body and unfiltered, so a {@code return}
+     * nested in a lambda or local class counts as the method's own. That is the
+     * conservative direction: it declines to suppress, falling back to the
+     * previous unresolved-edge behaviour, and never drops a real transition.
+     */
+    private static boolean neverReturnsNormally(CtMethod<?> callee) {
+        CtBlock<?> body = callee.getBody();
+        if (body == null) return false; // no body visible: never claim anything
+        return body.getElements(new TypeFilter<>(CtReturn.class)).isEmpty();
     }
 
     /** Returned / yielded expressions of a body, each with its accumulated guard. */
@@ -1039,14 +1676,28 @@ public final class TransitionExtractor {
      * each arm's from-state is the matched type pattern. When it dispatches on the
      * event type (finding F4), each arm's event label is the matched event —
      * mirroring the state case exactly. Otherwise both are inherited.
+     *
+     * <p>A multi-label arm ({@code case SEND_RST_STREAM, RECV_RST_STREAM -> ...})
+     * is walked once <em>per label</em>. Those are distinct inputs of Σ that happen
+     * to share a body, so collapsing them into one edge would silently drop every
+     * label but the first — the same reasoning that makes a disjunction of event
+     * tests several edges in the carrier walk.
+     *
+     * <p>A third dispatch kind appears one level further in: when an event arm
+     * deconstructs its event ({@code case Send(Signal s) ->}) and its body switches
+     * on the binding, that inner switch selects the <em>component</em>, and the two
+     * levels together name one input. Its arms are labelled with the composed
+     * symbol {@code Send.HEADERS} rather than with the bare family {@code Send},
+     * which is what lets an event modelled as a record-plus-enum be compared with
+     * the same event modelled as a flat constant.
      */
     private void walkSwitch(CtAbstractSwitch<?> sw, String from, String event,
                             String guard, Set<Transition> out) {
         boolean overState = isStateDispatch(sw);
         boolean overEvent = !overState && isEventDispatch(sw);
+        boolean overComponent = !overState && !overEvent && isComponentDispatch(sw);
         for (CtCase<?> c : sw.getCases()) {
             String caseFrom = from;
-            String caseEvent = event;
             if (overState) {
                 caseFrom = caseFromState(c);
                 if (caseFrom == null) {
@@ -1054,30 +1705,146 @@ public final class TransitionExtractor {
                             + truncate(safeText(c)));
                     // fall through with a null from so produced targets are still
                     // recorded (as undetermined-origin) rather than dropped.
+                } else {
+                    // The arm matched this state, so anything it fails to produce is
+                    // an absence the analysis observed rather than one it missed.
+                    dispatchedStates.add(caseFrom);
                 }
-            } else if (overEvent) {
-                String ev = caseEventName(c);
-                if (ev != null) caseEvent = ev; // default/unmatched arm keeps inherited event
+            }
+            List<String> caseEvents = overEvent ? caseEventNames(c)
+                    : overComponent ? componentEventNames(c)
+                    : List.<String>of();
+            if (caseEvents.isEmpty()) {
+                // Not an event dispatch, or an unlabelled `default` arm: the
+                // inherited event label carries through unchanged. Inside a
+                // component switch that inherited label is the bare family name
+                // (`Send`), which is the honest reading — the arm fires for every
+                // component value the labelled arms did not name.
+                caseEvents = Collections.singletonList(event); // may hold null
             }
             String caseGuard = merge(guard, caseGuard(c));
-            for (CtStatement st : c.getStatements()) {
-                walk(st, caseFrom, caseEvent, caseGuard, out);
+            // If this arm deconstructed its event, remember the binding so a switch
+            // on it inside the arm body refines the label instead of inheriting it.
+            ComponentEvent binding = overEvent && caseEvents.size() == 1
+                    ? componentBindingOf(c, caseEvents.get(0)) : null;
+            ComponentEvent savedComponent = componentEvent;
+            if (binding != null) componentEvent = binding;
+            try {
+                for (String caseEvent : caseEvents) {
+                    for (CtStatement st : c.getStatements()) {
+                        walk(st, caseFrom, caseEvent, caseGuard, out);
+                    }
+                }
+            } finally {
+                componentEvent = savedComponent;
             }
         }
+    }
+
+    /**
+     * Is this switch selecting the component bound by the enclosing event arm?
+     * Matched on the binding's NAME and its enum TYPE together: a record-pattern
+     * binding has no resolvable declaration in the Spoon model (verified — the
+     * inner selector's {@code getDeclaration()} is {@code null}), so identity
+     * comparison is unavailable, and the name alone would claim an unrelated
+     * switch that happened to reuse a one-letter variable.
+     */
+    private boolean isComponentDispatch(CtAbstractSwitch<?> sw) {
+        ComponentEvent ctx = componentEvent;
+        if (ctx == null) return false;
+        CtExpression<?> sel;
+        try {
+            sel = sw.getSelector();
+        } catch (Throwable t) {
+            return false;
+        }
+        if (!(sel instanceof CtVariableAccess<?> va) || va.getVariable() == null) return false;
+        if (!ctx.boundName().equals(va.getVariable().getSimpleName())) return false;
+        CtTypeReference<?> t = sel.getType();
+        return t != null && ctx.enumQualifiedName().equals(t.getQualifiedName());
+    }
+
+    /**
+     * The binding a record-pattern event arm introduced, or {@code null} when the
+     * arm binds no single enum component. Requiring exactly one keeps this in step
+     * with {@link #soleEnumComponent}: where Σ declined to expand, the label
+     * declines to compose, so the two can never describe different alphabets.
+     */
+    private ComponentEvent componentBindingOf(CtCase<?> c, String prefix) {
+        if (prefix == null) return null;
+        try {
+            for (CtExpression<?> ce : c.getCaseExpressions()) {
+                Object pattern = tryMethod(ce, "getPattern");
+                if (pattern == null) continue;
+                if (!(tryMethod(pattern, "getPatternList") instanceof List<?> subs)) continue;
+                ComponentEvent found = null;
+                for (Object sub : subs) {
+                    Object variable = tryMethod(sub, "getVariable");
+                    if (variable == null) continue;
+                    if (!(tryMethod(variable, "getSimpleName") instanceof String name)) continue;
+                    if (!(tryMethod(variable, "getType") instanceof CtTypeReference<?> t)) continue;
+                    if (!(t.getTypeDeclaration() instanceof CtEnum<?> en)
+                            || en.getEnumValues().isEmpty()) {
+                        continue;
+                    }
+                    if (found != null) return null; // several enum components — ambiguous
+                    found = new ComponentEvent(prefix, name, t.getQualifiedName());
+                }
+                if (found != null) return found;
+            }
+        } catch (Throwable ignored) {
+            // best effort: no binding simply means the arm keeps its family label
+        }
+        return null;
+    }
+
+    /**
+     * The Σ symbols an arm of a component switch matches: the enclosing event
+     * prefix joined to each matched constant. A composed symbol is emitted only if
+     * Σ already contains it — Σ is enumerated from the types and is the authority,
+     * so a label can never name an input the alphabet does not have. When it does
+     * not, the arm falls back to inheriting the bare family label.
+     */
+    private List<String> componentEventNames(CtCase<?> c) {
+        List<String> out = new ArrayList<>();
+        ComponentEvent ctx = componentEvent;
+        if (ctx == null) return out;
+        try {
+            for (CtExpression<?> ce : c.getCaseExpressions()) {
+                if (!(ce instanceof CtFieldAccess<?> fa) || fa.getVariable() == null) continue;
+                String composed = composedSymbol(ctx.prefix(), fa.getVariable().getSimpleName());
+                if (alphabet.contains(composed)) out.add(composed);
+            }
+        } catch (Throwable ignored) {
+            // best effort — an unreadable label keeps the inherited event
+        }
+        return out;
     }
 
     private void emit(String from, String event, String guard,
                       TransitionResolver.Candidate cand, Set<Transition> out) {
         if (cand.resolved()) {
             if (from == null) {
-                out.add(Transition.unresolved("<entry>", event, guard,
-                        "target " + cand.targetSimpleName() + " with undetermined source state"));
+                out.add(mark(Transition.unresolved("<entry>", event, guard,
+                        "target " + cand.targetSimpleName() + " with undetermined source state"), event));
             } else {
-                out.add(Transition.resolved(from, cand.targetSimpleName(), event, guard));
+                out.add(mark(Transition.resolved(from, cand.targetSimpleName(), event, guard)
+                        .withForm(cand.form()), event));
             }
         } else {
-            out.add(Transition.unresolved(from == null ? "<unknown>" : from, event, guard, cand.raw()));
+            out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from,
+                    event, guard, cand.raw()), event));
         }
+    }
+
+    /**
+     * Flag an edge reached through an {@code else}, a {@code default} arm or a
+     * fall-through as the state's default ("otherwise") transition — but only when
+     * no event selected it. An else branch under an event test still fires on that
+     * event and is not a default edge.
+     */
+    private Transition mark(Transition t, String event) {
+        return otherwisePath && event == null ? t.asOtherwise() : t;
     }
 
     // ---- Spoon-version-sensitive accessors (all guarded) ---------------------
@@ -1164,27 +1931,45 @@ public final class TransitionExtractor {
     }
 
     /**
-     * The event matched by a switch-over-event arm (F4): the type pattern for a
-     * sealed event ({@code case Lock l ->}) or the constant name for an enum
-     * event ({@code case LOCK ->}). Returns {@code null} for a {@code default}
-     * arm, so the inherited event label is kept.
+     * The events matched by a switch-over-event arm (F4), in label order: a type
+     * pattern for a sealed event ({@code case Lock l ->}) or a constant for an
+     * enum event ({@code case SEND_HEADERS ->}). Returns an empty list for a
+     * {@code default} arm, so the inherited event label is kept.
+     *
+     * <p>The enum-constant case is checked <em>first</em>, and the order is
+     * load-bearing. A constant read carries the enum's own type, so asking
+     * {@link #patternType} first answers "the event type" — labelling every arm of
+     * {@code switch (event)} with the name of the enum instead of the constant it
+     * matched, and collapsing the whole alphabet to a single symbol.
      */
-    private String caseEventName(CtCase<?> c) {
+    private List<String> caseEventNames(CtCase<?> c) {
+        List<String> out = new ArrayList<>();
         try {
             for (CtExpression<?> ce : c.getCaseExpressions()) {
+                String constant = enumConstantSymbol(ce);
+                if (constant != null) {
+                    out.add(constant);
+                    continue;
+                }
+                // A constant outside Σ (or unresolvable under noClasspath) still
+                // names itself; the bare simple name is what the source says.
+                if (ce instanceof CtFieldAccess<?> fa && fa.getVariable() != null) {
+                    out.add(fa.getVariable().getSimpleName());
+                    continue;
+                }
                 CtTypeReference<?> t = patternType(ce);
                 if (t != null && eventQualifiedNames.contains(t.getQualifiedName())) {
-                    return t.getSimpleName();
+                    out.add(t.getSimpleName());
+                    continue;
                 }
-                // enum constant label: `case LOCK ->` reads the constant.
                 if (ce instanceof CtVariableAccess<?> va && va.getVariable() != null) {
-                    return va.getVariable().getSimpleName();
+                    out.add(va.getVariable().getSimpleName());
                 }
             }
         } catch (Throwable ignored) {
-            // best effort — fall through to null (keep inherited event)
+            // best effort — an unreadable label keeps the inherited event
         }
-        return null;
+        return out;
     }
 
     /** Guarded-pattern {@code when} clause, if present and supported. */

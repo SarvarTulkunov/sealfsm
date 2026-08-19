@@ -1,20 +1,29 @@
 package io.sealfsm.extract;
 
+import io.sealfsm.model.SuccessorForm;
 import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtConditional;
 import spoon.reflect.code.CtConstructorCall;
 import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtInvocation;
+import spoon.reflect.code.CtLocalVariable;
 import spoon.reflect.code.CtThisAccess;
 import spoon.reflect.code.CtVariableAccess;
+import spoon.reflect.declaration.CtElement;
+import spoon.reflect.declaration.CtEnum;
+import spoon.reflect.declaration.CtEnumValue;
+import spoon.reflect.declaration.CtField;
 import spoon.reflect.declaration.CtMethod;
+import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtVariable;
+import spoon.reflect.reference.CtFieldReference;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.reference.CtVariableReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -42,14 +51,27 @@ import java.util.Set;
 public final class TransitionResolver {
 
     /** A possible transition target derived from one expression. */
-    public record Candidate(String targetSimpleName, String guard, boolean resolved, String raw) {
-        static Candidate of(String target, String guard) {
-            return new Candidate(target, guard, true, null);
+    public record Candidate(String targetSimpleName, String guard, boolean resolved,
+                            String raw, SuccessorForm form) {
+        static Candidate of(String target, String guard, SuccessorForm form) {
+            return new Candidate(target, guard, true, null, form);
         }
         static Candidate unresolved(String guard, String raw) {
-            return new Candidate(null, guard, false, raw);
+            return new Candidate(null, guard, false, raw, null);
+        }
+        /** The same candidate re-labelled with the form that reached it. */
+        Candidate as(SuccessorForm f) {
+            return resolved ? new Candidate(targetSimpleName, guard, true, raw, f) : this;
         }
     }
+
+    /**
+     * Depth bound for chasing a variable through its initializer. Two hops covers
+     * {@code H a = SINGLETON;} → {@code static final H SINGLETON = new Idle();}
+     * while keeping a self-referential or mutually-referential pair terminating;
+     * the {@code seen} set is the real cycle guard and this is the belt-and-braces.
+     */
+    private static final int MAX_INITIALIZER_DEPTH = 4;
 
     private final Set<String> hierarchyQualifiedNames;
     private final String rootQualifiedName;
@@ -60,10 +82,21 @@ public final class TransitionResolver {
     }
 
     public List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName) {
-        return resolve(expr, fromSimpleName, null);
+        return resolve(expr, fromSimpleName, null, new HashSet<>(), 0);
     }
 
-    private List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName, String guard) {
+    /**
+     * Map one produced expression to the permitted subtype(s) it can denote.
+     *
+     * <p>Every hierarchy-typed form is handled here rather than at the call sites,
+     * so the same sub-procedure serves centralized and per-state dispatch alike:
+     * construction, {@code this}, an explicit cast, a singleton field, an enum
+     * constant, and a local whose value is fixed within this method. Anything whose
+     * identity would require leaving the method — a parameter that is not the
+     * dispatch selector, a helper call — yields an <em>unresolved</em> candidate.
+     */
+    private List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName, String guard,
+                                    Set<CtElement> seen, int depth) {
         List<Candidate> out = new ArrayList<>();
         if (expr == null) {
             return out;
@@ -86,29 +119,31 @@ public final class TransitionResolver {
         }
 
         // return this  ->  self-loop
-        if (expr instanceof CtThisAccess<?> && fromSimpleName != null) {
-            out.add(Candidate.of(fromSimpleName, guard));
+        if (expr instanceof CtThisAccess<?>) {
+            out.add(fromSimpleName != null
+                    ? Candidate.of(fromSimpleName, guard, SuccessorForm.SELF)
+                    : Candidate.unresolved(guard, safeText(expr)));
             return out;
         }
 
         // cond ? a : b  ->  guarded split
         if (expr instanceof CtConditional<?> cond) {
             String condText = safeText(cond.getCondition());
-            out.addAll(resolve(cond.getThenExpression(), fromSimpleName, combine(guard, condText)));
-            out.addAll(resolve(cond.getElseExpression(), fromSimpleName, combine(guard, negate(condText))));
+            out.addAll(resolve(cond.getThenExpression(), fromSimpleName,
+                    combine(guard, condText), seen, depth));
+            out.addAll(resolve(cond.getElseExpression(), fromSimpleName,
+                    combine(guard, negate(condText)), seen, depth));
             return out;
         }
 
         // field / variable / parameter read
         if (expr instanceof CtVariableAccess<?> va) {
-            Candidate c = fromVariable(va, guard, expr, fromSimpleName);
-            if (c != null) {
-                out.add(c);
-                return out;
-            }
+            out.addAll(fromVariable(va, guard, expr, fromSimpleName, seen, depth));
+            return out;
         }
 
-        // return helper(...)  -> inter-procedural; out of v1 scope
+        // return helper(...)  -> the successor is computed elsewhere. The extractor
+        // may fold a bounded summary (F3); on its own this stays unresolved.
         if (expr instanceof CtInvocation<?> inv) {
             out.add(Candidate.unresolved(guard, safeText(inv)));
             return out;
@@ -131,7 +166,7 @@ public final class TransitionResolver {
             if (cast == null) continue;
             String q = cast.getQualifiedName();
             if (!q.equals(rootQualifiedName) && hierarchyQualifiedNames.contains(q)) {
-                return Candidate.of(cast.getSimpleName(), guard);
+                return Candidate.of(cast.getSimpleName(), guard, SuccessorForm.CAST);
             }
         }
         return null;
@@ -139,48 +174,136 @@ public final class TransitionResolver {
 
     private Candidate fromTypeRef(CtTypeReference<?> ref, String guard, CtExpression<?> raw) {
         if (ref != null && hierarchyQualifiedNames.contains(ref.getQualifiedName())) {
-            return Candidate.of(ref.getSimpleName(), guard);
+            return Candidate.of(ref.getSimpleName(), guard, SuccessorForm.CONSTRUCTION);
         }
         return Candidate.unresolved(guard, safeText(raw));
     }
 
-    private Candidate fromVariable(CtVariableAccess<?> va, String guard, CtExpression<?> raw, String fromSimpleName) {
+    /**
+     * Resolve a read of a field, local, parameter or pattern binding to the state
+     * it denotes. The order matters and encodes what can actually be <em>proved</em>:
+     *
+     * <ol>
+     *   <li><b>Enum constant</b> of a permitted {@code enum} subtype — the constant
+     *       <em>is</em> the state, so its identity beats its declared type (which
+     *       is merely the enum).</li>
+     *   <li><b>Initializer</b> — a variable bound once to a hierarchy value denotes
+     *       that value: {@code static final Signal INSTANCE = new Idle();}. This
+     *       must precede the declared-type rules, because a singleton is routinely
+     *       declared as the abstract root and rule (4) would otherwise mistake it
+     *       for the current state.</li>
+     *   <li><b>Concrete declared type</b> — a variable typed as a permitted subtype
+     *       can only hold that subtype.</li>
+     *   <li><b>Root-typed selector</b> — a parameter or pattern binding typed as the
+     *       abstract root is the value being dispatched on, so reading it means
+     *       "stay in the matched state".</li>
+     * </ol>
+     *
+     * A root-typed local or field that survives all four cannot be pinned without
+     * leaving the method, and is reported unresolved rather than guessed.
+     */
+    private List<Candidate> fromVariable(CtVariableAccess<?> va, String guard, CtExpression<?> raw,
+                                         String fromSimpleName, Set<CtElement> seen, int depth) {
         CtVariableReference<?> vref = va.getVariable();
-        if (vref == null) return null;
+        if (vref == null) return List.of(Candidate.unresolved(guard, safeText(raw)));
 
-        // (a) declared type tells us what the read yields
-        CtTypeReference<?> declaredType = vref.getType();
-        if (declaredType != null) {
-            String dq = declaredType.getQualifiedName();
-            // A read of a variable typed as the *abstract root* (typically the
-            // `current` selector parameter, e.g. `return current;`) means "stay
-            // in the matched state" -> self-loop to the from-state.
-            if (dq.equals(rootQualifiedName)) {
-                // The "root-typed read means stay in the matched state" shortcut is
-                // sound only for the *unmodified* selector (e.g. `current`). A
-                // reassigned variable would fabricate a proven self-loop, so it is
-                // left unresolved here; reassigned *locals* are recovered upstream
-                // by the extractor's reaching-definitions pass (see F1).
-                if (fromSimpleName != null && !isReassigned(vref)) {
-                    return Candidate.of(fromSimpleName, guard);
-                }
-                return Candidate.unresolved(guard, safeText(raw));
-            }
-            // A read of a variable typed as a *concrete* state resolves to it.
-            if (hierarchyQualifiedNames.contains(dq)) {
-                return Candidate.of(declaredType.getSimpleName(), guard);
-            }
+        // (1) enum-constant identity: `return Phase.RAMP;`
+        String constant = enumConstantState(vref);
+        if (constant != null) {
+            return List.of(Candidate.of(constant, guard, SuccessorForm.ENUM_CONSTANT));
         }
 
-        // (b) initializer constructs a state: static final Green G = new Green();
         CtVariable<?> decl = vref.getDeclaration();
-        if (decl != null && decl.getDefaultExpression() instanceof CtConstructorCall<?> cc) {
-            CtTypeReference<?> t = cc.getType();
-            if (t != null && hierarchyQualifiedNames.contains(t.getQualifiedName())) {
-                return Candidate.of(t.getSimpleName(), guard);
+        CtTypeReference<?> declaredType = vref.getType();
+        String dq = declaredType == null ? null : declaredType.getQualifiedName();
+
+        // (2) the initializer fixes the value. Resolved recursively so a singleton
+        // pointing at another singleton, a cast or a ternary all work; `seen`
+        // stops a self- or mutually-referential declaration from looping.
+        if (decl != null && !isReassigned(vref) && depth < MAX_INITIALIZER_DEPTH && seen.add(decl)) {
+            CtExpression<?> init = decl.getDefaultExpression();
+            if (init != null && !(init instanceof CtVariableAccess<?> self && refersTo(self, vref))) {
+                List<Candidate> viaInit = resolve(init, fromSimpleName, guard, seen, depth + 1);
+                if (viaInit.stream().allMatch(Candidate::resolved) && !viaInit.isEmpty()) {
+                    SuccessorForm form = decl instanceof CtField<?>
+                            ? SuccessorForm.SINGLETON_FIELD
+                            : SuccessorForm.LOCAL_VARIABLE;
+                    // A `this`-initialised or selector-initialised binding is still a
+                    // self-loop; keep SELF rather than relabelling it a singleton.
+                    return viaInit.stream()
+                            .map(c -> c.form() == SuccessorForm.SELF ? c : c.as(form))
+                            .toList();
+                }
             }
         }
-        return Candidate.unresolved(guard, safeText(raw));
+
+        if (dq != null) {
+            // (3) a variable typed as a *concrete* state resolves to it.
+            if (!dq.equals(rootQualifiedName) && hierarchyQualifiedNames.contains(dq)) {
+                SuccessorForm form = decl instanceof CtField<?>
+                        ? SuccessorForm.SINGLETON_FIELD
+                        : SuccessorForm.LOCAL_VARIABLE;
+                return List.of(Candidate.of(declaredType.getSimpleName(), guard, form));
+            }
+            // (4) a root-typed *selector* — a parameter, or a pattern binding —
+            // means "stay in the matched state". Deliberately NOT applied to a
+            // local or field: those hold a value that has an identity of its own,
+            // and reading the declared type there would fabricate a self-loop
+            // (finding F1). Reassigned locals are recovered upstream by the
+            // extractor's reaching-definitions pass.
+            if (dq.equals(rootQualifiedName)
+                    && fromSimpleName != null
+                    && isSelectorBinding(decl)
+                    && !isReassigned(vref)) {
+                return List.of(Candidate.of(fromSimpleName, guard, SuccessorForm.SELF));
+            }
+        }
+        return List.of(Candidate.unresolved(guard, safeText(raw)));
+    }
+
+    /**
+     * The state named by a read of an {@code enum} constant belonging to a permitted
+     * subtype, or {@code null} when this is not such a read. The constant is the
+     * state — {@code StateExtractor} enumerates a permitted enum's constants as its
+     * child states, exactly as it does a nested {@code permits} clause — so
+     * resolving to the enum type instead would lose the distinction between
+     * {@code RAMP} and {@code PEAK}.
+     */
+    private String enumConstantState(CtVariableReference<?> vref) {
+        if (vref.getDeclaration() instanceof CtEnumValue<?> ev) {
+            CtType<?> owner = ev.getDeclaringType();
+            if (owner != null && hierarchyQualifiedNames.contains(owner.getQualifiedName())) {
+                return ev.getSimpleName();
+            }
+            return null;
+        }
+        // noClasspath fallback: the declaration may be unavailable, but a field
+        // reference still names its owner, and that owner being an enum inside the
+        // hierarchy is enough to identify the read as a constant.
+        if (vref instanceof CtFieldReference<?> fref) {
+            CtTypeReference<?> owner = fref.getDeclaringType();
+            if (owner != null && hierarchyQualifiedNames.contains(owner.getQualifiedName())
+                    && owner.getTypeDeclaration() instanceof CtEnum<?>) {
+                return fref.getSimpleName();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Is this declaration the value the enclosing code dispatches on — a method
+     * parameter or a pattern binding — as opposed to a local or field holding a
+     * successor? Only the former licenses the "root-typed read means stay put"
+     * reading.
+     */
+    private static boolean isSelectorBinding(CtVariable<?> decl) {
+        if (decl == null) return true;  // unresolvable declaration: keep prior behaviour
+        return !(decl instanceof CtField<?>) && !(decl instanceof CtLocalVariable<?>);
+    }
+
+    private static boolean refersTo(CtVariableAccess<?> access, CtVariableReference<?> vref) {
+        return access.getVariable() != null
+                && access.getVariable().getSimpleName().equals(vref.getSimpleName());
     }
 
     /**

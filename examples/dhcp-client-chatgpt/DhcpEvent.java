@@ -1,0 +1,13 @@
+package dhcp;
+
+public enum DhcpEvent {
+    DHCPDISCOVER_SENT,
+    DHCPOFFER_RECEIVED,
+    SELECT_OFFER,
+    DHCPREQUEST_SENT,
+    DHCPACK_RECEIVED,
+    DHCPNAK_RECEIVED,
+    T1_EXPIRED,
+    T2_EXPIRED,
+    LEASE_EXPIRED
+}

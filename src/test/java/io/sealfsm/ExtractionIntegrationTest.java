@@ -1,7 +1,10 @@
 package io.sealfsm;
 
+import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.ExtractionResult;
+import io.sealfsm.model.State;
 import io.sealfsm.model.StateMachine;
+import io.sealfsm.model.SuccessorForm;
 import io.sealfsm.model.Transition;
 import org.junit.jupiter.api.Test;
 import spoon.Launcher;
@@ -14,6 +17,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -60,7 +64,7 @@ class ExtractionIntegrationTest {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/traffic"));
         StateMachine m = single(r);
 
-        assertEquals(StateMachine.Encoding.DISTRIBUTED, m.encoding());
+        assertEquals(StateMachine.Encoding.POLYMORPHIC, m.encoding());
         assertEquals(Set.of("Red", "Green", "Yellow"), stateIds(m));
         assertTrue(hasResolved(m, "Red", "Green"));
         assertTrue(hasResolved(m, "Green", "Yellow"));
@@ -77,7 +81,7 @@ class ExtractionIntegrationTest {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/door"));
         StateMachine m = single(r);
 
-        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertEquals(Set.of("Open", "Closed", "Locked"), stateIds(m));
 
         assertTrue(hasResolved(m, "Open", "Closed"), "Open -> Closed");
@@ -106,7 +110,7 @@ class ExtractionIntegrationTest {
                 .filter(sm -> sm.name().equals("Turnstile"))
                 .findFirst().orElseThrow();
 
-        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertEquals(Set.of("Locked", "Unlocked"), stateIds(m));
 
         assertTrue(hasResolved(m, "Locked", "Unlocked"), "Locked -> Unlocked (guarded, inside if)");
@@ -140,7 +144,7 @@ class ExtractionIntegrationTest {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/localvar"));
         StateMachine m = single(r);
 
-        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertEquals(Set.of("Open", "Closed"), stateIds(m));
 
         // Real targets, recovered through the reassignment, are present...
@@ -211,7 +215,7 @@ class ExtractionIntegrationTest {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/factory"));
         StateMachine m = single(r);
 
-        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertEquals(Set.of("Open", "Shut", "Jammed"), stateIds(m));
 
         // Resolved *through* helper methods.
@@ -245,7 +249,7 @@ class ExtractionIntegrationTest {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/eventalphabet"));
         StateMachine m = single(r);
 
-        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertEquals(Set.of("Stopped", "Playing", "Paused"), stateIds(m));
 
         // Σ is exact and complete — enumerated from the sealed Event type.
@@ -326,7 +330,7 @@ class ExtractionIntegrationTest {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/errorhandling"));
         StateMachine m = single(r);
 
-        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertEquals(Set.of("Running", "Done", "Failed", "Waiting"), stateIds(m));
 
         // The normal try-body producer.
@@ -355,7 +359,7 @@ class ExtractionIntegrationTest {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/cancellation"));
         StateMachine m = single(r);
 
-        assertEquals(StateMachine.Encoding.CENTRALIZED, m.encoding());
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertEquals(Set.of("Pending", "Cancelled"), stateIds(m));
 
         // Required resolved edges, each labelled by the enclosing method.
@@ -394,15 +398,625 @@ class ExtractionIntegrationTest {
                 "enclosing-method event labels populate the alphabet");
     }
 
-    // ---- negative control --------------------------------------------------
+    // ---- polymorphic carrier (F8) ------------------------------------------
+
+    @Test
+    void tcpPolymorphicCarrierEncoding() {
+        // F8: the RFC 9293 TCP machine in the polymorphic State pattern. Each of
+        // the 11 permitted subtypes overrides `Transition on(Event)`, and the
+        // successor is an ARGUMENT to a carrier factory rather than the returned
+        // value:  return Transition.to(new LastAck(), Action.SND_FIN);
+        // No method returns TcpState, so the hierarchy-returning recognizers see
+        // nothing and the whole machine was previously lost as a "plain sum type".
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/tcp"));
+
+        // `tcp.Event` is Σ, not a state hierarchy: exactly one machine, not two.
+        StateMachine m = single(r);
+        assertEquals("TcpState", m.name());
+        // Dispatch lives in a per-state method, so this is POLYMORPHIC dispatch.
+        // The carrier is a property of how the successor is spelled and committed,
+        // not of the encoding — the three axes are reported separately.
+        assertEquals(StateMachine.Encoding.POLYMORPHIC, m.encoding());
+        assertEquals(Set.of(CommitForm.POLY_CARRIER), m.commitForms(),
+                "the successor is handed to a carrier, not returned as the hierarchy type");
+
+        // States remain the exact, provably-complete part: the permits clause.
+        assertEquals(Set.of("Closed", "Listen", "SynSent", "SynReceived", "Established",
+                        "FinWait1", "FinWait2", "CloseWait", "Closing", "LastAck", "TimeWait"),
+                stateIds(m));
+
+        // Targets recovered from inside the carrier's argument list, spanning the
+        // three-way handshake, both close paths and the simultaneous-close path.
+        assertTrue(hasResolved(m, "Closed", "Listen"), "Closed -> Listen (passive OPEN)");
+        assertTrue(hasResolved(m, "Closed", "SynSent"), "Closed -> SynSent (active OPEN)");
+        assertTrue(hasResolved(m, "Listen", "SynReceived"), "Listen -> SynReceived (rcv SYN)");
+        assertTrue(hasResolved(m, "SynSent", "Established"), "SynSent -> Established (rcv SYN,ACK)");
+        assertTrue(hasResolved(m, "Established", "CloseWait"), "Established -> CloseWait (rcv FIN)");
+        assertTrue(hasResolved(m, "CloseWait", "LastAck"), "CloseWait -> LastAck (CLOSE)");
+        assertTrue(hasResolved(m, "FinWait1", "Closing"), "FinWait1 -> Closing (simultaneous close)");
+        assertTrue(hasResolved(m, "Closing", "TimeWait"), "Closing -> TimeWait (rcv ACK of FIN)");
+        assertTrue(hasResolved(m, "LastAck", "Closed"), "LastAck -> Closed (rcv ACK of FIN)");
+
+        // `Transition.ignore(this)` is a self-loop, not an unresolved target.
+        assertTrue(hasResolved(m, "TimeWait", "TimeWait"), "TimeWait self-loop (ignore(this))");
+        assertTrue(hasResolved(m, "Established", "Established"), "Established self-loop (ignore(this))");
+
+        // The event is recovered from the guard, not from the method name: `on`
+        // labels nothing, but `event == UserCall.CLOSE` and `event instanceof
+        // SegmentArrival` do.
+        assertTrue(hasEventEdge(m, "CloseWait", "UserCall.CLOSE", "LastAck"),
+                "CloseWait --UserCall.CLOSE--> LastAck");
+        assertTrue(hasEventEdge(m, "TimeWait", "Timeout.TIME_WAIT_2MSL", "Closed"),
+                "TimeWait --Timeout.TIME_WAIT_2MSL--> Closed");
+        assertTrue(hasEventEdge(m, "Established", "SegmentArrival", "Closed"),
+                "Established --SegmentArrival--> Closed (RST)");
+
+        // A disjunction of event tests is two inputs of Σ, not one compound label:
+        //   if (event == UserCall.CLOSE || event == Timeout.USER)
+        assertTrue(hasEventEdge(m, "SynSent", "UserCall.CLOSE", "Closed"), "SynSent --CLOSE--> Closed");
+        assertTrue(hasEventEdge(m, "SynSent", "Timeout.USER", "Closed"), "SynSent --USER timeout--> Closed");
+
+        // The data predicate stays a guard, separate from the event label.
+        Transition rstAbort = m.transitions().stream()
+                .filter(t -> t.from().equals("Established") && "Closed".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(rstAbort.guard(), "the RST branch should record its condition");
+        assertTrue(rstAbort.guard().contains("rst()"), "guard should be the data test, not the event test");
+
+        // Σ is enumerated from the sealed Event type, expanding enum members into
+        // their constants — the granularity the guards actually test.
+        assertTrue(m.alphabet().contains("SegmentArrival"), "record event in Σ");
+        assertTrue(m.alphabet().contains("UserCall.PASSIVE_OPEN"), "enum constant in Σ");
+        assertTrue(m.alphabet().contains("Timeout.RETRANSMISSION"),
+                "an event no edge names must still be in Σ");
+
+        // The from-state is the declaring class, so it is never undetermined.
+        assertFalse(m.transitions().stream().anyMatch(t -> "<unknown>".equals(t.from())),
+                "the declaring class always fixes the source state");
+        assertEquals("Closed", m.initialState().orElse(null));
+
+        // Actions (Action.SIGNAL_ABORT, ...) are carrier payload, not states: no
+        // edge may touch anything outside the hierarchy.
+        Set<String> ids = stateIds(m);
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> !ids.contains(t.from()) || (t.isResolved() && !ids.contains(t.to()))),
+                "no edge may touch a non-state type");
+    }
+
+    // ---- successor forms (the axis orthogonal to encoding) ------------------
+
+    @Test
+    void everySuccessorFormResolvesToAPermittedSubtype() {
+        // The successor of a transition may be written in any of several ways, and
+        // resolving them is one uniform sub-procedure independent of where dispatch
+        // lives. This fixture holds the encoding fixed (per-state methods returning
+        // a carrier) and varies only the spelling.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/valueforms"));
+        StateMachine m = single(r);
+
+        // A permitted `enum` contributes its constants as states: they are as
+        // compiler-checked-exhaustive as a permits clause, and transitions name
+        // them individually, so collapsing them into one state would merge
+        // genuinely distinct states.
+        assertEquals(Set.of("Idle", "Armed", "Firing", "Phase", "RAMP", "PEAK"), stateIds(m));
+
+        // new Firing(), held in a local and returned through the carrier.
+        assertTrue(hasResolved(m, "Armed", "Firing"), "Armed -> Firing (local variable)");
+        // A singleton declared with the CONCRETE state as its type.
+        assertTrue(hasResolved(m, "Idle", "Armed"), "Idle -> Armed (singleton, concrete-typed)");
+        // A singleton declared as the abstract ROOT: only its initializer pins it.
+        // Reading the declared type instead would have produced a false self-loop.
+        assertTrue(hasResolved(m, "Firing", "Idle"), "Firing -> Idle (singleton, root-typed)");
+        assertTrue(hasResolved(m, "Phase", "Idle"), "Phase -> Idle (singleton, root-typed)");
+        // Enum constants, qualified and bare.
+        assertTrue(hasResolved(m, "Armed", "RAMP"), "Armed -> RAMP (qualified enum constant)");
+        assertTrue(hasResolved(m, "Phase", "PEAK"), "Phase -> PEAK (bare enum constant)");
+        // `this` through the carrier.
+        assertTrue(hasResolved(m, "Idle", "Idle"), "Idle self-loop (this)");
+
+        // Each edge records HOW its successor was written.
+        assertEquals(Set.of(SuccessorForm.SINGLETON_FIELD, SuccessorForm.ENUM_CONSTANT,
+                        SuccessorForm.LOCAL_VARIABLE, SuccessorForm.SELF),
+                m.successorForms());
+
+        // No form may be resolved to a state outside the machine.
+        Set<String> ids = stateIds(m);
+        assertFalse(m.transitions().stream().anyMatch(t -> t.isResolved() && !ids.contains(t.to())),
+                "every resolved successor must be a state of this machine");
+    }
+
+    @Test
+    void aSuccessorComputedByAHelperStaysUnresolved() {
+        // `return Step.to(Router.pick(tick));` — the identity of the successor
+        // cannot be established without leaving the method. The soundness
+        // invariant says record it, do not guess it, and do not drop it.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/valueforms"));
+        StateMachine m = single(r);
+
+        assertTrue(m.transitions().stream().anyMatch(t -> t.from().equals("Firing") && !t.isResolved()),
+                "the helper-computed successor must be recorded as unresolved");
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> t.from().equals("Firing") && t.isResolved()
+                                && ("Armed".equals(t.to()) || "Firing".equals(t.to()))),
+                "the helper's own returns must not leak in as resolved edges");
+    }
+
+    @Test
+    void defaultBranchIsRecordedAsAnOtherwiseEdge() {
+        // A fall-through / else with no event test is a legitimate transition that
+        // fires when nothing else does. It must be marked as the default edge —
+        // distinguishing "fires otherwise" from "no event was recovered" — and
+        // never treated as an error or dropped.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/tcp"));
+        StateMachine m = single(r);
+
+        Transition fallThrough = m.transitions().stream()
+                .filter(t -> t.from().equals("Established") && "Established".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertTrue(fallThrough.isOtherwise(), "the trailing ignore(this) is the default edge");
+        assertNull(fallThrough.event(), "a default edge carries no event");
+        assertNotNull(fallThrough.guard(), "it still carries the residual of the guards before it");
+
+        // An edge an event DID select is not a default edge, even though it also
+        // sits on a fall-through path.
+        Transition evented = m.transitions().stream()
+                .filter(t -> "UserCall.CLOSE".equals(t.event()) && t.from().equals("Established"))
+                .findFirst().orElseThrow();
+        assertFalse(evented.isOtherwise(), "an event-selected edge is not the default edge");
+
+        // Every state has exactly one way out when nothing matches — no state was
+        // left with its default branch dropped.
+        for (String id : stateIds(m)) {
+            assertTrue(m.transitions().stream().anyMatch(t -> t.from().equals(id) && t.isOtherwise()),
+                    "state " + id + " should keep its default edge");
+        }
+    }
+
+    // ---- centralized dispatch: the commit axis ------------------------------
+    //
+    // The four tests below hold the ENCODING fixed — one switch over the state
+    // type, in every case — and vary only where that switch is hosted and how its
+    // result is installed. Recognising only the first of them (the pure function)
+    // was the false-negative this axis exists to close: the other three are the
+    // same automaton, written the way application code actually writes it.
+
+    @Test
+    void http2ValueReturnFromAnExternalHost() {
+        // Acceptance #1. `StreamStateMachine.next(state, event)` is a static pure
+        // function outside the hierarchy: `return switch (state) { case Idle s ->
+        // fromIdle(s, event); ... }`, with each arm delegating to a per-state
+        // helper. Dispatch is centralized, the commit is a plain value return, and
+        // the from-states come from TYPE patterns (`case Idle s`) rather than
+        // record patterns — the other half of D1.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/http2-stream-claude"));
+        StateMachine m = single(r);
+
+        assertEquals("StreamState", m.name());
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of(CommitForm.VALUE_RETURN), m.commitForms());
+        assertEquals(Set.of("Idle", "ReservedLocal", "ReservedRemote", "Open",
+                        "HalfClosedLocal", "HalfClosedRemote", "Closed"), stateIds(m));
+
+        // Σ: the event is a record carrying an enum (`Send(Signal)`), so one input
+        // is the PAIR, not the record. Σ is the closed-world product of the two
+        // levels — exactly as many symbols as the flat-constant spelling in #2.
+        assertEquals(Set.of("Send.HEADERS", "Send.PUSH_PROMISE", "Send.END_STREAM",
+                        "Send.RST_STREAM", "Recv.HEADERS", "Recv.PUSH_PROMISE",
+                        "Recv.END_STREAM", "Recv.RST_STREAM"), m.alphabet());
+
+        // Edges carry the composed symbol, not the bare event family. Labelling
+        // these `Send` would merge four distinct inputs into one label and make
+        // the two Idle edges look like a nondeterministic conflict.
+        assertTrue(hasEventEdge(m, "Idle", "Send.HEADERS", "Open"));
+        assertTrue(hasEventEdge(m, "Idle", "Recv.HEADERS", "Open"));
+        assertTrue(hasEventEdge(m, "Idle", "Send.PUSH_PROMISE", "ReservedLocal"));
+        assertTrue(hasEventEdge(m, "Idle", "Recv.PUSH_PROMISE", "ReservedRemote"));
+        assertTrue(hasEventEdge(m, "Open", "Send.END_STREAM", "HalfClosedLocal"));
+        assertTrue(hasEventEdge(m, "HalfClosedRemote", "Send.RST_STREAM", "Closed"));
+        assertFalse(m.transitions().stream().anyMatch(t -> "Send".equals(t.event())
+                        || "Recv".equals(t.event())),
+                "an edge must name the input, not the event family it belongs to");
+
+        assertEquals(20, m.transitions().size(), "the complete RFC 9113 relation");
+        assertEquals(0, m.unresolvedTransitionCount(), "every successor is constructed inline");
+
+        // With the inputs distinguished there is no conflict left to report. The
+        // warnings this used to raise were an artefact of the label, not a property
+        // of the machine.
+        assertFalse(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().toLowerCase().contains("nondetermin")),
+                "distinct inputs must not read as overlapping guards");
+
+        // `Closed s -> throw illegal(...)` is an explicit rejection, so Closed is
+        // terminal: no edge leaves it, and none is invented.
+        assertTerminal(m, "Closed");
+        // The event hierarchy is Σ, not a second machine.
+        assertEquals(1, r.machines().size(), "StreamEvent is the alphabet, not a state hierarchy");
+    }
+
+    @Test
+    void http2FieldMutationWithExplicitThis() {
+        // Acceptance #2. The SAME RFC 9113 machine, written the way a stateful
+        // object writes it: `this.currentState = switch (this.currentState) {...}`.
+        // The host takes no hierarchy-typed parameter, so the signature-based
+        // recognizer (hierarchy-in / hierarchy-out) never saw it and the entire
+        // machine was reported as "not a state machine".
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/http2-stream-gemini"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of(CommitForm.FIELD_MUTATION), m.commitForms());
+
+        // States: exact, from the permits clause.
+        assertEquals(Set.of("Idle", "ReservedLocal", "ReservedRemote", "Open",
+                        "HalfClosedLocal", "HalfClosedRemote", "Closed"), stateIds(m));
+
+        // Σ: all eight enum constants, exact and closed.
+        assertEquals(Set.of("SEND_HEADERS", "RECV_HEADERS", "SEND_PUSH_PROMISE",
+                        "RECV_PUSH_PROMISE", "SEND_END_STREAM", "RECV_END_STREAM",
+                        "SEND_RST_STREAM", "RECV_RST_STREAM"), m.alphabet());
+
+        // The full RFC 9113 §5.1 transition relation, every edge event-labelled.
+        assertTrue(hasEventEdge(m, "Idle", "SEND_PUSH_PROMISE", "ReservedLocal"));
+        assertTrue(hasEventEdge(m, "Idle", "RECV_PUSH_PROMISE", "ReservedRemote"));
+        assertTrue(hasEventEdge(m, "ReservedLocal", "SEND_HEADERS", "HalfClosedRemote"));
+        assertTrue(hasEventEdge(m, "ReservedRemote", "RECV_HEADERS", "HalfClosedLocal"));
+        assertTrue(hasEventEdge(m, "Open", "RECV_END_STREAM", "HalfClosedRemote"));
+        assertTrue(hasEventEdge(m, "Open", "SEND_END_STREAM", "HalfClosedLocal"));
+        assertTrue(hasEventEdge(m, "HalfClosedLocal", "RECV_END_STREAM", "Closed"));
+
+        // A multi-label arm is several inputs of Σ sharing a body, not one edge:
+        //   case SEND_HEADERS, RECV_HEADERS -> new Open();
+        assertTrue(hasEventEdge(m, "Idle", "SEND_HEADERS", "Open"));
+        assertTrue(hasEventEdge(m, "Idle", "RECV_HEADERS", "Open"));
+        assertTrue(hasEventEdge(m, "Open", "SEND_RST_STREAM", "Closed"));
+        assertTrue(hasEventEdge(m, "Open", "RECV_RST_STREAM", "Closed"));
+
+        // No label may be the ENUM's own name: a constant read carries the enum
+        // type, so resolving the label as a type pattern would collapse all eight
+        // symbols into the single label "Event".
+        assertFalse(m.transitions().stream().anyMatch(t -> "Event".equals(t.event())),
+                "an arm must be labelled with the constant it matched, not with the enum type");
+
+        assertEquals(20, m.transitions().size(), "the complete RFC 9113 relation, one edge per input");
+        assertEquals(0, m.unresolvedTransitionCount());
+        assertEquals("Idle", m.initialState().orElse(null));
+        assertTerminal(m, "Closed");
+    }
+
+    @Test
+    void bareFieldCommitBehavesExactlyLikeExplicitThis() {
+        // Acceptance #3. `state = switch (state) {...}; return state;` — the same
+        // commit as #2 with the `this.` qualifier omitted. Spoon models a bare
+        // field read as a CtFieldRead with an implicit `this` target, so the two
+        // must be indistinguishable to the recognizer; this pins that it keys off
+        // the resolved TYPE of the assignment target and never off the spelling.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/barefield"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of(CommitForm.FIELD_MUTATION), m.commitForms());
+        assertEquals(Set.of("Idle", "Armed", "Fired"), stateIds(m));
+
+        assertTrue(hasEventEdge(m, "Idle", "ARM", "Armed"));
+        assertTrue(hasEventEdge(m, "Idle", "RESET", "Idle"));
+        assertTrue(hasEventEdge(m, "Armed", "TRIGGER", "Fired"));
+        assertTrue(hasEventEdge(m, "Armed", "RESET", "Idle"));
+        assertEquals(4, m.transitions().size());
+        assertEquals(0, m.unresolvedTransitionCount());
+        assertEquals("Idle", m.initialState().orElse(null));
+
+        // D3: `default -> throw reject(e)` is an EXPLICIT rejection. It must
+        // produce no edge — not a self-loop, not an unresolved edge — and the
+        // thrown-exception helper must not be followed looking for a successor.
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> t.note() != null && t.note().contains("reject")),
+                "a throw arm must not be mined for a successor");
+        // `Fired` rejects everything, so it is terminal rather than merely unvisited.
+        assertTerminal(m, "Fired");
+        assertFalse(m.allStates().stream().filter(s -> !s.id().equals("Fired"))
+                        .anyMatch(State::isTerminal),
+                "only the all-throw state is terminal");
+    }
+
+    @Test
+    void localAccumulatorKeepsBranchTargetsAndInventsNoSelfLoop() {
+        // Acceptance #4 (and D4). The dispatch commits through a hierarchy-typed
+        // local, and the arms compute the successor by assigning a SECOND local on
+        // several branches:
+        //     Phase r; if (s == START) r = new Working(); else r = new Blocked(); yield r;
+        // Two traps sit here at once. Resolving `r` from its DECLARED type yields
+        // the sealed root, which the "root-typed read means stay put" rule turns
+        // into a confident, unguarded self-loop — one invented edge, both real
+        // targets lost. Collapsing the branch assignments into one reaching value
+        // loses a real target instead. Both are failures of the same kind.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/accumulator"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of(CommitForm.LOCAL_ACCUMULATOR), m.commitForms());
+        assertEquals(Set.of("Ready", "Working", "Blocked", "Halted"), stateIds(m));
+
+        // Both branch-assigned targets survive, each under its own guard.
+        assertTrue(hasResolved(m, "Ready", "Working"), "Ready -> Working (then branch)");
+        assertTrue(hasResolved(m, "Ready", "Blocked"), "Ready -> Blocked (else branch)");
+        // Declaration initializer + conditional overwrite: both reach the yield.
+        assertTrue(hasResolved(m, "Working", "Blocked"), "Working -> Blocked (overwrite)");
+        assertTrue(hasResolved(m, "Working", "Working"), "Working -> Working (initializer survives)");
+
+        for (Transition t : m.transitions()) {
+            if (t.isResolved() && t.from().equals("Ready")) {
+                assertNotNull(t.guard(), "each branch target keeps the condition that selected it");
+            }
+        }
+
+        // The self-loop that IS present is a real one — `r = new Working()` inside
+        // the Working arm — so it is guarded. A self-loop synthesised from the
+        // local's declared type would be unguarded, and there must be none.
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> t.isResolved() && t.from().equals(t.to()) && t.guard() == null),
+                "no unguarded self-loop may be synthesised from a reassigned local");
+        assertFalse(hasResolved(m, "Ready", "Ready"),
+                "the Ready arm assigns no Ready value — that edge would be fabricated");
+
+        // Only the branch whose successor is computed past the inter-procedural
+        // budget is unresolved. Recorded, never guessed, never dropped.
+        assertEquals(1, m.unresolvedTransitionCount());
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> t.from().equals("Blocked") && !t.isResolved()),
+                "the out-of-budget delegation must be recorded as unresolved");
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> t.from().equals("Blocked") && t.isResolved()),
+                "a successor beyond the budget must not be resolved on a guess");
+    }
+
+    @Test
+    void bothHttp2ModelsRecoverTheSameMachine() {
+        // The corpus contains RFC 9113 §5.1 written twice, independently, in two
+        // different idioms: a pure function over a sealed record-carrying event
+        // (#1) and a field-mutating switch over a flat enum event (#2). They are
+        // the same automaton, so the tool must recover the same automaton — same
+        // states, same |Σ|, same transition relation up to how the inputs are
+        // spelled.
+        //
+        // This is the strongest correctness signal available without hand-written
+        // ground truth: two source spellings, one answer. It is also the reason the
+        // component labels matter. While an edge was labelled with the event FAMILY
+        // (`Send`) rather than the input (`Send.HEADERS`), four distinct inputs
+        // collapsed onto one label, this fixture reported 18 edges against the
+        // other's 20, and the difference looked like a recall gap between commit
+        // forms when it was purely a labelling artefact.
+        StateMachine fn = single(new Analyzer().analyze(modelOf("examples/http2-stream-claude")));
+        StateMachine mut = single(new Analyzer().analyze(modelOf("examples/http2-stream-gemini")));
+
+        assertEquals(stateIds(mut), stateIds(fn), "same state set");
+        assertEquals(mut.alphabet().size(), fn.alphabet().size(), "same |Σ|");
+        assertEquals(mut.transitions().size(), fn.transitions().size(), "same edge count");
+        assertEquals(mut.initialState(), fn.initialState(), "same initial state");
+
+        // The relation itself, compared modulo the input spelling: `Send.HEADERS`
+        // in one model is `SEND_HEADERS` in the other, so normalise to
+        // DIRECTION+SIGNAL and require the two edge sets to be equal.
+        assertEquals(normalisedEdges(mut), normalisedEdges(fn),
+                "the two spellings must yield the same transition relation");
+
+        // Both must find the same absorbing state, from opposite evidence: one
+        // rejects in a `case Closed s -> throw`, the other in `case Closed() ->
+        // throw`.
+        assertTerminal(fn, "Closed");
+        assertTerminal(mut, "Closed");
+
+        // The encodings differ — that is the point of having both.
+        assertEquals(Set.of(CommitForm.VALUE_RETURN), fn.commitForms());
+        assertEquals(Set.of(CommitForm.FIELD_MUTATION), mut.commitForms());
+    }
+
+    // ---- F9: a helper that cannot return normally is not a producer ---------
+
+    @Test
+    void nonReturningHelperYieldsNoEdgeButAHiddenReturnStaysUnresolved() {
+        // F9 and its own negative control in one hierarchy. Both helpers return
+        // the hierarchy type and both defeat the shallow `collectReturns` walk,
+        // which does not descend into a switch — so the two are indistinguishable
+        // to the summariser and can only be separated by whether a `return` exists
+        // at all.
+        //
+        // `reject` has none. JLS §8.4.7 already forbids a non-void method whose
+        // body can complete normally, so the compiler has PROVEN it always throws
+        // or diverges: there is no successor, and the three arms calling it are
+        // undefined inputs rather than unresolved targets. This is exact, which is
+        // the only reason it may suppress an edge at all.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/nonreturning"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of("Idle", "Armed", "Fired"), stateIds(m));
+
+        assertTrue(hasEventEdge(m, "Idle", "ARM", "Armed"));
+        assertTrue(hasEventEdge(m, "Armed", "FIRE", "Fired"));
+        assertTrue(hasEventEdge(m, "Armed", "RESET", "Idle"));
+
+        // The three `reject` arms contribute nothing — not an edge, not even an
+        // unresolved one. Without F9 these were three `-> ?` edges, making the
+        // spelling `default -> reject(s, e)` report a different relation from
+        // `default -> throw reject(s, e)` for the same machine.
+        assertEquals(4, m.transitions().size(),
+                "a helper that cannot return normally is not a transition producer");
+
+        // NEGATIVE CONTROL, and the whole risk of this rule: `escalate` DOES
+        // return a state, but only from inside a switch the summariser cannot
+        // read. `collectReturns` comes back empty for it exactly as it does for
+        // `reject`, so a rule keyed on that emptiness would drop a real target.
+        // It must stay UNRESOLVED — recorded, never guessed, never dropped.
+        assertEquals(1, m.unresolvedTransitionCount(),
+                "a return hidden in a switch is unresolved, not absent");
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "Idle".equals(t.from()) && "ESCALATE".equals(t.event())
+                                && !t.isResolved()),
+                "the hidden-return helper must remain an unresolved edge from Idle");
+
+        // The suppression is reported, so it is reclassified rather than silent —
+        // the "never silently dropped" invariant is about visibility, and this
+        // keeps the count auditable against the source.
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("cannot return normally")),
+                "suppressed arms must be reported, not vanish");
+
+        // Fired is dispatched (`case Fired f -> reject(...)`) and every input it
+        // handles throws, so it is genuinely absorbing rather than a recall gap.
+        assertTerminal(m, "Fired");
+    }
+
+    @Test
+    void dhcpRejectionHelperDoesNotManufactureUnresolvedEdges() {
+        // The fixture F9 was found on. `DhcpClientStateMachine` guards all eight
+        // arms with `default -> invalid(state, event)`, where `invalid` returns
+        // DhcpState and always throws. Each of those was an unresolved edge — one
+        // per state — reporting 21/29 for a machine that has exactly 21
+        // transitions and inflating the denominator with non-transitions.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/dhcp-client-chatgpt"));
+        StateMachine m = single(r);
+
+        assertEquals(8, m.topLevelStates().size());
+        assertEquals(21, m.transitions().size(), "the relation the source actually defines");
+        assertEquals(0, m.unresolvedTransitionCount(),
+                "`default -> invalid(...)` is an undefined input, not an unresolved target");
+
+        // Rebinding writes its rejection as a bare `throw` instead, which the D3
+        // rule already dropped. After F9 the two spellings agree: neither arm is
+        // an edge, so the relation no longer depends on where the throw is written.
+        assertTrue(hasEventEdge(m, "Rebinding", "DHCPACK_RECEIVED", "Bound"));
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> "Rebinding".equals(t.from())
+                                && "LEASE_EXPIRED".equals(t.event())),
+                "an arm that throws is not a transition, however the throw is spelled");
+    }
+
+    /** `from --SEND_HEADERS--> to` and `from --Send.HEADERS--> to` normalise alike. */
+    private Set<String> normalisedEdges(StateMachine m) {
+        return m.transitions().stream()
+                .filter(Transition::isResolved)
+                .map(t -> t.from() + "|"
+                        + String.valueOf(t.event()).toUpperCase().replace('.', '_')
+                        + "|" + t.to())
+                .collect(Collectors.toSet());
+    }
+
+    /** A state marked terminal must in fact have no outbound edge, and vice versa. */
+    private void assertTerminal(StateMachine m, String id) {
+        State s = m.allStates().stream().filter(st -> st.id().equals(id))
+                .findFirst().orElseThrow();
+        assertTrue(s.isTerminal(), id + " should be terminal");
+        assertFalse(m.transitions().stream().anyMatch(t -> t.from().equals(id)),
+                "a terminal state must have no outbound edge");
+    }
+
+    // ---- negative controls -------------------------------------------------
+
+    @Test
+    void foreignCodomainFoldIsRejected() {
+        // Acceptance #6 / precision guard B1. Every structural signal the widened
+        // recognizer looks for is present — a sealed hierarchy, a driver holding a
+        // field of that type, exhaustive switches over it in both accepted commit
+        // positions — except the one that matters: nothing commits a Mode value.
+        // The switches fold the hierarchy into String and int.
+        //
+        // Widening a recognizer is where false positives enter, and this is the
+        // one that would have entered: an "automaton" whose every state has zero
+        // transitions. The commit requirement is not a convenience check, it is
+        // the whole discriminator.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/foreignfold"));
+        assertTrue(r.isEmpty(), "an exhaustive fold into a foreign codomain is not a state machine");
+        boolean explained = r.diagnostics().stream()
+                .anyMatch(d -> d.message().toLowerCase().contains("no transition producer found"));
+        assertTrue(explained, "rejection reason should be reported");
+    }
 
     @Test
     void shapeSumTypeIsRejected() {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/shape"));
         assertTrue(r.isEmpty(), "a plain sum type must not be classified as an FSM");
         boolean explained = r.diagnostics().stream()
-                .anyMatch(d -> d.message().toLowerCase().contains("sum type"));
+                .anyMatch(d -> d.message().toLowerCase().contains("no transition producer found"));
         assertTrue(explained, "rejection reason should be reported");
+
+        // The abstention must be worded as an abstention. Claiming "plain sum
+        // type" asserts a classification the analysis never made: a sealed type
+        // reaches this branch just as readily by being Σ, or by being dispatched
+        // somewhere the recognizers cannot see.
+        assertFalse(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().toLowerCase().contains("plain sum type")),
+                "the rejection must not over-claim what the hierarchy is");
+    }
+
+    @Test
+    void treeBuilderIsRejectedBySiblingNestedGuard() {
+        // Precision guard for F8. `treebuilder.Expr` is shaped exactly like the
+        // carrier encoding — one consistently-named method per permitted subtype,
+        // returning a non-hierarchy carrier (`Rewrite`) that wraps Expr values —
+        // yet it is a recursive tree rewrite, not an automaton. The difference is
+        // positional: `new Add(l.result(), r.result())` NESTS hierarchy values
+        // inside a bigger hierarchy node instead of producing a peer of the
+        // current one.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/treebuilder"));
+        assertTrue(r.isEmpty(), "a compositional sealed type must not be classified as an FSM");
+        boolean explained = r.diagnostics().stream()
+                .anyMatch(d -> d.message().toLowerCase().contains("composed into one another"));
+        assertTrue(explained, "rejection should name the compositional guard");
+    }
+
+    // ---- analysis scope isolation ------------------------------------------
+
+    @Test
+    void mutationMachinesDoNotAbsorbEachOthersAssignments() {
+        // Regression: the mutation encoding identified state fields and mutators by
+        // simple NAME across the whole model, because `ctx.setState(...)` returns
+        // void and offers nothing typed to anchor on. Both PortalContext and
+        // VendMachine call their field `state`, so analysing them together made
+        // each machine swallow the other's assignments as edges with an
+        // undetermined source — Portal acquired transitions guarded by `coins >= 1`.
+        //
+        // The pollution is one-directional (a foreign type can never resolve to a
+        // state of this hierarchy) so it never invented a wrong *resolved* edge,
+        // but it inflated the unresolved count and corrupted per-corpus recall.
+        // Analysing the two together must now give exactly what analysing each
+        // alone gives.
+        StateMachine portalAlone = named(new Analyzer().analyze(modelOf("examples/gofcontext")), "Portal");
+        StateMachine vendAlone = named(new Analyzer().analyze(modelOf("examples/nondeterministic")), "Vend");
+
+        Launcher launcher = new Launcher();
+        launcher.addInputResource("examples/gofcontext");
+        launcher.addInputResource("examples/nondeterministic");
+        launcher.getEnvironment().setComplianceLevel(17);
+        launcher.getEnvironment().setNoClasspath(true);
+        launcher.getEnvironment().setCommentEnabled(false);
+        launcher.buildModel();
+        ExtractionResult together = new Analyzer().analyze(launcher.getModel());
+
+        StateMachine portal = named(together, "Portal");
+        StateMachine vend = named(together, "Vend");
+
+        assertEquals(edgeSet(portalAlone), edgeSet(portal),
+                "Portal's edges must not depend on what else is in the model");
+        assertEquals(edgeSet(vendAlone), edgeSet(vend),
+                "Vend's edges must not depend on what else is in the model");
+
+        // The signature of the old bug: an edge with no attributable source.
+        assertFalse(portal.transitions().stream().anyMatch(t -> "<unknown>".equals(t.from())),
+                "no edge from another machine may leak in");
+        assertFalse(vend.transitions().stream().anyMatch(t -> "<unknown>".equals(t.from())),
+                "no edge from another machine may leak in");
+        assertEquals(0, portal.unresolvedTransitionCount());
+        assertEquals(0, vend.unresolvedTransitionCount());
+    }
+
+    private StateMachine named(ExtractionResult r, String name) {
+        return r.machines().stream().filter(m -> m.name().equals(name))
+                .findFirst().orElseThrow(() -> new AssertionError("no machine named " + name));
+    }
+
+    private Set<String> edgeSet(StateMachine m) {
+        return m.transitions().stream().map(Transition::toString).collect(Collectors.toSet());
     }
 
     // ---- combined ----------------------------------------------------------
@@ -413,6 +1027,48 @@ class ExtractionIntegrationTest {
         List<String> names = r.machines().stream().map(StateMachine::name).toList();
         assertTrue(names.contains("TrafficLight"));
         assertTrue(names.contains("Door"));
+        assertTrue(names.contains("TcpState"), "the carrier-encoded machine is recognised in the corpus");
+        assertTrue(names.contains("Latch"), "the bare-field commit is recognised in the corpus");
+        assertTrue(names.contains("Phase"), "the local-accumulator commit is recognised in the corpus");
         assertFalse(names.contains("Shape"), "Shape must be excluded");
+        assertFalse(names.contains("Expr"), "the compositional tree builder must be excluded");
+        assertFalse(names.contains("Mode"), "an exhaustive fold into a foreign codomain must be excluded");
+        assertFalse(names.contains("Event"), "an event alphabet is not a state hierarchy");
+
+        // No machine may be rooted at an event type. Checked on QUALIFIED names,
+        // because `Signal` is both a machine (valueforms) and an alphabet
+        // (barefield, accumulator, http2) in this corpus — a simple-name check
+        // would be unable to tell the two apart and would pass vacuously.
+        Set<String> roots = r.machines().stream()
+                .map(StateMachine::qualifiedName).collect(Collectors.toSet());
+        for (String eventType : List.of("examples.barefield.Signal", "examples.accumulator.Signal",
+                "http2.Signal", "http2.StreamEvent", "http2stream.Event", "tcp.Event")) {
+            assertFalse(roots.contains(eventType), eventType + " is Σ, not a state hierarchy");
+        }
+
+        // Stratification, on all three axes. The encoding axis has exactly two
+        // positions and the corpus exercises both...
+        Set<StateMachine.Encoding> encodings = r.machines().stream()
+                .map(StateMachine::encoding).collect(Collectors.toSet());
+        assertTrue(encodings.contains(StateMachine.Encoding.POLYMORPHIC));
+        assertTrue(encodings.contains(StateMachine.Encoding.CENTRALIZED_DISPATCH));
+
+        // ...while the orthogonal successor-form axis is what separates the
+        // carrier-encoded machines from the plain ones.
+        Set<SuccessorForm> forms = r.machines().stream()
+                .flatMap(m -> m.successorForms().stream()).collect(Collectors.toSet());
+        assertTrue(forms.contains(SuccessorForm.CONSTRUCTION));
+        assertTrue(forms.contains(SuccessorForm.SELF));
+        assertTrue(forms.contains(SuccessorForm.SINGLETON_FIELD));
+        assertTrue(forms.contains(SuccessorForm.ENUM_CONSTANT));
+
+        // ...and the commit axis is what separates the idioms that share an
+        // encoding. All four positions are exercised, which is the whole point of
+        // reporting it: recall stratified by idiom rather than pooled per encoding.
+        Set<CommitForm> commits = r.machines().stream()
+                .flatMap(m -> m.commitForms().stream()).collect(Collectors.toSet());
+        assertEquals(Set.of(CommitForm.VALUE_RETURN, CommitForm.FIELD_MUTATION,
+                        CommitForm.LOCAL_ACCUMULATOR, CommitForm.POLY_CARRIER), commits,
+                "the corpus must exercise every commit form");
     }
 }
