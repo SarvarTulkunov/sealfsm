@@ -811,6 +811,87 @@ class ExtractionIntegrationTest {
         assertEquals(Set.of(CommitForm.FIELD_MUTATION), mut.commitForms());
     }
 
+    // ---- F9: a helper that cannot return normally is not a producer ---------
+
+    @Test
+    void nonReturningHelperYieldsNoEdgeButAHiddenReturnStaysUnresolved() {
+        // F9 and its own negative control in one hierarchy. Both helpers return
+        // the hierarchy type and both defeat the shallow `collectReturns` walk,
+        // which does not descend into a switch — so the two are indistinguishable
+        // to the summariser and can only be separated by whether a `return` exists
+        // at all.
+        //
+        // `reject` has none. JLS §8.4.7 already forbids a non-void method whose
+        // body can complete normally, so the compiler has PROVEN it always throws
+        // or diverges: there is no successor, and the three arms calling it are
+        // undefined inputs rather than unresolved targets. This is exact, which is
+        // the only reason it may suppress an edge at all.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/nonreturning"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of("Idle", "Armed", "Fired"), stateIds(m));
+
+        assertTrue(hasEventEdge(m, "Idle", "ARM", "Armed"));
+        assertTrue(hasEventEdge(m, "Armed", "FIRE", "Fired"));
+        assertTrue(hasEventEdge(m, "Armed", "RESET", "Idle"));
+
+        // The three `reject` arms contribute nothing — not an edge, not even an
+        // unresolved one. Without F9 these were three `-> ?` edges, making the
+        // spelling `default -> reject(s, e)` report a different relation from
+        // `default -> throw reject(s, e)` for the same machine.
+        assertEquals(4, m.transitions().size(),
+                "a helper that cannot return normally is not a transition producer");
+
+        // NEGATIVE CONTROL, and the whole risk of this rule: `escalate` DOES
+        // return a state, but only from inside a switch the summariser cannot
+        // read. `collectReturns` comes back empty for it exactly as it does for
+        // `reject`, so a rule keyed on that emptiness would drop a real target.
+        // It must stay UNRESOLVED — recorded, never guessed, never dropped.
+        assertEquals(1, m.unresolvedTransitionCount(),
+                "a return hidden in a switch is unresolved, not absent");
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "Idle".equals(t.from()) && "ESCALATE".equals(t.event())
+                                && !t.isResolved()),
+                "the hidden-return helper must remain an unresolved edge from Idle");
+
+        // The suppression is reported, so it is reclassified rather than silent —
+        // the "never silently dropped" invariant is about visibility, and this
+        // keeps the count auditable against the source.
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("cannot return normally")),
+                "suppressed arms must be reported, not vanish");
+
+        // Fired is dispatched (`case Fired f -> reject(...)`) and every input it
+        // handles throws, so it is genuinely absorbing rather than a recall gap.
+        assertTerminal(m, "Fired");
+    }
+
+    @Test
+    void dhcpRejectionHelperDoesNotManufactureUnresolvedEdges() {
+        // The fixture F9 was found on. `DhcpClientStateMachine` guards all eight
+        // arms with `default -> invalid(state, event)`, where `invalid` returns
+        // DhcpState and always throws. Each of those was an unresolved edge — one
+        // per state — reporting 21/29 for a machine that has exactly 21
+        // transitions and inflating the denominator with non-transitions.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/dhcp-client-chatgpt"));
+        StateMachine m = single(r);
+
+        assertEquals(8, m.topLevelStates().size());
+        assertEquals(21, m.transitions().size(), "the relation the source actually defines");
+        assertEquals(0, m.unresolvedTransitionCount(),
+                "`default -> invalid(...)` is an undefined input, not an unresolved target");
+
+        // Rebinding writes its rejection as a bare `throw` instead, which the D3
+        // rule already dropped. After F9 the two spellings agree: neither arm is
+        // an edge, so the relation no longer depends on where the throw is written.
+        assertTrue(hasEventEdge(m, "Rebinding", "DHCPACK_RECEIVED", "Bound"));
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> "Rebinding".equals(t.from())
+                                && "LEASE_EXPIRED".equals(t.event())),
+                "an arm that throws is not a transition, however the throw is spelled");
+    }
+
     /** `from --SEND_HEADERS--> to` and `from --Send.HEADERS--> to` normalise alike. */
     private Set<String> normalisedEdges(StateMachine m) {
         return m.transitions().stream()

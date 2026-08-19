@@ -124,6 +124,11 @@ public final class TransitionExtractor {
     private final Deque<String> interProcStack = new ArrayDeque<>();
     private int interProcResolvedEdges = 0;
 
+    // F9: calls to an in-model helper that provably cannot return normally. The
+    // arms they occupy carry no transition, so no edge is emitted; the count is
+    // reported as a diagnostic rather than letting them vanish unremarked.
+    private int nonReturningCalls = 0;
+
     // F4: the closed-world event alphabet Σ enumerated from the sealed/enum event
     // parameter of centralized transition functions, plus the qualified names of
     // that event type (root + members) so a switch-over-event can be recognised
@@ -272,6 +277,11 @@ public final class TransitionExtractor {
             diagnostics.add(interProcResolvedEdges + " transition target(s) resolved via bounded "
                     + "inter-procedural summaries (depth ≤ " + MAX_INTERPROC_DEPTH
                     + "); precision-sensitive — audit separately");
+        }
+        if (nonReturningCalls > 0) {
+            diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
+                    + "(always throws or diverges) contributed no transition — the arms holding "
+                    + "them are undefined inputs, not unresolved targets");
         }
         return new ArrayList<>(out);
     }
@@ -1226,8 +1236,9 @@ public final class TransitionExtractor {
     /**
      * Fold a call to an in-model helper that returns the hierarchy type into its
      * possible return targets — a bounded, k-limited return-value summary. Returns
-     * {@code true} when the call was folded (its resolvable targets emitted, any
-     * unresolvable ones recorded); {@code false} when it cannot be summarised
+     * {@code true} when the call was handled — either folded (its resolvable
+     * targets emitted, any unresolvable ones recorded) or shown to produce no
+     * successor at all (F9, {@link #neverReturnsNormally}); {@code false} when it cannot be summarised
      * soundly — a library/abstract callee, a non-hierarchy return, an exhausted
      * depth budget, or a recursion cycle — leaving the caller to record it
      * unresolved (the never-guess invariant).
@@ -1253,6 +1264,15 @@ public final class TransitionExtractor {
         if (interProcStack.size() >= MAX_INTERPROC_DEPTH || interProcStack.contains(sig)) {
             return false; // depth budget exhausted or recursion cycle
         }
+        // F9: a callee that provably cannot return normally produces no successor,
+        // so the arm holding this call carries no transition at all. This must be
+        // tested BEFORE the summarisability check below: both fire on an empty
+        // `collectReturns`, but they mean opposite things — "there is no target"
+        // versus "there is a target we could not see".
+        if (neverReturnsNormally(callee)) {
+            nonReturningCalls++;
+            return true; // handled: nothing to emit
+        }
         List<GuardedExpr> returns = collectReturns(callee.getBody(), null);
         if (returns.isEmpty()) return false; // nothing summarisable (e.g. returns hidden in a switch)
 
@@ -1272,6 +1292,35 @@ public final class TransitionExtractor {
             if (top) interProcResolvedEdges += Math.max(0, countResolved(out) - resolvedBefore);
         }
         return true;
+    }
+
+    /**
+     * F9 — true when {@code callee} provably cannot complete normally, so a call
+     * to it yields no successor state and contributes no transition.
+     *
+     * <p>This is <em>exact</em>, not a heuristic, and that is the whole reason it
+     * is allowed to suppress an edge. JLS §8.4.7 makes it a compile-time error for
+     * a method with a declared return type to have a body that can complete
+     * normally; the caller has already established that this callee's return type
+     * is the hierarchy type, so it is non-void by construction. A body containing
+     * no {@code return} anywhere therefore <em>cannot</em> return a value — it
+     * must throw or diverge. Either way there is no state to transition to.
+     *
+     * <p>It is the syntactic counterpart of the D3 rule that a {@code throw} arm
+     * produces no edge. Without it, {@code default -> throw fail(s, e)} and
+     * {@code default -> fail(s, e)} — where {@code fail} always throws — would
+     * report different transition relations for the same machine, turning a
+     * spelling difference into an apparent recall gap.
+     *
+     * <p>The scan is deliberately whole-body and unfiltered, so a {@code return}
+     * nested in a lambda or local class counts as the method's own. That is the
+     * conservative direction: it declines to suppress, falling back to the
+     * previous unresolved-edge behaviour, and never drops a real transition.
+     */
+    private static boolean neverReturnsNormally(CtMethod<?> callee) {
+        CtBlock<?> body = callee.getBody();
+        if (body == null) return false; // no body visible: never claim anything
+        return body.getElements(new TypeFilter<>(CtReturn.class)).isEmpty();
     }
 
     /** Returned / yielded expressions of a body, each with its accumulated guard. */
