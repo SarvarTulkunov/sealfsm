@@ -889,12 +889,21 @@ public final class TransitionExtractor {
     private void walkCarrierSwitch(CtAbstractSwitch<?> sw, String from, String event,
                                    String guard, Set<Transition> out) {
         boolean overEvent = isEventDispatch(sw);
+        Map<String, List<String>> guardsByLabel = new LinkedHashMap<>();
         for (CtCase<?> c : sw.getCases()) {
             List<String> caseEvents = overEvent ? caseEventNames(c) : List.of();
             if (caseEvents.isEmpty()) {
                 caseEvents = Collections.singletonList(event); // default arm inherits
             }
-            String caseGuard = merge(guard, caseGuard(c));
+            // F12 applies here too: a later arm with the same label is reached
+            // only when the earlier guard was false.
+            String ownGuard = caseGuard(c);
+            String caseGuard = merge(merge(guard, priorExclusion(caseEvents, guardsByLabel)), ownGuard);
+            if (ownGuard != null) {
+                for (String label : caseEvents) {
+                    guardsByLabel.computeIfAbsent(label, k -> new ArrayList<>()).add(ownGuard);
+                }
+            }
             boolean prev = otherwisePath;
             // A `default:` arm names no label, so whatever it produces is the
             // residual of every labelled arm — the default edge.
@@ -1771,6 +1780,16 @@ public final class TransitionExtractor {
         boolean overState = isStateDispatch(sw);
         boolean overEvent = !overState && isEventDispatch(sw);
         boolean overComponent = !overState && !overEvent && isComponentDispatch(sw);
+        // F12 — arm order is part of the semantics. A later arm carrying the same
+        // label as an earlier GUARDED one is reached only when that guard was
+        // false, so the two are mutually exclusive by construction. Without the
+        // negation, `case Timeout t when t.counter() > 0 -> ...` followed by
+        // `case Timeout t -> ...` is reported as [g] against [true], which the
+        // overlap check reads as nondeterminism the source does not contain: 14
+        // such warnings on examples/lcp_automation for a deterministic RFC 1661
+        // automaton. This is the same reasoning walkBlock already applies to an
+        // `if` with no `else`, carried across sibling arms.
+        Map<String, List<String>> guardsByLabel = new LinkedHashMap<>();
         for (CtCase<?> c : sw.getCases()) {
             String caseFrom = from;
             if (overState) {
@@ -1797,7 +1816,21 @@ public final class TransitionExtractor {
                 // component value the labelled arms did not name.
                 caseEvents = Collections.singletonList(event); // may hold null
             }
-            String caseGuard = merge(guard, caseGuard(c));
+            // Labels are the discriminator the exclusion is keyed on: only arms
+            // that can match the SAME input compete. Distinct labels are already
+            // disjoint, and negating those would bury every edge under a pile of
+            // redundant `!(event instanceof X)` clauses.
+            List<String> labels = overState ? Collections.singletonList(caseFrom) : caseEvents;
+            String ownGuard = caseGuard(c);
+            String caseGuard = merge(merge(guard, priorExclusion(labels, guardsByLabel)), ownGuard);
+            // Only a GUARDED arm constrains its successors. An unguarded arm
+            // dominates every later arm with the same label, which the compiler
+            // already rejects, so there is nothing to record for it.
+            if (ownGuard != null) {
+                for (String label : labels) {
+                    guardsByLabel.computeIfAbsent(label, k -> new ArrayList<>()).add(ownGuard);
+                }
+            }
             // If this arm deconstructed its event, remember the binding so a switch
             // on it inside the arm body refines the label instead of inheriting it.
             ComponentEvent binding = overEvent && caseEvents.size() == 1
@@ -1814,8 +1847,12 @@ public final class TransitionExtractor {
             // arm's BLOCK a yield is always genuine, so this is a one-level rule.
             boolean discardedArms = !(sw instanceof CtSwitchExpression<?, ?>);
             try {
+                CtElement leaked = leakedGuard(c);
                 for (String caseEvent : caseEvents) {
                     for (CtStatement st : c.getStatements()) {
+                        // The leaked `when` clause is the arm's guard, consumed
+                        // above; it is not part of the arm's body.
+                        if (st == leaked) continue;
                         CtElement effective = st;
                         if (discardedArms && st instanceof CtYieldStatement ys
                                 && ys.getExpression() != null) {
@@ -2061,10 +2098,60 @@ public final class TransitionExtractor {
         return out;
     }
 
-    /** Guarded-pattern {@code when} clause, if present and supported. */
+    /**
+     * Guarded-pattern {@code when} clause. Spoon 10.4.2 populates
+     * {@code getGuard()} only when the guard is a {@code CtBinaryOperator}
+     * ({@code when t.counter() > 0}); for any other shape — a bare invocation
+     * ({@code when r.acceptable()}), a unary ({@code when !r.catastrophic()}), a
+     * parenthesised invocation — the slot is left null and the guard expression is
+     * instead PREPENDED INTO THE ARM BODY as a statement. Verified empirically
+     * against all five shapes. So the guard is recovered from either place.
+     */
     private String caseGuard(CtCase<?> c) {
         Object guard = tryMethod(c, "getGuard");
-        return guard == null ? null : safeText(guard);
+        if (guard != null) return safeText(guard);
+        CtElement leaked = leakedGuard(c);
+        return leaked == null ? null : safeText(leaked);
+    }
+
+    /**
+     * The {@code when} clause Spoon leaked into the arm body, or {@code null}.
+     *
+     * <p>The discriminator is the ARROW case kind, and it is exact rather than a
+     * guess: JLS §14.11.1 gives an arrow arm a single expression, block or
+     * {@code throw}, so an arrow arm can never legitimately hold two statements.
+     * A leading extra one is therefore always the leaked guard. The restriction
+     * matters — a COLON arm holds a statement list, and {@code case X: helper();
+     * return 1;} (verified) puts an ordinary boolean-returning call exactly where
+     * the naive "first boolean statement is the guard" rule would misread it as a
+     * condition and silently drop the call.
+     */
+    private CtElement leakedGuard(CtCase<?> c) {
+        try {
+            if (!"ARROW".equals(String.valueOf(tryMethod(c, "getCaseKind")))) return null;
+            List<CtStatement> body = c.getStatements();
+            if (body.size() < 2) return null;
+            CtStatement first = body.get(0);
+            if (!(first instanceof CtExpression<?> expr)) return null;
+            CtTypeReference<?> t = expr.getType();
+            return t != null && "boolean".equals(t.getSimpleName()) ? first : null;
+        } catch (Throwable ignored) {
+            return null; // unreadable: keep the previous (guardless) behaviour
+        }
+    }
+
+    /**
+     * The conjunction of the negated guards of earlier arms carrying any of
+     * {@code labels} — the condition under which control actually reaches this arm.
+     */
+    private String priorExclusion(List<String> labels, Map<String, List<String>> guardsByLabel) {
+        String exclusion = null;
+        for (String label : labels) {
+            for (String prior : guardsByLabel.getOrDefault(label, List.of())) {
+                exclusion = merge(exclusion, negate(prior));
+            }
+        }
+        return exclusion;
     }
 
     /**

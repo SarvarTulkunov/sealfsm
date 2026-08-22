@@ -1,3 +1,5 @@
+package lcp;
+
 /**
  * Represents a state in the Point-to-Point Protocol (PPP) Link Control Protocol (LCP)
  * state machine, as defined in RFC 1661.

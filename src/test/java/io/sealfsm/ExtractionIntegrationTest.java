@@ -1019,6 +1019,133 @@ class ExtractionIntegrationTest {
         assertTrue(hasResolved(m, "Full", "Filling"), "colon-arm commit must survive");
     }
 
+    // ---- F12: a guarded arm excludes the arms after it ----------------------
+
+    @Test
+    void guardedArmsAreMutuallyExclusiveWithTheArmsBelowThem() {
+        // F12, part 2. Arm ORDER is part of the semantics: in
+        //   case Timeout t when t.counter() > 0 -> state;
+        //   case Timeout t                      -> new Stopped();
+        // the second arm runs only when the first guard was false, so the two can
+        // never both be enabled. Recording the fall-through arm as an unguarded
+        // `true` made GuardAnalysis report nondeterminism the source does not
+        // contain — 14 such warnings on examples/lcp_automation, a deterministic
+        // RFC 1661 automaton. Same reasoning walkBlock already applies to an `if`
+        // with no `else`, carried across sibling arms.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/lcp_automation"));
+        StateMachine m = single(r);
+
+        assertTrue(r.diagnostics().stream().noneMatch(d -> d.message().contains("nondeterminism")),
+                "a deterministic switch must not be reported as nondeterministic");
+
+        List<Transition> rcr = m.transitions().stream()
+                .filter(t -> "Stopped".equals(t.from())
+                        && "ReceiveConfigureRequest".equals(t.event()))
+                .toList();
+        assertEquals(2, rcr.size(), "RCR+ and RCR- are two edges");
+        // One carries the guard, the other its negation — never a bare null.
+        assertTrue(rcr.stream().allMatch(t -> t.guard() != null),
+                "the fall-through arm is guarded by the negation, not unguarded");
+        assertTrue(rcr.stream().anyMatch(t -> t.guard().contains("!")),
+                "the later arm must carry the negated guard");
+    }
+
+    @Test
+    void realGuardOverlapIsStillReported() {
+        // NEGATIVE CONTROL for F12, and the whole risk of it: the exclusion rule
+        // must not become a blanket "stop reporting nondeterminism". It applies
+        // ONLY to sibling arms of one switch, where Java's arm order makes the
+        // later one unreachable under the earlier guard. examples/nondeterministic
+        // overlaps by SEMANTICS instead — `coins >= 1` and `coins > 0` are two
+        // separate non-terminating assignments in the same arm, so nothing orders
+        // them and both really can fire. It must still warn.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/nondeterministic"));
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("nondeterminism")
+                                && d.message().contains("coins")),
+                "genuine semantic guard overlap must still be diagnosed");
+    }
+
+    @Test
+    void aGuardedArmExcludesTheFallThroughInEveryFixture() {
+        // The same fix, seen on a second, independently written corpus entry:
+        //   case AckReceived(boolean addressInUse) when addressInUse -> new Init();
+        //   case AckReceived ignored                                 -> new Bound();
+        // The Requesting -> Bound edge used to be reported as unconditional, which
+        // claimed a DHCPACK always commits the lease. It only does when the
+        // duplicate-address check passed (RFC 2131 §4.4.1).
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/dhcp-client-claude"));
+        StateMachine m = single(r);
+        Transition commit = m.transitions().stream()
+                .filter(t -> "Requesting".equals(t.from()) && "Bound".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(commit.guard(), "the fall-through arm is conditional, not unconditional");
+        assertTrue(commit.guard().contains("addressInUse"), commit.guard());
+    }
+
+    @Test
+    void aGuardSpelledOutsideABinaryOperatorIsStillRecovered() {
+        // F12, part 1. Spoon 10.4.2 fills CtCase.getGuard() only when the guard is
+        // a CtBinaryOperator; for a bare invocation (`when r.acceptable()`) or a
+        // unary (`when !r.catastrophic()`) it leaves the slot null and PREPENDS the
+        // guard expression into the arm body as a statement. Both halves of the
+        // machine's behaviour then went wrong: the guard vanished from the label,
+        // and the leaked expression was walked as if it produced a successor.
+        //
+        // The recovery keys on the ARROW case kind, which is exact rather than a
+        // guess: JLS §14.11.1 gives an arrow arm a single expression, block or
+        // throw, so two statements there is always the leak. See
+        // examples/plumbing's colon-arm control for why the kind check is
+        // load-bearing.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/lcp_automation"));
+        StateMachine m = single(r);
+
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "Stopped".equals(t.from()) && "AckSent".equals(t.to())
+                                && t.guard() != null && t.guard().contains("acceptable")),
+                "an invocation-shaped `when` clause must reach the edge label");
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "ReqSent".equals(t.from()) && "Stopped".equals(t.to())
+                                && t.guard() != null && t.guard().contains("catastrophic")),
+                "a unary-shaped `when` clause must reach the edge label");
+
+        // And the leaked guard must not also be an edge: 13 LcpEvent records over
+        // 10 states is 130 cells, +14 guard splits = 144 arms, of which 31 throw.
+        assertEquals(113, m.transitions().size(), "exactly the 113 value-producing arms");
+        assertEquals(0, m.unresolvedTransitionCount());
+    }
+
+    @Test
+    void initialStateFallsBackToASeededLocalOnlyWhenUnanimous() {
+        // A dense automaton defeats the structural rules exactly when it is most
+        // faithful: in RFC 1661's LCP every state INCLUDING Initial has incoming
+        // edges, so "no incoming, some outgoing" has no candidate, and the machine
+        // class holds no state field either. The weakest rule — a hierarchy-typed
+        // local seeded with `new Concrete()` — recovers it, and says so.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/lcp_automation"));
+        StateMachine m = single(r);
+
+        assertEquals("Initial", m.initialState().orElse(null));
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("inferred from")
+                                && d.message().contains("weaker evidence")),
+                "an inferred initial state must be reported as weaker evidence");
+    }
+
+    @Test
+    void theCentralizedFunctionCountIsOfDistinctHosts() {
+        // The signature-based recognizer and DispatchCommitDetector legitimately
+        // overlap — `Door transition(Door, Event)` whose body is `return switch` is
+        // seen by both — and the reason text summed them. examples/door has exactly
+        // ONE transition function and was reported as two. Extraction was never
+        // affected (it deduped on declaringType#signature); this uses the same key
+        // so the reported number and the walked set cannot drift apart.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/door"));
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("1 centralized transition function")),
+                "door has one transition function, not two");
+    }
+
     // ---- negative controls -------------------------------------------------
 
     @Test
