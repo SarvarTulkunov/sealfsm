@@ -840,7 +840,7 @@ class ExtractionIntegrationTest {
         // unresolved one. Without F9 these were three `-> ?` edges, making the
         // spelling `default -> reject(s, e)` report a different relation from
         // `default -> throw reject(s, e)` for the same machine.
-        assertEquals(4, m.transitions().size(),
+        assertEquals(5, m.transitions().size(),
                 "a helper that cannot return normally is not a transition producer");
 
         // NEGATIVE CONTROL, and the whole risk of this rule: `escalate` DOES
@@ -848,12 +848,34 @@ class ExtractionIntegrationTest {
         // read. `collectReturns` comes back empty for it exactly as it does for
         // `reject`, so a rule keyed on that emptiness would drop a real target.
         // It must stay UNRESOLVED — recorded, never guessed, never dropped.
-        assertEquals(1, m.unresolvedTransitionCount(),
+        assertEquals(2, m.unresolvedTransitionCount(),
                 "a return hidden in a switch is unresolved, not absent");
         assertTrue(m.transitions().stream()
                         .anyMatch(t -> "Idle".equals(t.from()) && "ESCALATE".equals(t.event())
                                 && !t.isResolved()),
                 "the hidden-return helper must remain an unresolved edge from Idle");
+
+        // F11 — SECOND NEGATIVE CONTROL, and the wider hole of the two.
+        // `Objects.requireNonNull(current)` is a JDK method, so Spoon hands back a
+        // reflective SHADOW declaration: a real signature with an empty stub body.
+        // That body has no `return` for the same reason it has nothing at all — it
+        // was never parsed — so its emptiness says nothing about whether the method
+        // returns. F9 read it as proof and DELETED this edge, with no unresolved
+        // marker anywhere: 5 transitions were reported as 4. The same hole swallows
+        // `Optional.orElse(new Fired())` and `map.getOrDefault(k, new Idle())`.
+        // F9's licence to suppress comes from JLS §8.4.7 making the conclusion
+        // exact; on a body the analysis never read, there is no such licence.
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "Idle".equals(t.from()) && "HOLD".equals(t.event())
+                                && !t.isResolved()),
+                "a call into an unread (shadow) body is unresolved, never suppressed");
+
+        // The suppression count must track the three `reject` arms only. If the
+        // shadow call were counted too it would read as a fourth proven rejection —
+        // a false claim dressed in the diagnostic that exists to make F9 auditable.
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().startsWith("3 call(s) to a helper")),
+                "only the three provably-throwing arms may be reported as suppressed");
 
         // The suppression is reported, so it is reclassified rather than silent —
         // the "never silently dropped" invariant is about visibility, and this
@@ -909,6 +931,92 @@ class ExtractionIntegrationTest {
         assertTrue(s.isTerminal(), id + " should be terminal");
         assertFalse(m.transitions().stream().anyMatch(t -> t.from().equals(id)),
                 "a terminal state must have no outbound edge");
+    }
+
+    // ---- F10: an expression statement is not a produced successor -----------
+
+    @Test
+    void ordinaryPlumbingInsideADispatchIsNotATransition() {
+        // F10. `walk` ended in a catch-all that handed ANY expression reaching it
+        // to the successor resolver. Every call site passes a STATEMENT, so the
+        // only thing that catch-all ever saw was an expression statement — and
+        // Java discards an expression statement's value (JLS §14.8). A value the
+        // language throws away cannot be a committed successor, which makes this
+        // exact rather than heuristic: it belongs beside F9 on the
+        // compiler-checked side of the line, not with the approximate data-flow.
+        //
+        // Found on examples/lcp_automation, where a two-line
+        // `Objects.requireNonNull` prelude reported a 105-edge RFC 1661 automaton
+        // as 115. The corpus had never caught it because no fixture until now
+        // contained the bookkeeping real code is full of.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/plumbing"));
+        StateMachine m = single(r);
+
+        assertEquals(Set.of("Stopped", "Running", "Jammed"), stateIds(m));
+
+        // Exactly the six edges the two switches encode — two per state.
+        assertEquals(6, m.transitions().size(),
+                "only the switch arms commit a successor; the plumbing does not");
+        assertEquals(0, m.unresolvedTransitionCount(),
+                "nothing in this machine is unrecoverable, so no gap may be reported");
+
+        assertTrue(hasResolved(m, "Stopped", "Running"));
+        assertTrue(hasResolved(m, "Stopped", "Stopped"));
+        assertTrue(hasResolved(m, "Running", "Jammed"));
+        assertTrue(hasResolved(m, "Running", "Running"));
+        assertTrue(hasResolved(m, "Jammed", "Stopped"));
+        assertTrue(hasResolved(m, "Jammed", "Jammed"));
+
+        // The sharpest of the four plumbing statements: `identity(current)` is
+        // in-model, hierarchy-typed and trivially summarisable, so F3 WOULD fold
+        // it to a self-loop on the selector. Nothing about the expression is
+        // unresolvable — only its statement position rules it out. A guard that
+        // merely required a hierarchy type (as the carrier walker uses) would
+        // still have recorded it, which is why the position is the real rule.
+        assertFalse(m.transitions().stream().anyMatch(t -> t.from() == null),
+                "a discarded value must not become an edge with no source state");
+
+        // And the failure mode that made this visible: an undetermined SOURCE.
+        // `Objects.requireNonNull(event, ...)` produced exactly this in LCP.
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> "<unknown>".equals(t.from()) || "<entry>".equals(t.from())),
+                "no pseudo-sourced edge may be manufactured out of plumbing");
+    }
+
+    @Test
+    void aStatementThatIsTheCommitIsStillClaimed() {
+        // NEGATIVE CONTROL for F10, and the whole risk of the rule. `ctx.setState(
+        // new Filling())` is an expression statement too. "Ignore expression
+        // statements" taken one step too far deletes the entire F2 mutation
+        // encoding from the tool; the rule is "ignore expression statements that no
+        // commit form claims". Separate hierarchy because F2 runs only as a
+        // fallback — beside a VALUE_RETURN machine it never executes and this
+        // control would silently assert nothing.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/plumbing-mutation"));
+        StateMachine m = single(r);
+
+        assertEquals(Set.of("Empty", "Filling", "Full"), stateIds(m));
+        assertEquals(6, m.transitions().size());
+        assertEquals(0, m.unresolvedTransitionCount());
+
+        // `drive` — arrow arms of a switch STATEMENT. This is F10's second half:
+        // Spoon wraps such an arm in a synthetic CtYieldStatement even though
+        // `yield` is illegal outside a switch expression, so the arm reached
+        // handleValue as a produced value, where a void setState call resolves to
+        // nothing. All three edges were LOST and replaced by `-> ?`. Unwrapping the
+        // synthetic yield routes them back through `walk`, where the mutator branch
+        // claims them — so F10 raises recall here, it does not only trim.
+        assertTrue(hasResolved(m, "Empty", "Filling"), "arrow-arm commit must survive");
+        assertTrue(hasResolved(m, "Filling", "Full"), "arrow-arm commit must survive");
+        assertTrue(hasResolved(m, "Full", "Empty"), "arrow-arm commit must survive");
+
+        // `pump` — colon arms, a deliberately DISJOINT relation so the two arm
+        // spellings stay separately attributable. Were both to encode the same
+        // edges the set-valued store would dedup them, and this test could not tell
+        // which spelling produced anything.
+        assertTrue(hasResolved(m, "Empty", "Full"), "colon-arm commit must survive");
+        assertTrue(hasResolved(m, "Filling", "Empty"), "colon-arm commit must survive");
+        assertTrue(hasResolved(m, "Full", "Filling"), "colon-arm commit must survive");
     }
 
     // ---- negative controls -------------------------------------------------

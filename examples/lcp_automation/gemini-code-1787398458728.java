@@ -1,0 +1,272 @@
+import java.util.Objects;
+
+/**
+ * A production-grade implementation of the Point-to-Point Protocol (PPP)
+ * Link Control Protocol (LCP) state machine, faithfully implementing the
+ * phase transitions defined in RFC 1661, Section 4.1.
+ */
+public class PppLcpStateMachine {
+
+    /**
+     * Transitions the state machine from the current state to the next state
+     * based on the given event, according to the RFC 1661 state transition table.
+     *
+     * @param currentState the current state of the LCP protocol
+     * @param event the LCP event to process
+     * @return the resulting state after applying the transition
+     * @throws IllegalStateException if the event is not permitted in the current state
+     */
+    public LcpState transition(LcpState currentState, LcpEvent event) {
+        Objects.requireNonNull(currentState, "currentState must not be null");
+        Objects.requireNonNull(event, "event must not be null");
+
+        // First level switch delegates to state-specific handlers.
+        // Exhaustiveness ensures all possible LCP states are covered.
+        return switch (currentState) {
+            case LcpState.Initial s  -> handleInitial(s, event);
+            case LcpState.Starting s -> handleStarting(s, event);
+            case LcpState.Closed s   -> handleClosed(s, event);
+            case LcpState.Stopped s  -> handleStopped(s, event);
+            case LcpState.Closing s  -> handleClosing(s, event);
+            case LcpState.Stopping s -> handleStopping(s, event);
+            case LcpState.ReqSent s  -> handleReqSent(s, event);
+            case LcpState.AckRcvd s  -> handleAckRcvd(s, event);
+            case LcpState.AckSent s  -> handleAckSent(s, event);
+            case LcpState.Opened s   -> handleOpened(s, event);
+        };
+    }
+
+    private LcpState handleInitial(LcpState.Initial state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Up up       -> new LcpState.Closed();
+            case LcpEvent.Open open   -> new LcpState.Starting();
+            case LcpEvent.Close close -> state;
+            
+            // Explicitly handling illegal transitions instead of using a default branch
+            // guarantees compiler validation if new events are ever added.
+            case LcpEvent.Down down                         -> throw illegalTransition(state, event);
+            case LcpEvent.Timeout t                         -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveConfigureRequest r         -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveConfigureAck r             -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveConfigureNakRej r          -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveTerminateRequest r         -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveTerminateAck r             -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveUnknownCode r              -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveCodeReject r               -> throw illegalTransition(state, event);
+        };
+    }
+
+    private LcpState handleStarting(LcpState.Starting state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Up up       -> new LcpState.ReqSent();
+            case LcpEvent.Open open   -> state;
+            case LcpEvent.Close close -> new LcpState.Initial();
+            
+            case LcpEvent.Down down                         -> throw illegalTransition(state, event);
+            case LcpEvent.Timeout t                         -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveConfigureRequest r         -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveConfigureAck r             -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveConfigureNakRej r          -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveTerminateRequest r         -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveTerminateAck r             -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveUnknownCode r              -> throw illegalTransition(state, event);
+            case LcpEvent.ReceiveCodeReject r               -> throw illegalTransition(state, event);
+        };
+    }
+
+    private LcpState handleClosed(LcpState.Closed state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Down down                         -> new LcpState.Initial();
+            case LcpEvent.Open open                         -> new LcpState.ReqSent();
+            case LcpEvent.Close close                       -> state;
+            case LcpEvent.ReceiveConfigureRequest r         -> state;
+            case LcpEvent.ReceiveConfigureAck r             -> state;
+            case LcpEvent.ReceiveConfigureNakRej r          -> state;
+            case LcpEvent.ReceiveTerminateRequest r         -> state;
+            case LcpEvent.ReceiveTerminateAck r             -> state;
+            case LcpEvent.ReceiveUnknownCode r              -> state;
+            case LcpEvent.ReceiveCodeReject r               -> state;
+            
+            case LcpEvent.Up up                             -> throw illegalTransition(state, event);
+            case LcpEvent.Timeout t                         -> throw illegalTransition(state, event);
+        };
+    }
+
+    private LcpState handleStopped(LcpState.Stopped state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Down down                         -> new LcpState.Starting();
+            case LcpEvent.Open open                         -> state; // Triggers a restart logic via action
+            case LcpEvent.Close close                       -> new LcpState.Closed();
+            case LcpEvent.ReceiveConfigureRequest r when r.acceptable() -> new LcpState.AckSent();
+            case LcpEvent.ReceiveConfigureRequest r         -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveConfigureAck r             -> state;
+            case LcpEvent.ReceiveConfigureNakRej r          -> state;
+            case LcpEvent.ReceiveTerminateRequest r         -> state;
+            case LcpEvent.ReceiveTerminateAck r             -> state;
+            case LcpEvent.ReceiveUnknownCode r              -> state;
+            case LcpEvent.ReceiveCodeReject r               -> state;
+            
+            case LcpEvent.Up up                             -> throw illegalTransition(state, event);
+            case LcpEvent.Timeout t                         -> throw illegalTransition(state, event);
+        };
+    }
+
+    private LcpState handleClosing(LcpState.Closing state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Down down                         -> new LcpState.Initial();
+            case LcpEvent.Open open                         -> new LcpState.Stopping();
+            case LcpEvent.Close close                       -> state;
+            case LcpEvent.Timeout t when t.counter() > 0    -> state;
+            case LcpEvent.Timeout t                         -> new LcpState.Closed();
+            case LcpEvent.ReceiveConfigureRequest r         -> state;
+            case LcpEvent.ReceiveConfigureAck r             -> state;
+            case LcpEvent.ReceiveConfigureNakRej r          -> state;
+            case LcpEvent.ReceiveTerminateRequest r         -> state;
+            case LcpEvent.ReceiveTerminateAck r             -> new LcpState.Closed();
+            case LcpEvent.ReceiveUnknownCode r              -> state;
+            case LcpEvent.ReceiveCodeReject r               -> state;
+            
+            case LcpEvent.Up up                             -> throw illegalTransition(state, event);
+        };
+    }
+
+    private LcpState handleStopping(LcpState.Stopping state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Down down                         -> new LcpState.Starting();
+            case LcpEvent.Open open                         -> state;
+            case LcpEvent.Close close                       -> new LcpState.Closing();
+            case LcpEvent.Timeout t when t.counter() > 0    -> state;
+            case LcpEvent.Timeout t                         -> new LcpState.Stopped();
+            case LcpEvent.ReceiveConfigureRequest r         -> state;
+            case LcpEvent.ReceiveConfigureAck r             -> state;
+            case LcpEvent.ReceiveConfigureNakRej r          -> state;
+            case LcpEvent.ReceiveTerminateRequest r         -> state;
+            case LcpEvent.ReceiveTerminateAck r             -> new LcpState.Stopped();
+            case LcpEvent.ReceiveUnknownCode r              -> state;
+            case LcpEvent.ReceiveCodeReject r               -> state;
+            
+            case LcpEvent.Up up                             -> throw illegalTransition(state, event);
+        };
+    }
+
+    private LcpState handleReqSent(LcpState.ReqSent state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Down down                         -> new LcpState.Starting();
+            case LcpEvent.Open open                         -> state;
+            case LcpEvent.Close close                       -> new LcpState.Closing();
+            case LcpEvent.Timeout t when t.counter() > 0    -> state;
+            case LcpEvent.Timeout t                         -> new LcpState.Stopped();
+            case LcpEvent.ReceiveConfigureRequest r when r.acceptable() -> new LcpState.AckSent();
+            case LcpEvent.ReceiveConfigureRequest r         -> state;
+            case LcpEvent.ReceiveConfigureAck r             -> new LcpState.AckRcvd();
+            case LcpEvent.ReceiveConfigureNakRej r          -> state;
+            case LcpEvent.ReceiveTerminateRequest r         -> state;
+            case LcpEvent.ReceiveTerminateAck r             -> state;
+            case LcpEvent.ReceiveUnknownCode r              -> state;
+            case LcpEvent.ReceiveCodeReject r when !r.catastrophic() -> state;
+            case LcpEvent.ReceiveCodeReject r               -> new LcpState.Stopped();
+            
+            case LcpEvent.Up up                             -> throw illegalTransition(state, event);
+        };
+    }
+
+    private LcpState handleAckRcvd(LcpState.AckRcvd state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Down down                         -> new LcpState.Starting();
+            case LcpEvent.Open open                         -> state;
+            case LcpEvent.Close close                       -> new LcpState.Closing();
+            case LcpEvent.Timeout t when t.counter() > 0    -> new LcpState.ReqSent();
+            case LcpEvent.Timeout t                         -> new LcpState.Stopped();
+            case LcpEvent.ReceiveConfigureRequest r when r.acceptable() -> new LcpState.Opened();
+            case LcpEvent.ReceiveConfigureRequest r         -> state;
+            case LcpEvent.ReceiveConfigureAck r             -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveConfigureNakRej r          -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveTerminateRequest r         -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveTerminateAck r             -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveUnknownCode r              -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveCodeReject r when !r.catastrophic() -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveCodeReject r               -> new LcpState.Stopped();
+            
+            case LcpEvent.Up up                             -> throw illegalTransition(state, event);
+        };
+    }
+
+    private LcpState handleAckSent(LcpState.AckSent state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Down down                         -> new LcpState.Starting();
+            case LcpEvent.Open open                         -> state;
+            case LcpEvent.Close close                       -> new LcpState.Closing();
+            case LcpEvent.Timeout t when t.counter() > 0    -> new LcpState.ReqSent();
+            case LcpEvent.Timeout t                         -> new LcpState.Stopped();
+            case LcpEvent.ReceiveConfigureRequest r when r.acceptable() -> state;
+            case LcpEvent.ReceiveConfigureRequest r         -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveConfigureAck r             -> new LcpState.Opened();
+            case LcpEvent.ReceiveConfigureNakRej r          -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveTerminateRequest r         -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveTerminateAck r             -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveUnknownCode r              -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveCodeReject r when !r.catastrophic() -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveCodeReject r               -> new LcpState.Stopped();
+            
+            case LcpEvent.Up up                             -> throw illegalTransition(state, event);
+        };
+    }
+
+    private LcpState handleOpened(LcpState.Opened state, LcpEvent event) {
+        return switch (event) {
+            case LcpEvent.Down down                         -> new LcpState.Starting();
+            case LcpEvent.Open open                         -> state;
+            case LcpEvent.Close close                       -> new LcpState.Closing();
+            case LcpEvent.ReceiveConfigureRequest r when r.acceptable() -> new LcpState.AckSent();
+            case LcpEvent.ReceiveConfigureRequest r         -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveConfigureAck r             -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveConfigureNakRej r          -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveTerminateRequest r         -> new LcpState.Stopping();
+            case LcpEvent.ReceiveTerminateAck r             -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveUnknownCode r              -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveCodeReject r when !r.catastrophic() -> new LcpState.ReqSent();
+            case LcpEvent.ReceiveCodeReject r               -> new LcpState.Stopping();
+            
+            case LcpEvent.Up up                             -> throw illegalTransition(state, event);
+            case LcpEvent.Timeout t                         -> throw illegalTransition(state, event);
+        };
+    }
+
+    private IllegalStateException illegalTransition(LcpState state, LcpEvent event) {
+        return new IllegalStateException(
+            String.format("Invalid event %s received in LCP state %s", 
+                event.getClass().getSimpleName(), 
+                state.getClass().getSimpleName())
+        );
+    }
+
+    public static void main(String[] args) {
+        PppLcpStateMachine sm = new PppLcpStateMachine();
+        LcpState currentState = new LcpState.Initial();
+        System.out.println("Starting state: " + currentState.getClass().getSimpleName());
+
+        // Simulate a typical successful link negotiation and teardown
+        LcpEvent[] events = {
+            new LcpEvent.Open(),                             // Admin brings up interface
+            new LcpEvent.Up(),                               // Lower layer goes up
+            new LcpEvent.ReceiveConfigureRequest(true),      // Good request from peer
+            new LcpEvent.ReceiveConfigureAck(),              // Peer acknowledges our config
+            new LcpEvent.Close(),                            // Admin closes connection
+            new LcpEvent.ReceiveTerminateAck()               // Peer acknowledges termination
+        };
+
+        for (LcpEvent event : events) {
+            String eventInfo = event.getClass().getSimpleName();
+            if (event instanceof LcpEvent.ReceiveConfigureRequest rcr) {
+                eventInfo += "(acceptable=" + rcr.acceptable() + ")";
+            }
+            
+            System.out.println("Processing event: " + eventInfo);
+            currentState = sm.transition(currentState, event);
+            System.out.println("New state: " + currentState.getClass().getSimpleName());
+        }
+
+        assert currentState instanceof LcpState.Closed;
+        System.out.println("LCP transition path completed successfully.");
+    }
+}

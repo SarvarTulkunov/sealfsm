@@ -33,6 +33,7 @@ import spoon.reflect.code.CtTry;
 import spoon.reflect.code.CtTypeAccess;
 import spoon.reflect.code.CtVariableAccess;
 import spoon.reflect.code.CtYieldStatement;
+import spoon.reflect.cu.SourcePosition;
 import spoon.reflect.declaration.CtElement;
 import spoon.reflect.declaration.CtEnum;
 import spoon.reflect.declaration.CtEnumValue;
@@ -40,6 +41,7 @@ import spoon.reflect.declaration.CtField;
 import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtParameter;
 import spoon.reflect.declaration.CtType;
+import spoon.reflect.declaration.CtShadowable;
 import spoon.reflect.declaration.CtVariable;
 import spoon.reflect.reference.CtExecutableReference;
 import spoon.reflect.reference.CtFieldReference;
@@ -1316,11 +1318,46 @@ public final class TransitionExtractor {
      * nested in a lambda or local class counts as the method's own. That is the
      * conservative direction: it declines to suppress, falling back to the
      * previous unresolved-edge behaviour, and never drops a real transition.
+     *
+     * <p>F11 — the rule may only be applied to a body the analysis actually
+     * <em>read</em>. For a method outside the source set (a JDK or library call),
+     * Spoon supplies a reflective <em>shadow</em> declaration: a signature with an
+     * empty {@code { }} body. That body contains no {@code return} for the same
+     * reason it contains nothing at all — it was never parsed — so the emptiness
+     * carries no information about whether the method returns. Reading it as proof
+     * turned every library call returning a hierarchy type into a silently deleted
+     * edge: {@code Objects.requireNonNull(state, ...)},
+     * {@code Optional.orElse(new Closed())}, {@code map.getOrDefault(k, new Idle())}.
+     * That is a false drop with no unresolved marker, the one outcome the
+     * "unresolved transitions are never dropped" invariant forbids. The whole
+     * licence for F9 to suppress is that JLS §8.4.7 makes the conclusion exact;
+     * on a body that was never read there is no such licence.
      */
     private static boolean neverReturnsNormally(CtMethod<?> callee) {
         CtBlock<?> body = callee.getBody();
-        if (body == null) return false; // no body visible: never claim anything
+        if (body == null) return false;      // no body visible: never claim anything
+        if (isShadow(callee)) return false;  // F11: a stub body is not an empty body
         return body.getElements(new TypeFilter<>(CtReturn.class)).isEmpty();
+    }
+
+    /**
+     * True when {@code type} was reconstructed by reflection rather than parsed
+     * from the source set, so its body is a stub. Checked two ways because either
+     * signal alone has failed across Spoon versions: {@code isShadow()} is the
+     * declared API, and an invalid source position is the structural consequence
+     * (verified — a JDK declaration reports {@code isShadow() == true} and
+     * {@code getPosition().isValidPosition() == false}). Best-effort and never
+     * throws; when unreadable it answers "shadow", because declining to apply F9
+     * is the direction that cannot drop a transition.
+     */
+    private static boolean isShadow(CtElement element) {
+        try {
+            if (element instanceof CtShadowable s && s.isShadow()) return true;
+            SourcePosition pos = element.getPosition();
+            return pos == null || !pos.isValidPosition();
+        } catch (Throwable t) {
+            return true;
+        }
     }
 
     /** Returned / yielded expressions of a body, each with its accumulated guard. */
@@ -1425,14 +1462,52 @@ public final class TransitionExtractor {
             // enabler for F1/F2 — a producer or state mutation inside the loop
             // would otherwise vanish with no unresolved marker.
             walk(loop.getBody(), from, event, merge(guard, loopGuard(loop)), out);
-        } else if (node instanceof CtExpression<?> expr) {
-            // arrow-arm expression body: case X -> new A();  (statement is itself
-            // an expression) or  case X -> switch (event) { ... };
+        } else if (node instanceof CtExpression<?> expr
+                && isSwitchExpressionArm(expr) && isHierarchyTyped(expr)) {
+            // Arrow-arm expression body in VALUE position: case X -> new A();
+            // Spoon 10.4.2 wraps every arm form in a typed node (yield / block /
+            // return) so this is currently unreachable, but the Spoon version is a
+            // pom property meant to be bumped freely and an earlier modelling could
+            // return. Keeping the branch — narrowed to the case where it would be
+            // correct — means a version change is handled on purpose rather than by
+            // accident. See F10 below for why the unnarrowed form was wrong.
             handleValue(expr, from, event, guard, out);
         }
-        // local-variable declarations and other plain statements do not directly
-        // produce a next state (reassigned locals are a scope line), so they are
-        // intentionally not descended for value production.
+        // F10 — every OTHER expression reaching here is an expression STATEMENT,
+        // and Java discards an expression statement's value (JLS §14.8). A value
+        // the language throws away cannot be a committed successor, so this is an
+        // exact rule, not a heuristic: it belongs beside F9 and state enumeration
+        // on the compiler-checked side of the line, not with the approximate
+        // data-flow. Handing such statements to `handleValue` made every piece of
+        // ordinary plumbing inside a walked body into a transition —
+        // `Objects.requireNonNull(event, "...")`, `log.debug(...)`,
+        // `metrics.increment()` — inflating the denominator with non-transitions
+        // and, where the expression was hierarchy-typed, threatening a fabricated
+        // resolved edge. A statement that genuinely IS the commit is already
+        // claimed above by its own branch: an assignment to the state field, or a
+        // recognised mutator call (F2). Nothing else installs a successor.
+        //
+        // Local-variable declarations and other plain statements likewise do not
+        // directly produce a next state (reassigned locals are a scope line), so
+        // they are intentionally not descended for value production.
+    }
+
+    /**
+     * Is this expression the direct arm body of a switch <em>expression</em> —
+     * i.e. is its value consumed rather than discarded? Answered from the node's
+     * own position rather than a flag threaded through {@link #walk}, because it
+     * is a property of where the expression sits, and a flag would have to be
+     * passed correctly at ten call sites to say the same thing. A statement nested
+     * inside an arm's block is NOT an arm body: its value is discarded like any
+     * other statement, and the block's producer is its {@code yield}.
+     */
+    private static boolean isSwitchExpressionArm(CtExpression<?> expr) {
+        try {
+            CtElement parent = expr.getParent();
+            return parent instanceof CtCase<?> c && c.getParent() instanceof CtSwitchExpression<?, ?>;
+        } catch (Throwable t) {
+            return false; // unknown position: assume statement, the safe direction
+        }
     }
 
     /**
@@ -1729,10 +1804,24 @@ public final class TransitionExtractor {
                     ? componentBindingOf(c, caseEvents.get(0)) : null;
             ComponentEvent savedComponent = componentEvent;
             if (binding != null) componentEvent = binding;
+            // F10 — Spoon wraps the arrow arm of a switch STATEMENT in a synthetic
+            // CtYieldStatement (`case X -> ctx.setState(new A());` arrives as a
+            // yield), even though `yield` is illegal outside a switch expression.
+            // Walking it as a yield reads a discarded value as a produced one. Any
+            // yield directly under a CtSwitch is therefore synthetic and must be
+            // unwrapped to the statement it really is — which also routes it back
+            // through `walk`, where the F2 mutator branch can claim it. Inside an
+            // arm's BLOCK a yield is always genuine, so this is a one-level rule.
+            boolean discardedArms = !(sw instanceof CtSwitchExpression<?, ?>);
             try {
                 for (String caseEvent : caseEvents) {
                     for (CtStatement st : c.getStatements()) {
-                        walk(st, caseFrom, caseEvent, caseGuard, out);
+                        CtElement effective = st;
+                        if (discardedArms && st instanceof CtYieldStatement ys
+                                && ys.getExpression() != null) {
+                            effective = ys.getExpression();
+                        }
+                        walk(effective, caseFrom, caseEvent, caseGuard, out);
                     }
                 }
             } finally {
