@@ -2133,8 +2133,22 @@ public final class TransitionExtractor {
             if (body.size() < 2) return null;
             CtStatement first = body.get(0);
             if (!(first instanceof CtExpression<?> expr)) return null;
+            // The ARROW + extra-statement structure is what PROVES this is the
+            // guard; the type is only a sanity check against that reasoning being
+            // wrong. So an unresolvable type (routine under noClasspath) is
+            // accepted, and both the primitive and the boxed spelling count — a
+            // `Boolean`-returning accessor is an ordinary way to write a guard and
+            // was silently losing its condition.
+            // A CAST is not its own node in Spoon — it hangs off the expression, so
+            // `(Boolean) v.o()` reports the invocation's own type (Object) and was
+            // rejected, losing the guard. The outermost cast is what the `when`
+            // clause actually evaluates.
             CtTypeReference<?> t = expr.getType();
-            return t != null && "boolean".equals(t.getSimpleName()) ? first : null;
+            List<CtTypeReference<?>> casts = expr.getTypeCasts();
+            if (casts != null && !casts.isEmpty()) t = casts.get(casts.size() - 1);
+            if (t == null) return first;
+            String name = t.getSimpleName();
+            return "boolean".equals(name) || "Boolean".equals(name) ? first : null;
         } catch (Throwable ignored) {
             return null; // unreadable: keep the previous (guardless) behaviour
         }
@@ -2198,10 +2212,18 @@ public final class TransitionExtractor {
         return "!(" + condText + ")";
     }
 
+    /**
+     * Source text of a node, flattened to one line. Guard text reaches a DOT edge
+     * label and an SCXML {@code cond} attribute, and a guard can legitimately span
+     * lines — {@code when switch (v.n()) { case 1 -> true; default -> false; }}
+     * pretty-prints across five. Graphviz accepts the embedded newlines, so this
+     * failed silently rather than loudly: the diagram just grew an unreadable
+     * five-line label. Runs of whitespace collapse to one space.
+     */
     private static String safeText(Object e) {
         if (e == null) return "";
         try {
-            return e.toString();
+            return e.toString().replaceAll("\\s+", " ").trim();
         } catch (Throwable t) {
             return e.getClass().getSimpleName();
         }

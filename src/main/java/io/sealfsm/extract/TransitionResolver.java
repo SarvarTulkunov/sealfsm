@@ -344,10 +344,17 @@ public final class TransitionResolver {
         return "!(" + condText + ")";
     }
 
+    /**
+     * Source text of an expression, flattened to one line — the same contract as
+     * {@code TransitionExtractor.safeText}. This text becomes an unresolved edge's
+     * note and a ternary's guard, both of which reach a DOT label and an SCXML
+     * attribute, and a multi-line expression there produces an unreadable
+     * multi-line label rather than any visible error.
+     */
     private static String safeText(CtExpression<?> e) {
         if (e == null) return "";
         try {
-            return e.toString();
+            return e.toString().replaceAll("\\s+", " ").trim();
         } catch (Throwable t) {
             return e.getClass().getSimpleName();
         }

@@ -10,6 +10,9 @@ import org.junit.jupiter.api.Test;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
 
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -1048,6 +1051,70 @@ class ExtractionIntegrationTest {
                 "the fall-through arm is guarded by the negation, not unguarded");
         assertTrue(rcr.stream().anyMatch(t -> t.guard().contains("!")),
                 "the later arm must carry the negated guard");
+    }
+
+    @Test
+    void everyGuardSpellingReachesTheEdgeLabel() {
+        // The guard-form axis, held against a fixed two-state machine so the only
+        // variable is how the `when` clause is written. Spoon 10.4.2 fills
+        // CtCase.getGuard() only for a CtBinaryOperator; the other thirteen shapes
+        // here are recovered from the arm body. A silently lost guard turns a
+        // conditional edge into an unconditional CLAIM, and leaves the F12
+        // exclusion nothing to separate it from its fall-through arm with.
+        //
+        // Three of these were found losing their guard only by enumerating the
+        // table: Boxed (a `Boolean` guard failing a check written for the
+        // primitive), Cast (a cast is not its own node, so `(Boolean) t.o()`
+        // reported the invocation's own Object type), and Sw (recovered, but its
+        // five-line source reached the DOT label with the newlines intact —
+        // Graphviz accepts that, so it failed silently).
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/guardforms"));
+        StateMachine m = single(r);
+
+        Map<String, Transition> byEvent = new HashMap<>();
+        for (Transition t : m.transitions()) {
+            if (t.event() != null && "Busy".equals(t.to())) byEvent.put(t.event(), t);
+        }
+
+        Map<String, String> expected = new LinkedHashMap<>();
+        expected.put("Inv", "t.flag()");
+        expected.put("Unary", "!t.flag()");
+        expected.put("Binary", "t.n() > 10");
+        expected.put("Conj", "&&");
+        expected.put("Disj", "||");
+        expected.put("Boxed", "t.flag()");            // java.lang.Boolean, not boolean
+        expected.put("Bound", "flag");                // pattern-binding read
+        expected.put("Inst", "instanceof");
+        expected.put("Ternary", "?");
+        expected.put("Arr", "t.flags()[0]");
+        expected.put("NegBin", "!(t.n() > 3)");
+        expected.put("Static", "positive");
+        expected.put("Chain", "isEmpty()");
+        expected.put("Lib", "equals");
+        expected.put("Sw", "switch");                 // guard that is itself a switch
+        expected.put("Paren", "t.flag()");
+        expected.put("Deep", "&&");
+        expected.put("Lambda", "anyMatch");
+        expected.put("Cast", "Boolean");              // cast hangs off the expression
+        expected.put("Nest", "on");                   // nested record pattern binding
+
+        for (Map.Entry<String, String> e : expected.entrySet()) {
+            Transition t = byEvent.get(e.getKey());
+            assertNotNull(t, "no edge for guard shape " + e.getKey());
+            assertNotNull(t.guard(), "guard lost for shape " + e.getKey());
+            assertTrue(t.guard().contains(e.getValue()),
+                    e.getKey() + ": expected guard to contain '" + e.getValue()
+                            + "' but was '" + t.guard() + "'");
+        }
+
+        // Guard text reaches a DOT label and an SCXML cond attribute, so it must be
+        // one line however the source was formatted.
+        for (Transition t : m.transitions()) {
+            if (t.guard() != null) {
+                assertEquals(1, t.guard().lines().count(),
+                        "guard text must be single-line: " + t.guard());
+            }
+        }
     }
 
     @Test
