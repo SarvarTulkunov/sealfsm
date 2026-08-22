@@ -89,6 +89,60 @@ class DotSerializerTest {
                 "an unvisited state must not be reported as terminal");
     }
 
+    // ---- pseudo-states ------------------------------------------------------
+
+    @Test
+    void anUndeterminedSourceIsAMarkerNotAStateBox() {
+        // Regression (LCP): `<unknown>` appeared only as an edge endpoint, so
+        // Graphviz auto-created it and applied the file's default
+        // `shape=rectangle, style=rounded`. The rendered diagram then showed a
+        // rounded box captioned "<unknown>" sitting among the real states, reading
+        // as an eleventh state — a recall gap dressed as a result. It must be
+        // declared, and styled like the `?` sink it points at.
+        StateMachine m = sample();
+        m.addTransition(Transition.unresolved("<unknown>", null, null, "requireNonNull(event, ...)"));
+        String dot = new DotSerializer().serialize(m);
+
+        assertTrue(dot.contains("\"<unknown>\" [shape=none, fontcolor=\"#b00020\"];"),
+                "the undetermined source must be declared as a red marker");
+        // Declared before the edges, so nothing has auto-created it with the
+        // default node shape by the time it is first named.
+        assertTrue(dot.indexOf("\"<unknown>\" [shape=none") < dot.indexOf("\"<unknown>\" ->"),
+                "the declaration must precede the edge that names it");
+    }
+
+    @Test
+    void realStatesAreNotTreatedAsPseudoStates() {
+        // The predicate is "absent from allStates()", so a composite's CHILD — a
+        // real state that is never declared at top level — must not be swept up
+        // and restyled as a gap marker.
+        String dot = new DotSerializer().serialize(compositeSample());
+        assertFalse(dot.contains("\"RAMP\" [shape=none"), "a child state is a state");
+        assertFalse(dot.contains("[shape=none, fontcolor=\"#b00020\"];"),
+                "a fully resolved machine declares no gap markers");
+    }
+
+    @Test
+    void machineEntryPseudoStateIsADotNotADuplicateStartPoint() {
+        // When the analyzer could not prove which permitted subtype starts the
+        // machine it sources those edges at <initial>. That is a real entry point,
+        // so it gets the conventional filled dot — and the separate __start point
+        // is suppressed, since a dot aimed at a dot says nothing.
+        StateMachine m = new StateMachine("CancellationState",
+                "cancellation.CancellationState", StateMachine.Encoding.CENTRALIZED_DISPATCH);
+        m.addTopLevelState(new State("Pending", "cancellation.Pending", false));
+        m.addTopLevelState(new State("Cancelled", "cancellation.Cancelled", false));
+        m.addTransition(Transition.resolved(StateMachine.INITIAL_PSEUDO_STATE, "Pending", "subscribe", null));
+        m.setInitialState(StateMachine.INITIAL_PSEUDO_STATE);
+        String dot = new DotSerializer().serialize(m);
+
+        assertTrue(dot.contains("\"<initial>\" [shape=point, width=0.12, label=\"\"];"),
+                "machine entry is drawn as a point, not a rounded box");
+        assertFalse(dot.contains("\"<initial>\" [shape=none"),
+                "entry is a proven start point, not an unresolved gap");
+        assertFalse(dot.contains("__start"), "no second entry point aimed at the entry point");
+    }
+
     // ---- composite states ---------------------------------------------------
 
     /** A machine with a composite state that edges enter, leave and loop on. */

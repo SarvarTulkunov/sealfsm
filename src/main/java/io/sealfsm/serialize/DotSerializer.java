@@ -20,6 +20,13 @@ import java.util.Set;
  * The initial state is marked with an entry arrow from a hidden point. Any
  * unresolved transition is drawn as a dashed red edge into a shared {@code ?}
  * sink, so gaps in transition recovery are immediately obvious on the diagram.
+ *
+ * <p>Pseudo-states are declared explicitly rather than left to Graphviz. A node
+ * that only ever appears as an edge endpoint is auto-created with the file's
+ * default {@code shape=rectangle, style=rounded}, so an undetermined source
+ * ({@code <unknown>}) would render as a rounded box indistinguishable from a
+ * real state — a recall gap dressed as a result, which is the one thing the
+ * unresolved-transition invariant exists to prevent.
  */
 public final class DotSerializer {
 
@@ -52,19 +59,40 @@ public final class DotSerializer {
         sb.append("  node [shape=rectangle, style=rounded, fontname=\"Helvetica\"];\n");
         sb.append("  edge [fontname=\"Helvetica\", fontsize=10];\n\n");
 
-        // Entry arrow into the initial state.
-        m.initialState().ifPresent(init -> {
-            sb.append("  __start [shape=point, width=0.12, label=\"\"];\n");
-            sb.append("  __start -> ").append(q(endpoint(init, composites)));
-            if (clipsTo(init, "__start", composites)) {
-                sb.append(" [lhead=").append(cluster(init)).append("]");
-            }
-            sb.append(";\n\n");
-        });
+        Set<String> realIds = new LinkedHashSet<>();
+        for (State s : m.allStates()) realIds.add(s.id());
+
+        // Entry arrow into the initial state. When the "initial state" is itself
+        // the entry pseudo-state, it is already drawn as an entry marker below and
+        // a second point node aimed at it would just be a dot pointing at a dot.
+        m.initialState()
+                .filter(init -> !StateMachine.INITIAL_PSEUDO_STATE.equals(init))
+                .ifPresent(init -> {
+                    sb.append("  __start [shape=point, width=0.12, label=\"\"];\n");
+                    sb.append("  __start -> ").append(q(endpoint(init, composites)));
+                    if (clipsTo(init, "__start", composites)) {
+                        sb.append(" [lhead=").append(cluster(init)).append("]");
+                    }
+                    sb.append(";\n\n");
+                });
 
         boolean hasUnresolved = m.transitions().stream().anyMatch(t -> !t.isResolved());
         if (hasUnresolved) {
             sb.append("  \"?\" [shape=none, label=\"?\", fontcolor=\"#b00020\"];\n\n");
+        }
+
+        // Pseudo-states — machine entry, or an edge whose source the analysis could
+        // not determine — are named by an edge but are NOT permitted subtypes, so
+        // nothing above declares them. Graphviz auto-creates any node an edge names
+        // and applies the file's default `shape=rectangle, style=rounded`, which
+        // renders a gap as a box indistinguishable from a real state (`<unknown>`
+        // read as an eleventh LCP state). Declare them explicitly instead.
+        List<String> pseudo = pseudoEndpoints(m, realIds);
+        if (!pseudo.isEmpty()) {
+            for (String id : pseudo) {
+                sb.append("  ").append(q(id)).append(' ').append(pseudoAttrs(id)).append(";\n");
+            }
+            sb.append('\n');
         }
 
         for (State s : m.topLevelStates()) {
@@ -78,6 +106,36 @@ public final class DotSerializer {
 
         sb.append("}\n");
         return sb.toString();
+    }
+
+    /**
+     * Edge endpoints that are not permitted subtypes, in first-seen order. The
+     * predicate is "absent from {@link StateMachine#allStates()}", the same one
+     * {@code ScxmlSerializer.emitPseudoStates} uses — a serializer that enumerated
+     * the pseudo-state spellings itself would fall out of step with the extractor
+     * the first time a new one is introduced.
+     */
+    private static List<String> pseudoEndpoints(StateMachine m, Set<String> realIds) {
+        Set<String> out = new LinkedHashSet<>();
+        for (Transition t : m.transitions()) {
+            if (t.from() != null && !realIds.contains(t.from())) out.add(t.from());
+            if (t.isResolved() && t.to() != null && !realIds.contains(t.to())) out.add(t.to());
+        }
+        return new ArrayList<>(out);
+    }
+
+    /**
+     * How a pseudo-state is drawn. Machine entry is a real, proven start point and
+     * gets the conventional filled dot — the same vocabulary as {@code __start}. An
+     * undetermined source is a <em>gap</em>, so it is styled exactly like the
+     * {@code ?} target sink: a bare red marker, never a node shape, so that the two
+     * halves of one unrecovered edge read alike.
+     */
+    private static String pseudoAttrs(String id) {
+        if (StateMachine.INITIAL_PSEUDO_STATE.equals(id)) {
+            return "[shape=point, width=0.12, label=\"\"]";
+        }
+        return "[shape=none, fontcolor=\"#b00020\"]";
     }
 
     private static void collectMembers(State s, Set<String> out) {
