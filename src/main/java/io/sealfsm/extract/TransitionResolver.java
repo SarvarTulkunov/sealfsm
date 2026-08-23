@@ -25,8 +25,10 @@ import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * Resolves a single returned/produced expression to the concrete target
@@ -84,6 +86,14 @@ public final class TransitionResolver {
      */
     private final StateNaming naming;
 
+    /**
+     * Variable names for which {@link #isReassigned} could not decide identity and
+     * had to fall back to a name match. Drained by {@link TransitionExtractor} into
+     * a diagnostic, so a read resolved (or declined) on that weaker basis is
+     * reported rather than passing for a proven one.
+     */
+    private final Set<String> nameOnlyReassignmentChecks = new LinkedHashSet<>();
+
     public TransitionResolver(Set<String> hierarchyQualifiedNames, String rootQualifiedName) {
         this(hierarchyQualifiedNames, rootQualifiedName, StateNaming.EMPTY);
     }
@@ -93,6 +103,11 @@ public final class TransitionResolver {
         this.hierarchyQualifiedNames = hierarchyQualifiedNames;
         this.rootQualifiedName = rootQualifiedName;
         this.naming = naming == null ? StateNaming.EMPTY : naming;
+    }
+
+    /** Names whose reassignment status rested on a name match; see the field. */
+    Set<String> nameOnlyReassignmentChecks() {
+        return nameOnlyReassignmentChecks;
     }
 
     public List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName) {
@@ -234,7 +249,8 @@ public final class TransitionResolver {
         // (2) the initializer fixes the value. Resolved recursively so a singleton
         // pointing at another singleton, a cast or a ternary all work; `seen`
         // stops a self- or mutually-referential declaration from looping.
-        if (decl != null && !isReassigned(vref) && depth < MAX_INITIALIZER_DEPTH && seen.add(decl)) {
+        if (decl != null && !isReassigned(vref, nameOnlyReassignmentChecks::add)
+                && depth < MAX_INITIALIZER_DEPTH && seen.add(decl)) {
             CtExpression<?> init = decl.getDefaultExpression();
             if (init != null && !(init instanceof CtVariableAccess<?> self && refersTo(self, vref))) {
                 List<Candidate> viaInit = resolve(init, fromSimpleName, guard, seen, depth + 1);
@@ -268,7 +284,7 @@ public final class TransitionResolver {
             if (dq.equals(rootQualifiedName)
                     && fromSimpleName != null
                     && isSelectorBinding(decl)
-                    && !isReassigned(vref)) {
+                    && !isReassigned(vref, nameOnlyReassignmentChecks::add)) {
                 return List.of(Candidate.of(fromSimpleName, guard, SuccessorForm.SELF));
             }
         }
@@ -327,8 +343,31 @@ public final class TransitionResolver {
      * otherwise be reported as a false, proven self-loop (see finding F1). This is
      * package-visible so the extractor's reaching-definitions pass reuses the same
      * notion of "reassigned".
+     *
+     * <p>The question is about a VARIABLE, not about a name (finding F13). Java
+     * scopes a local to its block, so one method may legally declare the same name
+     * in any number of <em>disjoint</em> blocks — and a centralized dispatch is
+     * precisely where that happens, because every arm is its own block and every
+     * arm wants to call its successor {@code next}. Matching writes by simple name
+     * therefore let one arm's accumulator condemn every other arm's local: a
+     * single-assignment read was pushed onto the reaching-definitions fallback,
+     * which relabels its successor form and — wherever that pass cannot model the
+     * control flow enclosing the read, such as a {@code try} or a loop — drops the
+     * edge to unresolved outright. {@code examples/scopedlocals} is one rename
+     * apart from 5/5 and 4/5.
+     *
+     * <p>A write is therefore matched on its DECLARATION, <b>by identity</b>. The
+     * {@code ==} is load-bearing and {@code equals} is unusable here: Spoon gives
+     * {@code CtElement} deep structural equality, so two disjoint arms that both
+     * declare {@code Gate next = new Ajar();} compare equal — which is exactly the
+     * confusion being removed.
+     *
+     * @param onNameFallback notified with the variable name when Spoon cannot bind
+     *                       a same-named write to any declaration, so identity is
+     *                       undecidable and the answer rests on the name alone.
+     *                       Reported by the caller rather than let pass for a proof.
      */
-    static boolean isReassigned(CtVariableReference<?> vref) {
+    static boolean isReassigned(CtVariableReference<?> vref, Consumer<String> onNameFallback) {
         if (vref == null) return false;
         CtVariable<?> decl = vref.getDeclaration();
         if (decl == null) return false;
@@ -337,14 +376,36 @@ public final class TransitionResolver {
         String name = vref.getSimpleName();
         for (CtAssignment<?, ?> a : method.getElements(new TypeFilter<>(CtAssignment.class))) {
             CtExpression<?> lhs = a.getAssigned();
-            if (lhs instanceof CtVariableAccess<?> vw
-                    && !(lhs instanceof CtFieldAccess<?>)
-                    && vw.getVariable() != null
-                    && name.equals(vw.getVariable().getSimpleName())) {
+            if (!(lhs instanceof CtVariableAccess<?> vw) || lhs instanceof CtFieldAccess<?>) {
+                continue;
+            }
+            CtVariableReference<?> written = vw.getVariable();
+            // The name is a prefilter only — a write to a differently named variable
+            // can never be a write to this one — and it keeps the declaration lookup
+            // off every unrelated assignment in the method.
+            if (written == null || !name.equals(written.getSimpleName())) {
+                continue;
+            }
+            CtVariable<?> writtenDecl = written.getDeclaration();
+            if (writtenDecl == null) {
+                // The write cannot be bound to a declaration, so identity is
+                // undecidable. Answering "reassigned" is the direction that cannot
+                // fabricate an edge — it costs a resolvable read, it never invents an
+                // unresolvable one — so take it, and record that the answer was a
+                // name match rather than a proof.
+                if (onNameFallback != null) onNameFallback.accept(name);
+                return true;
+            }
+            if (writtenDecl == decl) {
                 return true;
             }
         }
         return false;
+    }
+
+    /** {@link #isReassigned(CtVariableReference, Consumer)} with no fallback report. */
+    static boolean isReassigned(CtVariableReference<?> vref) {
+        return isReassigned(vref, null);
     }
 
     private static String combine(String existing, String added) {

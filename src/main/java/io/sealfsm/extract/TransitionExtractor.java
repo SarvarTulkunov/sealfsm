@@ -132,6 +132,13 @@ public final class TransitionExtractor {
     // reported as a diagnostic rather than letting them vanish unremarked.
     private int nonReturningCalls = 0;
 
+    // F13: reads whose "is this local reassigned?" answer could not be decided on
+    // variable identity because Spoon could not bind a same-named write to any
+    // declaration, and so rests on the name alone. Rare, and reported: the answer
+    // is taken in the direction that cannot fabricate an edge, but it is a name
+    // match standing in for a proof and should not read like one.
+    private final Set<String> nameOnlyReassignmentChecks = new LinkedHashSet<>();
+
     // F4: the closed-world event alphabet Σ enumerated from the sealed/enum event
     // parameter of centralized transition functions, plus the qualified names of
     // that event type (root + members) so a switch-over-event can be recognised
@@ -309,6 +316,14 @@ public final class TransitionExtractor {
             diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
                     + "(always throws or diverges) contributed no transition — the arms holding "
                     + "them are undefined inputs, not unresolved targets");
+        }
+        Set<String> nameOnly = new LinkedHashSet<>(nameOnlyReassignmentChecks);
+        nameOnly.addAll(resolver.nameOnlyReassignmentChecks());
+        if (!nameOnly.isEmpty()) {
+            diagnostics.add("reassignment of local(s) " + nameOnly + " was decided by NAME, not by "
+                    + "variable identity — a same-named write could not be bound to a declaration. "
+                    + "Answered conservatively (treated as reassigned), which may cost resolution "
+                    + "on an unrelated local of the same name");
         }
         return new ArrayList<>(out);
     }
@@ -1627,13 +1642,18 @@ public final class TransitionExtractor {
      * somewhere in its method. Such a read is intercepted before the resolver so
      * its declared type never fabricates a self-loop; a non-reassigned local (a
      * pattern binding, a single-init local) keeps the ordinary resolver path.
+     *
+     * <p>"That variable", not "that name" — the write has to be bound to this
+     * declaration (F13). Sibling switch arms routinely each declare their own
+     * {@code next}, and a name-keyed scan puts every one of them on the
+     * reaching-definitions path as soon as any one of them is an accumulator.
      */
     private boolean isReassignedLocal(CtVariableAccess<?> va) {
         CtVariableReference<?> vref = va.getVariable();
         if (vref == null || !(vref.getDeclaration() instanceof CtLocalVariable<?>)) {
             return false;
         }
-        return TransitionResolver.isReassigned(vref);
+        return TransitionResolver.isReassigned(vref, nameOnlyReassignmentChecks::add);
     }
 
     /**

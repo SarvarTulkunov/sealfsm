@@ -814,6 +814,69 @@ class ExtractionIntegrationTest {
         assertEquals(Set.of(CommitForm.FIELD_MUTATION), mut.commitForms());
     }
 
+    // ---- F13: a local's identity is not its name ---------------------------
+
+    @Test
+    void sameNamedLocalsInDisjointArmsDoNotCondemnEachOther() {
+        // Every arm of GateDriver.transition declares its own `next` — the ordinary
+        // way a per-arm switch is written, and legal because Java scopes a local to
+        // its block. Asking "is `next` reassigned?" by scanning the method for a
+        // write to SOME variable of that name answers a question about the
+        // spelling: the Ajar arm's accumulator made the other two arms' locals look
+        // reassigned, pushing reads that were single assignment onto the
+        // reaching-definitions fallback.
+        //
+        // That fallback does not model exceptional flow, so on the Wedged arm — a
+        // single-assignment local read from inside a `try` — it bailed and the edge
+        // became `-> ?`. The fixture is ONE RENAME away from 5/5 and 4/5: with the
+        // three locals spelled nextA / next / nextC the same source reported every
+        // edge. A real transition lost to an unrelated variable's name is a recall
+        // gap with no defensible reading.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/scopedlocals"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of(CommitForm.VALUE_RETURN), m.commitForms());
+        assertEquals(Set.of("Shut", "Ajar", "Wedged"), stateIds(m));
+        assertEquals("Shut", m.initialState().orElse(null));
+
+        assertEquals(5, m.transitions().size());
+        assertEquals(0, m.unresolvedTransitionCount(),
+                "no edge may be lost to a sibling arm's choice of variable name");
+
+        assertTrue(hasResolved(m, "Shut", "Ajar"));
+        assertTrue(hasResolved(m, "Wedged", "Shut"),
+                "the try-enclosed read is the edge the name collision dropped");
+        assertTrue(hasResolved(m, "Wedged", "Ajar"), "the catch arm's producer");
+
+        // The successor-form axis records how a value was SPELLED, so the
+        // degradation was visible there too: routed through the reaching-definitions
+        // pass, `Gate next = new Ajar()` reports the initializer's CONSTRUCTION and
+        // the local disappears from the axis entirely.
+        assertTrue(m.successorForms().contains(SuccessorForm.LOCAL_VARIABLE),
+                "a single-assignment local must be attributed to the local, not to its initializer");
+
+        // NEGATIVE CONTROL — the Ajar arm, whose `next` IS reassigned. Deciding
+        // reassignment by identity must not turn this into "never written": `next`
+        // starts life as the root-typed selector `current`, so a single-assignment
+        // reading resolves it to a confident, UNGUARDED self-loop and loses the
+        // `new Wedged()` target altogether. That is finding F1. What must survive
+        // is the pair of mutually-exclusive guarded edges the source actually
+        // encodes.
+        assertTrue(hasResolved(m, "Ajar", "Wedged"), "the reassigned target must survive");
+        assertTrue(hasResolved(m, "Ajar", "Ajar"), "as must the fall-through self-loop");
+        assertTrue(m.transitions().stream()
+                        .filter(t -> "Ajar".equals(t.from()))
+                        .allMatch(t -> t.guard() != null && !t.guard().isBlank()),
+                "both Ajar edges are conditional; an unguarded one is the F1 fabrication");
+
+        // No fallback to name matching was needed anywhere in this model, so the
+        // diagnostic that would report a weaker answer must be absent.
+        assertFalse(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("decided by NAME")),
+                "identity was decidable throughout; nothing may claim otherwise");
+    }
+
     // ---- F9: a helper that cannot return normally is not a producer ---------
 
     @Test

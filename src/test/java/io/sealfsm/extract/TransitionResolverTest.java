@@ -7,7 +7,11 @@ import org.junit.jupiter.api.Test;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.CtExpression;
+import spoon.reflect.code.CtBlock;
+import spoon.reflect.code.CtLocalVariable;
 import spoon.reflect.code.CtReturn;
+import spoon.reflect.code.CtVariableAccess;
+import spoon.reflect.code.CtVariableRead;
 import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.visitor.filter.TypeFilter;
@@ -239,5 +243,103 @@ class TransitionResolverTest {
                 }
             }
         }
+    }
+
+    // ---- F13: reassignment is a property of a VARIABLE, not of a name -------
+
+    /**
+     * The three arm-locals of {@code GateDriver.transition}, keyed by the source
+     * text of their initializer. Java scopes each to its own arm block, so they
+     * are three distinct variables that merely share the name {@code next}.
+     */
+    private CtLocalVariable<?> armLocal(String initializerText) {
+        CtMethod<?> m = type(model, "scopedlocals.GateDriver").getMethods().stream()
+                .filter(x -> x.getSimpleName().equals("transition"))
+                .findFirst().orElseThrow();
+        List<CtLocalVariable<?>> decls = m.getElements(new TypeFilter<CtLocalVariable<?>>(CtLocalVariable.class))
+                .stream()
+                .filter(v -> v.getSimpleName().equals("next"))
+                .filter(v -> v.getDefaultExpression() != null
+                        && v.getDefaultExpression().toString().equals(initializerText))
+                .toList();
+        assertEquals(1, decls.size(),
+                "fixture must declare exactly one `next` initialised to " + initializerText);
+        return decls.get(0);
+    }
+
+    /**
+     * A read of {@code decl}, found by SCOPE rather than by
+     * {@code getDeclaration()} — the very mechanism under test must not be what
+     * selects the input. Java forbids a local shadowing a local, so any read of
+     * {@code next} inside the declaring block is a read of that {@code next}.
+     */
+    private CtVariableAccess<?> readOf(CtLocalVariable<?> decl) {
+        CtBlock<?> scope = decl.getParent(CtBlock.class);
+        assertNotNull(scope, "declaration must sit in a block");
+        List<CtVariableRead<?>> reads =
+                scope.getElements(new TypeFilter<CtVariableRead<?>>(CtVariableRead.class)).stream()
+                        .filter(v -> v.getVariable() != null
+                                && v.getVariable().getSimpleName().equals(decl.getSimpleName()))
+                        .toList();
+        assertFalse(reads.isEmpty(), "expected a read of `" + decl.getSimpleName() + "` in its block");
+        return reads.get(reads.size() - 1);
+    }
+
+    @Test
+    void reassignmentIsDecidedPerVariableNotPerName() {
+        // The bug this pins: `isReassigned` scanned the whole method for a write
+        // to SOME variable spelled `next` and answered a question about the name.
+        // A centralized dispatch is where that misfires, because every arm is its
+        // own block and every arm calls its successor `next` — so one arm's
+        // accumulator condemned all three, and the reads that were single
+        // assignment lost their resolution.
+        model = modelOf("examples/scopedlocals");
+
+        CtLocalVariable<?> single = armLocal("new scopedlocals.Ajar()");
+        CtLocalVariable<?> accumulated = armLocal("current");
+        CtLocalVariable<?> guarded = armLocal("new scopedlocals.Shut()");
+
+        assertFalse(TransitionResolver.isReassigned(readOf(single).getVariable()),
+                "a local written nowhere is not reassigned because a SIBLING arm's local is");
+        assertFalse(TransitionResolver.isReassigned(readOf(guarded).getVariable()),
+                "nor is the one in the third arm");
+
+        // NEGATIVE CONTROL. This one genuinely is reassigned, and narrowing the
+        // test by identity must not lose that: `next` starts as the root-typed
+        // selector `current`, so a "not reassigned" answer here would resolve its
+        // initializer to a confident, unguarded self-loop and drop the real
+        // `new Wedged()` target. That is finding F1, and it is the error this fix
+        // is one sign away from reintroducing.
+        assertTrue(TransitionResolver.isReassigned(readOf(accumulated).getVariable()),
+                "a local this method really does write must still read as reassigned");
+    }
+
+    @Test
+    void aSingleAssignmentLocalResolvesThroughItsInitializer() {
+        // The consequence at the resolver: the read is resolvable, and it is
+        // resolvable AS a local — the successor-form axis reports how the value
+        // was spelled, so degrading this to the extractor's reaching-definitions
+        // fallback would relabel it CONSTRUCTION and misattribute the form.
+        model = modelOf("examples/scopedlocals");
+        TransitionResolver r = resolverFor("scopedlocals.Gate");
+
+        Candidate c = only(r.resolve(readOf(armLocal("new scopedlocals.Ajar()")), "Shut"));
+        assertTrue(c.resolved());
+        assertEquals("Ajar", c.targetSimpleName());
+        assertEquals(SuccessorForm.LOCAL_VARIABLE, c.form());
+    }
+
+    @Test
+    void aReassignedRootTypedLocalIsNeverResolvedFromItsInitializer() {
+        // The F1 guarantee, restated on this fixture: `Gate next = current;` is
+        // reassigned below, so the resolver must refuse both the initializer rule
+        // and the root-typed-read shortcut and hand back an unresolved candidate.
+        // The extractor's reaching-definitions pass is what recovers the two real
+        // targets; a resolved SELF here would fabricate an edge and hide one.
+        model = modelOf("examples/scopedlocals");
+        TransitionResolver r = resolverFor("scopedlocals.Gate");
+
+        Candidate c = only(r.resolve(readOf(armLocal("current")), "Ajar"));
+        assertFalse(c.resolved(), "a reassigned root-typed local must not resolve to a self-loop");
     }
 }
