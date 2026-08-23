@@ -4,14 +4,18 @@ import io.sealfsm.detect.DispatchCommitDetector.Producer;
 import io.sealfsm.model.CommitForm;
 import org.junit.jupiter.api.Test;
 import spoon.Launcher;
+import spoon.reflect.code.CtAbstractSwitch;
+import spoon.reflect.code.CtIf;
 import spoon.reflect.CtModel;
 import spoon.reflect.declaration.CtType;
+import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -34,6 +38,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * A recognizer that got this wrong would still pass every positive integration
  * test while quietly reporting exhaustive folds as automata.
+ *
+ * <p>The {@code instanceof}-chain cases (F17) are arranged the same way, because
+ * the chain is admitted on exactly the switch's terms. The pairs there differ
+ * only in what the chain produces: an H-typed field write is accepted, a
+ * {@code String} field write over the same discrimination is not, and a write
+ * that nests one H value inside another is vetoed.
  */
 class DispatchCommitDetectorTest {
 
@@ -48,7 +58,9 @@ class DispatchCommitDetectorTest {
     }
 
     private CtType<?> type(CtModel model, String qualifiedName) {
-        CtType<?> t = model.getAllTypes().stream()
+        // getAllTypes() lists only top-level types; a hierarchy declared inside its
+        // driver (examples/cancellation) is reachable only through the elements.
+        CtType<?> t = model.getElements(new TypeFilter<>(CtType.class)).stream()
                 .filter(x -> x.getQualifiedName().equals(qualifiedName))
                 .findFirst().orElse(null);
         assertNotNull(t, "fixture type not found: " + qualifiedName);
@@ -111,8 +123,10 @@ class DispatchCommitDetectorTest {
         // attributable source, inventing an unresolved edge out of plumbing.
         Producer p = producers("examples/http2-stream-gemini", "http2stream.State").get(0);
         assertNotNull(p.dispatch());
-        assertNotNull(p.dispatch().getSelector());
-        assertEquals("http2stream.State", p.dispatch().getSelector().getType().getQualifiedName());
+        assertInstanceOf(CtAbstractSwitch.class, p.dispatch());
+        CtAbstractSwitch<?> sw = (CtAbstractSwitch<?>) p.dispatch();
+        assertNotNull(sw.getSelector());
+        assertEquals("http2stream.State", sw.getSelector().getType().getQualifiedName());
     }
 
     // ---- the precision guard ------------------------------------------------
@@ -134,6 +148,83 @@ class DispatchCommitDetectorTest {
         // recognizers with two notions of "recursive data type" would eventually
         // disagree, and the disagreement would be a false positive.
         assertEquals(List.of(), producers("examples/treebuilder", "treebuilder.Expr"));
+    }
+
+    // ---- F17: the chain is one spelling of the discrimination ---------------
+
+    @Test
+    void anInstanceofChainOverAFieldIsAProducer() {
+        // The shape the finding is about: no switch, and no hierarchy-typed
+        // parameter for the signature recognizer to key on. What makes it a
+        // dispatch is the discrimination plus the commit, and both are present.
+        List<Producer> ps = producers("examples/chaindispatch", "chaindispatch.Relay");
+        assertEquals(1, ps.size());
+        assertEquals(Set.of(CommitForm.FIELD_MUTATION), commits(ps));
+        assertInstanceOf(CtIf.class, ps.get(0).dispatch());
+        assertNotNull(ps.get(0).selector());
+        assertEquals("state", ps.get(0).selector().getSimpleName());
+    }
+
+    @Test
+    void anInstanceofChainCommittedByReturnIsAValueReturnProducer() {
+        List<Producer> ps = producers("examples/chaindispatch", "chaindispatch.Shutter");
+        assertEquals(1, ps.size());
+        assertEquals(Set.of(CommitForm.VALUE_RETURN), commits(ps));
+        assertEquals("current", ps.get(0).selector().getSimpleName());
+    }
+
+    @Test
+    void onlyTheHeadOfAChainIsAProducer() {
+        // Every `else if` is itself a CtIf. Emitting one producer per link would
+        // report the tail of one dispatch as a second dispatch, and the extractor
+        // would walk the same branches once per link.
+        assertEquals(1, producers("examples/chaindispatch", "chaindispatch.Relay").size());
+    }
+
+    @Test
+    void anInstanceofFoldIntoAForeignCodomainIsNotAProducer() {
+        // The instanceof spelling of foreignfold, and the pair for
+        // anInstanceofChainOverAFieldIsAProducer: GlyphNamer discriminates every
+        // permitted subtype and assigns a field, exactly as RelayBoard does. The
+        // declared type of that field is the only difference, and it decides.
+        assertEquals(List.of(), producers("examples/chaindispatch", "chaindispatch.Glyph"));
+    }
+
+    @Test
+    void anInstanceofTreeRewriteIsNotAProducer() {
+        // The instanceof spelling of treebuilder. Unlike treebuilder this
+        // hierarchy declares no methods at all, so neither the compositional veto
+        // nor the distributed recognizer can be what rejects it — the shared
+        // sibling-vs-nested predicate is, and nothing else could be.
+        assertEquals(List.of(), producers("examples/chaindispatch", "chaindispatch.Tree"));
+    }
+
+    @Test
+    void aSingleTypeTestIsACheckNotADispatch() {
+        // RelayBoard.reset() commits an H value under one type test. It is not a
+        // producer, and this is a threshold with a visible price: `Tripped ->
+        // Idle` is a transition the program can make and the tool does not report
+        // it. Discriminating BETWEEN states is what makes a dispatch, and an `if`
+        // is too common a construct to read every committing one as an automaton
+        // — the same argument CarrierTransitionDetector.qualifies already makes
+        // for requiring two producing subtypes.
+        //
+        // Asserted through the producer count: Relay has exactly one producer,
+        // `accept`, so `reset` contributed none.
+        List<Producer> ps = producers("examples/chaindispatch", "chaindispatch.Relay");
+        assertEquals(1, ps.size());
+        assertEquals("accept", ps.get(0).host().getSimpleName());
+    }
+
+    @Test
+    void aChainInsideAFunctionalCallableIsLeftToTheFunctionalWalker() {
+        // examples/cancellation dispatches by instanceof inside an anonymous-class
+        // SAM override, which F7 discovers, attributes a selector and labels with
+        // its enclosing method's name. Claiming it here as well would walk one
+        // body twice — the same ownership rule findCentralizedTransitionMethods
+        // already applies to anonymous-class methods.
+        assertEquals(List.of(), producers("examples/cancellation",
+                "examples.cancellation.CancellationRequests$CancellationState"));
     }
 
     @Test

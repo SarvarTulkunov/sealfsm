@@ -125,6 +125,13 @@ public final class TransitionExtractor {
     private Set<String> stateFieldNames = Set.of();
     private Set<String> mutatorNames = Set.of();
 
+    // The commit form of the dispatch currently being walked, or null outside one.
+    // Only a chain consults it: a switch commits its whole result in one place the
+    // detector already identified, whereas a chain commits inside each branch, so
+    // the walker has to know that an assignment there IS the produced successor
+    // rather than the incidental local write it is everywhere else.
+    private CommitForm dispatchCommit = null;
+
     // F3: bounded inter-procedural resolution. k = 2 keeps the fixed analysis
     // terminating; the stack also detects recursion cycles.
     private static final int MAX_INTERPROC_DEPTH = 2;
@@ -392,7 +399,24 @@ public final class TransitionExtractor {
         // Σ comes from the host's event parameter exactly as for a named
         // transition function, so a nested switch-over-event can label its arms.
         enumerateEventAlphabet(producer.host());
-        walkSwitch(producer.dispatch(), null, null, null, out);
+        if (producer.dispatch() instanceof CtAbstractSwitch<?> sw) {
+            walkSwitch(sw, null, null, null, out);
+        } else if (producer.dispatch() instanceof CtIf head) {
+            // An instanceof chain. The selector is threaded as walk context so the
+            // type tests attribute from-states instead of piling up as guards; at
+            // entry the selector may be on any concrete state, which is the same
+            // closed-world set the permits clause gives.
+            CtVariable<?> savedSelector = this.selector;
+            CommitForm savedCommit = this.dispatchCommit;
+            this.selector = producer.selector();
+            this.dispatchCommit = producer.commit();
+            try {
+                walkTypeChain(head, concreteStateSimpleNames, null, null, out);
+            } finally {
+                this.selector = savedSelector;
+                this.dispatchCommit = savedCommit;
+            }
+        }
     }
 
     /** Declaring type + signature: unique across the model, unlike a bare signature. */
@@ -407,17 +431,30 @@ public final class TransitionExtractor {
         // (and register the event type so a nested switch-over-event can label
         // each arm). Done before the walk so walkSwitch sees eventQualifiedNames.
         enumerateEventAlphabet(method);
-        if (!containsStateDispatchSwitch(method)) {
-            // No switch we could attribute from-states to. Walk anyway so produced
-            // targets remain visible (recorded with an undetermined origin), and
-            // flag for manual review.
-            diagnostics.add("centralized method '" + method.getSignature()
-                    + "' has no recognised switch over the state type; "
-                    + "from-states could not be attributed");
+        // The hierarchy-typed parameter this function dispatches on. Threading it
+        // as the walk's selector is what lets an `if (current instanceof Closed)`
+        // body attribute from-states: the signature recognizer finds such a method
+        // perfectly well, and before this its every type test was read as a data
+        // guard, so a fully recognised machine still reported `<unknown> -> ?`
+        // for each of its edges. A switch-dispatched body sets no type test on the
+        // selector, so nothing changes for one.
+        CtVariable<?> saved = this.selector;
+        this.selector = selectorParameter(method.getParameters());
+        try {
+            if (!containsStateDispatch(method)) {
+                // Nothing we could attribute from-states to. Walk anyway so
+                // produced targets remain visible (recorded with an undetermined
+                // origin), and flag for manual review.
+                diagnostics.add("centralized method '" + method.getSignature()
+                        + "' has no recognised switch or instanceof chain over the "
+                        + "state type; from-states could not be attributed");
+            }
+            // from starts unknown and is set per matched state-pattern case or
+            // type test; the event label is null until an arm names it (F4).
+            walk(method.getBody(), null, null, null, out);
+        } finally {
+            this.selector = saved;
         }
-        // from starts unknown and is set per matched state-pattern case; the event
-        // label is null until a switch-over-event arm names it (F4).
-        walk(method.getBody(), null, null, null, out);
     }
 
     /**
@@ -1472,9 +1509,20 @@ public final class TransitionExtractor {
         if (node instanceof CtBlock<?> block) {
             walkBlock(block, from, event, guard, out);
         } else if (node instanceof CtIf ctIf) {
-            String cond = safeText(ctIf.getCondition());
-            walk(ctIf.getThenStatement(), from, event, merge(guard, cond), out);
-            walk(ctIf.getElseStatement(), from, event, merge(guard, negate(cond)), out);
+            // A chain of type tests over the dispatch selector is a state
+            // discrimination, not a condition: `if (s instanceof Closed)` selects
+            // the from-state exactly the way `case Closed c ->` does, and reading
+            // it as a guard both loses the source state and decorates every edge
+            // with a predicate that is really the arm label. Handled as a unit so
+            // the else branch knows which states are left.
+            DispatchCommitDetector.TypeChain chain = typeChainAt(ctIf);
+            if (chain != null) {
+                walkTypeChain(ctIf, candidateStates(from), event, guard, out);
+            } else {
+                String cond = safeText(ctIf.getCondition());
+                walk(ctIf.getThenStatement(), from, event, merge(guard, cond), out);
+                walk(ctIf.getElseStatement(), from, event, merge(guard, negate(cond)), out);
+            }
         } else if (node instanceof CtSwitch<?> sw) {
             walkSwitch(sw, from, event, guard, out);
         } else if (node instanceof CtReturn<?> ret) {
@@ -1486,7 +1534,18 @@ public final class TransitionExtractor {
             // is the next-state expression (`this.state = new Locked();`). A bare
             // assignment to any other variable is a local mutation — read directly
             // by the F1 reaching-definitions pass — and not a produced value here.
-            if (mutationMode && isStateFieldWrite(asg.getAssigned())) {
+            //
+            // The second clause is the chain form of the same site. A dispatch the
+            // detector accepted BECAUSE it writes an H-typed field commits once per
+            // branch, so inside such a dispatch the write is the successor. It is
+            // restricted to FIELD_MUTATION deliberately: a local accumulator is
+            // read back later in the same body, and the reaching-definitions pass
+            // (F1) resolves it there — honouring the write as well would report
+            // that one successor twice.
+            if ((mutationMode && isStateFieldWrite(asg.getAssigned()))
+                    || (dispatchCommit == CommitForm.FIELD_MUTATION
+                        && DispatchCommitDetector.isCommitTarget(asg.getAssigned(),
+                                                                 hierarchyQualifiedNames))) {
                 handleValue(asg.getAssignment(), from, event, guard, out);
             }
         } else if (node instanceof CtInvocation<?> inv && mutationMode && isMutatorCall(inv)) {
@@ -1574,8 +1633,37 @@ public final class TransitionExtractor {
     private void walkBlock(CtBlock<?> block, String from, String event,
                            String guard, Set<Transition> out) {
         String acc = guard;
+        String accFrom = from;
         for (CtStatement st : block.getStatements()) {
-            walk(st, from, event, acc, out);
+            DispatchCommitDetector.TypeChain chain =
+                    st instanceof CtIf ctIf ? typeChainAt(ctIf) : null;
+            if (chain != null && chain.otherwise() == null && chainLinksAllTerminate(chain)) {
+                // A closed type-test chain narrows what follows it. `if (s
+                // instanceof Shut) {...} else if (s instanceof Ajar) {...}` whose
+                // links all return leaves exactly the untested states reaching the
+                // next statement, so a trailing `return s;` is a self-loop on
+                // those — not the `<unknown>` origin a single from-state forces.
+                // The same closed-world reasoning as the permits clause: the
+                // selector is one of the permitted subtypes or none of them.
+                walk(st, accFrom, event, acc, out);
+                Map<String, String> residual = chainResidual(chain, candidateStates(accFrom));
+                if (residual.isEmpty()) {
+                    // Every state was tested and every branch left the method:
+                    // nothing that follows is reachable in any state.
+                    break;
+                }
+                if (residual.size() == 1 && residual.values().iterator().next() == null) {
+                    accFrom = residual.keySet().iterator().next();
+                    continue;
+                }
+                // Several states can still reach the rest of the block. Walking it
+                // once per state emits the one edge each of them really has; a
+                // single merged walk would have to call the origin unknown.
+                walkResidual(block, block.getStatements().indexOf(st) + 1,
+                        residual, event, acc, out);
+                return;
+            }
+            walk(st, accFrom, event, acc, out);
             if (st instanceof CtIf ctIf
                     && ctIf.getElseStatement() == null
                     && alwaysTerminates(ctIf.getThenStatement())) {
@@ -1584,6 +1672,154 @@ public final class TransitionExtractor {
                 break; // remaining statements are unreachable
             }
         }
+    }
+
+    /** Walk a block's tail once per state the preceding chain left possible. */
+    private void walkResidual(CtBlock<?> block, int firstIndex, Map<String, String> residual,
+                              String event, String guard, Set<Transition> out) {
+        List<CtStatement> tail = block.getStatements().subList(firstIndex, block.getStatements().size());
+        for (Map.Entry<String, String> e : residual.entrySet()) {
+            String stateGuard = merge(guard, e.getValue());
+            String acc = stateGuard;
+            for (CtStatement st : tail) {
+                walk(st, e.getKey(), event, acc, out);
+                if (st instanceof CtIf ctIf
+                        && ctIf.getElseStatement() == null
+                        && alwaysTerminates(ctIf.getThenStatement())) {
+                    acc = merge(acc, negate(safeText(ctIf.getCondition())));
+                } else if (alwaysTerminates(st)) {
+                    break;
+                }
+            }
+        }
+    }
+
+    // ---- instanceof-chain dispatch -------------------------------------------
+
+    /**
+     * The chain headed by this {@code if}, or {@code null} when it is not one.
+     * Decomposition is the detector's, not a second copy of it: a recognizer and
+     * an extractor that each decide for themselves what a chain is would
+     * eventually disagree, and the disagreement would be an edge attributed to a
+     * state the classifier never admitted. Answered only while a selector is in
+     * scope — outside a dispatch there is no value whose type tests mean this.
+     */
+    private DispatchCommitDetector.TypeChain typeChainAt(CtIf ctIf) {
+        if (selector == null) return null;
+        DispatchCommitDetector.TypeChain chain =
+                DispatchCommitDetector.chainOf(ctIf, hierarchyQualifiedNames, rootQualifiedName);
+        return chain != null && isSelectorVariable(chain.selector()) ? chain : null;
+    }
+
+    /** True when the chain discriminates the variable this walk is dispatching on. */
+    private boolean isSelectorVariable(CtVariable<?> v) {
+        if (selector == null || v == null) return false;
+        return v == selector || selector.getSimpleName().equals(v.getSimpleName());
+    }
+
+    /**
+     * The states the selector could be on entry to a fragment: the one already
+     * attributed, or — when none is — every concrete state, which is exact
+     * because the permits clause is.
+     */
+    private Set<String> candidateStates(String from) {
+        return from == null ? concreteStateSimpleNames : Set.of(from);
+    }
+
+    /**
+     * Walk an {@code instanceof} chain as a dispatch: each link's branch under the
+     * state it tests for, and the final {@code else} under each state no link
+     * claimed.
+     *
+     * <p>The type test itself is never recorded as a guard — it is the arm label,
+     * and repeating it as a predicate would say the edge is conditional when it is
+     * unconditional in that state. Whatever else the link's condition tests still
+     * counts, and is split into an event label and a guard by the same rule the
+     * carrier walk uses, so {@code if (s instanceof Shut && e == OPEN)} yields
+     * {@code Shut --OPEN--> ...} rather than one edge labelled with a predicate.
+     */
+    private void walkTypeChain(CtIf head, Set<String> candidates, String event,
+                               String guard, Set<Transition> out) {
+        DispatchCommitDetector.TypeChain chain = typeChainAt(head);
+        if (chain == null) return;
+        for (DispatchCommitDetector.ChainLink link : chain.links()) {
+            String from = stateId(link.type());
+            if (!candidates.contains(from)) continue;   // unreachable test, no edge
+            // The arm matched this state, so anything it fails to produce is an
+            // absence the analysis observed rather than one it missed.
+            dispatchedStates.add(from);
+            EventCond ec = splitConjuncts(link.extra());
+            String linkGuard = merge(guard, ec.residual());
+            if (ec.symbols().isEmpty()) {
+                walk(link.branch(), from, event, linkGuard, out);
+            } else {
+                for (String sym : ec.symbols()) {
+                    walk(link.branch(), from, sym, linkGuard, out);
+                }
+            }
+        }
+        if (chain.otherwise() == null) return;
+        // Not flagged as an `otherwise` edge, though it is the chain's default
+        // branch: walkSwitch does not flag a `default` arm either, and a rule that
+        // held for one spelling of the default and not the other would put the
+        // difference between two idioms into the model. Extending the flag to the
+        // centralized walk is one change covering both.
+        for (Map.Entry<String, String> e : chainResidual(chain, candidates).entrySet()) {
+            dispatchedStates.add(e.getKey());
+            walk(chain.otherwise(), e.getKey(), event, merge(guard, e.getValue()), out);
+        }
+    }
+
+    /**
+     * Which states can still be current once every link's test has failed, and
+     * under what guard.
+     *
+     * <p>A link testing {@code s instanceof T} with nothing else removes T
+     * outright. A link testing {@code s instanceof T && extra} does not: its
+     * branch is skipped whenever {@code extra} is false, so T is still reachable
+     * below — under {@code !extra}. Dropping T there would delete a real edge;
+     * keeping it without the negation would report it as unconditional.
+     */
+    private Map<String, String> chainResidual(DispatchCommitDetector.TypeChain chain,
+                                              Set<String> candidates) {
+        Map<String, String> residual = new LinkedHashMap<>();
+        for (String c : candidates) residual.put(c, null);
+        for (DispatchCommitDetector.ChainLink link : chain.links()) {
+            String id = stateId(link.type());
+            if (!residual.containsKey(id)) continue;
+            if (link.extra().isEmpty()) {
+                residual.remove(id);
+            } else {
+                // The negation is of the source condition, not of the Σ symbols it
+                // split into: a symbol is an edge LABEL and is not an expression,
+                // so negating it would put `!(LOWER)` in a DOT label and an SCXML
+                // `cond` attribute, where a predicate is expected.
+                String taken = null;
+                for (CtExpression<?> c : link.extra()) taken = merge(taken, safeText(c));
+                residual.put(id, merge(residual.get(id), negate(taken)));
+            }
+        }
+        return residual;
+    }
+
+    /** Do all of a chain's link branches leave the method, so the chain has a residual? */
+    private static boolean chainLinksAllTerminate(DispatchCommitDetector.TypeChain chain) {
+        for (DispatchCommitDetector.ChainLink link : chain.links()) {
+            if (link.branch() == null || !alwaysTerminates(link.branch())) return false;
+        }
+        return !chain.links().isEmpty();
+    }
+
+    /** Split a link's remaining conjuncts into Σ symbols and a residual data guard. */
+    private EventCond splitConjuncts(List<CtExpression<?>> conjuncts) {
+        Set<String> symbols = new LinkedHashSet<>();
+        String residual = null;
+        for (CtExpression<?> c : conjuncts) {
+            EventCond ec = splitEventCondition(c);
+            symbols.addAll(ec.symbols());
+            residual = merge(residual, ec.residual());
+        }
+        return new EventCond(symbols, residual);
     }
 
     /**
@@ -2132,12 +2368,21 @@ public final class TransitionExtractor {
 
     // ---- Spoon-version-sensitive accessors (all guarded) ---------------------
 
-    private boolean containsStateDispatchSwitch(CtMethod<?> method) {
+    /**
+     * Does this method discriminate the state anywhere — by a switch over the
+     * hierarchy, or by a chain of type tests on the selector? Both are dispatch;
+     * only asking about the switch made a perfectly well attributed chain report
+     * the "from-states could not be attributed" diagnostic.
+     */
+    private boolean containsStateDispatch(CtMethod<?> method) {
         for (CtSwitch<?> sw : method.getElements(new TypeFilter<>(CtSwitch.class))) {
             if (isStateDispatch(sw)) return true;
         }
         for (CtSwitchExpression<?, ?> sw : method.getElements(new TypeFilter<>(CtSwitchExpression.class))) {
             if (isStateDispatch(sw)) return true;
+        }
+        for (CtIf ctIf : method.getElements(new TypeFilter<>(CtIf.class))) {
+            if (typeChainAt(ctIf) != null) return true;
         }
         return false;
     }

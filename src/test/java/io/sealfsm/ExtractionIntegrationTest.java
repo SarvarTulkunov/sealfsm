@@ -1852,6 +1852,133 @@ class ExtractionIntegrationTest {
         assertEquals(StateMachine.Encoding.POLYMORPHIC, onItsOwn.encoding());
     }
 
+    // ---- F17: instanceof-chain dispatch in a named method -------------------
+
+    /**
+     * The shape the finding is about: a field selector, no hierarchy-typed
+     * parameter, no switch. Every recognizer was blind to it, so the whole
+     * hierarchy was reported as "no transition producer found" — a false negative
+     * on what is the dominant dispatch idiom in Java written before pattern
+     * matching.
+     */
+    @Test
+    void instanceofChainOverAFieldIsAMachine() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/chaindispatch"));
+        StateMachine m = named(r, "Relay");
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of("Idle", "Live", "Tripped"), stateIds(m));
+        assertTrue(m.commitForms().contains(CommitForm.FIELD_MUTATION));
+
+        assertTrue(hasResolved(m, "Idle", "Live"), "Idle -> Live");
+        assertTrue(hasResolved(m, "Live", "Idle"), "Live -> Idle");
+        assertTrue(hasResolved(m, "Live", "Tripped"), "Live -> Tripped");
+        assertTrue(hasResolved(m, "Tripped", "Idle"), "Tripped -> Idle");
+        assertEquals(0, m.unresolvedTransitionCount());
+        assertEquals("Idle", m.initialState().orElse(null));
+    }
+
+    /**
+     * The type test is the arm LABEL, not a guard. Recording it as a guard is how
+     * the second half of the finding presented: the hierarchy-in / hierarchy-out
+     * host was recognised all along, and every one of its edges still came out
+     * with an undetermined source and an unresolvable target.
+     */
+    @Test
+    void aTypeTestSelectsTheFromStateRatherThanGuardingTheEdge() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/chaindispatch"));
+        StateMachine m = named(r, "Shutter");
+
+        assertEquals(0, m.unresolvedTransitionCount());
+        assertTrue(m.transitions().stream().noneMatch(
+                        t -> t.from().equals("<unknown>") || t.from().equals("<entry>")),
+                "no edge may be left with an undetermined source");
+        assertTrue(m.transitions().stream().noneMatch(
+                        t -> t.guard() != null && t.guard().contains("instanceof")),
+                "the type test is consumed as the from-state, never re-reported as a guard");
+
+        // A conjoined event test still splits into a Σ label.
+        assertTrue(hasEventEdge(m, "Open", "LOWER", "Closing"), "Open --LOWER--> Closing");
+        assertTrue(m.alphabet().containsAll(Set.of("LOWER", "SEAL", "RAISE")));
+    }
+
+    /**
+     * Because every link returns, {@code return current;} below the chain is
+     * reached exactly in the states no link claimed — the same closed-world
+     * reasoning the permits clause licenses. The {@code Open} link carries an
+     * extra condition, so {@code Open} is still reachable there and keeps its edge
+     * <em>under the negation</em>; {@code Closing}, tested with nothing else, is
+     * genuinely gone. Getting either direction wrong is silent: one deletes a real
+     * edge, the other reports a conditional edge as unconditional.
+     */
+    @Test
+    void aClosedChainLeavesTheUntestedStatesToTheStatementBelowIt() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/chaindispatch"));
+        StateMachine m = named(r, "Shutter");
+
+        assertTrue(hasResolved(m, "Shut", "Shut"), "Shut was never tested: it reaches the tail");
+        Transition openLoop = m.transitions().stream()
+                .filter(t -> t.from().equals("Open") && "Open".equals(t.to()))
+                .findFirst().orElseThrow(() ->
+                        new AssertionError("Open stays Open unless the command is LOWER"));
+        assertNotNull(openLoop.guard(), "that edge is conditional and must say so");
+        assertTrue(openLoop.guard().contains("LOWER"));
+        assertEquals(5, m.transitions().size());
+    }
+
+    /**
+     * NEGATIVE CONTROL, codomain: the same discrimination folding into a
+     * {@code String} field is not a machine. It sits in the same package as a
+     * field-mutation machine that IS one, so what separates them is the declared
+     * type of the field written and nothing else.
+     */
+    @Test
+    void anInstanceofFoldIntoAForeignCodomainIsNotAMachine() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/chaindispatch"));
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Glyph")));
+    }
+
+    /**
+     * NEGATIVE CONTROL, composition: a rewrite that nests one hierarchy value
+     * inside another is a recursive data type. Unlike {@code examples/treebuilder}
+     * this hierarchy declares no methods, so neither the compositional veto nor
+     * the distributed recognizer can be what rejects it.
+     */
+    @Test
+    void anInstanceofTreeRewriteIsNotAMachine() {
+        CtModel model = modelOf("examples/chaindispatch");
+        ExtractionResult r = new Analyzer().analyze(model);
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Tree")));
+
+        // The control bites only if nothing ELSE was already rejecting it.
+        CtType<?> tree = model.getAllTypes().stream()
+                .filter(t -> t.getQualifiedName().equals("chaindispatch.Tree"))
+                .findFirst().orElseThrow();
+        assertFalse(io.sealfsm.detect.CarrierTransitionDetector.composesItself(tree),
+                "if the compositional veto fired, this would not be testing the chain guard");
+        assertEquals(List.of(),
+                StateMachineClassifier.findDistributedTransitionMethods(tree),
+                "if the distributed recognizer had claimed it, the rejection would prove nothing");
+    }
+
+    /**
+     * Two chains in one model must produce exactly the edges they produce alone.
+     * The field-mutation path is the fragile one — {@code RelayBoard} and
+     * {@code GlyphNamer} and {@code TreeFolder} all write a field in an
+     * instanceof branch — so the commit test has to key on the declared TYPE.
+     */
+    @Test
+    void chainMachinesDoNotAbsorbEachOthersAssignments() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/chaindispatch"));
+        assertEquals(2, r.machines().size());
+        for (StateMachine m : r.machines()) {
+            for (Transition t : m.transitions()) {
+                assertTrue(stateIds(m).contains(t.from()),
+                        m.name() + " sourced an edge at " + t.from() + ", which is not its state");
+            }
+        }
+    }
+
     /**
      * The withholding is only lifted by an ABSTENTION, so an accepted parent keeps
      * its nested sealed hierarchies as composite states — the existing behaviour,
