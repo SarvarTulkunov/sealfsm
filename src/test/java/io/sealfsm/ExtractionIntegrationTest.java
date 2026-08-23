@@ -1373,4 +1373,88 @@ class ExtractionIntegrationTest {
                         CommitForm.LOCAL_ACCUMULATOR, CommitForm.POLY_CARRIER), commits,
                 "the corpus must exercise every commit form");
     }
+
+    // ---- name collisions: two states sharing a simple name --------------------
+
+    /**
+     * A {@code permits} clause may legally name two types with the same simple
+     * name, so the simple name is not an identity. Keyed on it, the two
+     * {@code Idle} states of {@code examples/namecollision} become one node and
+     * the two {@code UPGRADE} edges between them become the same
+     * {@code (from, to, event, guard, resolved)} tuple — at which point the
+     * extractor's transition set discards one and reports a clean 11/11. A
+     * transition lost with no unresolved marker is the one failure mode the
+     * record-everything invariant exists to prevent, so the count is the
+     * assertion that matters here.
+     */
+    @Test
+    void statesSharingASimpleNameStayDistinct() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/namecollision"));
+        StateMachine m = single(r);
+
+        // Enumeration is exact either way — the collision costs edges, not states.
+        assertEquals(8, m.allStates().size(), "4 permitted subtypes + 4 enum constants");
+
+        // Every state must be separately addressable; a duplicate id here is the
+        // bug itself, and StateMachine reports it for exactly that reason.
+        assertEquals(Set.of(), m.duplicateStateIds(), "no two states may share an id");
+        assertEquals(8, stateIds(m).size(), "8 states must yield 8 distinct ids");
+
+        // Uncollided states keep their bare simple name; only the collided ones
+        // lengthen, and only as far as they must to become unique.
+        assertTrue(stateIds(m).containsAll(
+                        Set.of("namecollision.Idle", "Legacy.Idle", "Phase.IDLE", "Mode.IDLE",
+                                "ACTIVE", "BULK", "Phase", "Mode")),
+                "ids were " + stateIds(m));
+
+        // The two edges the collision used to merge. Under simple-name ids both
+        // read (Idle, Idle, UPGRADE) and one was silently dropped.
+        assertEquals(12, m.transitions().size(), "12 arms, none merged away");
+        assertEquals(12, m.resolvedTransitionCount());
+        assertTrue(hasEventEdge(m, "namecollision.Idle", "UPGRADE", "Legacy.Idle"));
+        assertTrue(hasEventEdge(m, "Legacy.Idle", "UPGRADE", "namecollision.Idle"));
+
+        // ...and the same one level down, where two permitted enums both declare
+        // IDLE. These targets are reached from different sources, so they survived
+        // deduplication even before the fix — but both pointed at the same node.
+        assertTrue(hasEventEdge(m, "namecollision.Idle", "RESET", "Mode.IDLE"));
+        assertTrue(hasEventEdge(m, "Legacy.Idle", "OPEN", "Phase.IDLE"));
+
+        // The initial-state rules must speak the same ids as the states, or the
+        // machine would declare an initial state that no state matches.
+        assertEquals("namecollision.Idle", m.initialState().orElse(null));
+        assertTrue(m.allStates().stream()
+                        .filter(State::isInitial)
+                        .allMatch(st -> st.id().equals("namecollision.Idle")),
+                "exactly the disambiguated state may be flagged initial");
+    }
+
+    /**
+     * Every endpoint an edge names must be a state that exists. This is what a
+     * disambiguation applied only to state ids — and not to the transition
+     * endpoints produced alongside them — would break: the states would separate
+     * correctly while every edge went on naming the old ambiguous spelling, which
+     * DOT would silently render as a phantom node.
+     */
+    @Test
+    void everyEdgeEndpointNamesADeclaredState() {
+        for (String fixture : List.of("examples/namecollision", "examples/valueforms",
+                "examples/lcp_automation", "examples/tcp")) {
+            ExtractionResult r = new Analyzer().analyze(modelOf(fixture));
+            for (StateMachine m : r.machines()) {
+                Set<String> ids = stateIds(m);
+                for (Transition t : m.transitions()) {
+                    // Pseudo-states are deliberately not states; everything else is.
+                    if (!t.from().startsWith("<")) {
+                        assertTrue(ids.contains(t.from()),
+                                fixture + ": edge source '" + t.from() + "' is not a state");
+                    }
+                    if (t.isResolved() && t.to() != null && !t.to().startsWith("<")) {
+                        assertTrue(ids.contains(t.to()),
+                                fixture + ": edge target '" + t.to() + "' is not a state");
+                    }
+                }
+            }
+        }
+    }
 }

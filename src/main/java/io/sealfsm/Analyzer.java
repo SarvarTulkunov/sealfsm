@@ -11,6 +11,7 @@ import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.ExtractionResult;
 import io.sealfsm.model.State;
 import io.sealfsm.model.StateMachine;
+import io.sealfsm.model.StateNaming;
 import io.sealfsm.model.Transition;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.CtConstructorCall;
@@ -57,12 +58,30 @@ public final class Analyzer {
             StateMachine machine =
                     new StateMachine(root.getSimpleName(), root.getQualifiedName(), c.encoding());
 
-            for (State s : stateExtractor.extractStates(root)) {
+            // States and the ids naming them are produced together: two permitted
+            // subtypes may legally share a simple name, so ids can only be assigned
+            // once the complete state set is known. The same naming then governs
+            // every transition endpoint, so an edge cannot name a state that does
+            // not exist — or, worse, silently merge with an edge between two other
+            // states because both endpoints collapsed to one spelling.
+            StateExtractor.Result states = stateExtractor.extract(root);
+            for (State s : states.topLevelStates()) {
                 machine.addTopLevelState(s);
+            }
+            for (String dup : machine.duplicateStateIds()) {
+                result.warn(root.getQualifiedName(),
+                        "two states share the id '" + dup + "' — their edges will be "
+                                + "indistinguishable in the output");
+            }
+            if (states.naming().hasCollisions()) {
+                result.info(root.getQualifiedName(),
+                        "disambiguated state name(s) " + states.naming().collidingSimpleNames()
+                                + " — the permits clause names distinct types sharing a simple name");
             }
 
             Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
-            TransitionExtractor te = new TransitionExtractor(hierarchy, root.getQualifiedName());
+            TransitionExtractor te =
+                    new TransitionExtractor(hierarchy, root.getQualifiedName(), states.naming());
             for (Transition t : te.extract(root, model)) {
                 machine.addTransition(t);
             }
@@ -94,7 +113,7 @@ public final class Analyzer {
             }
 
             initialStateEvidence = null;
-            detectInitialState(root, machine, model)
+            detectInitialState(root, machine, model, states.naming())
                     .ifPresentOrElse(
                             init -> {
                                 machine.setInitialState(init);
@@ -143,7 +162,8 @@ public final class Analyzer {
      * whereas a wrong one is a fabricated claim, and unanimity is what keeps the
      * rule from guessing between rival candidates.
      */
-    private Optional<String> detectInitialState(CtType<?> root, StateMachine machine, CtModel model) {
+    private Optional<String> detectInitialState(CtType<?> root, StateMachine machine,
+                                                CtModel model, StateNaming naming) {
         Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
 
         // F7: a callable that produces a state on the machine-entry residual has
@@ -161,7 +181,7 @@ public final class Analyzer {
             if (field.getDefaultExpression() instanceof CtConstructorCall<?> cc) {
                 CtTypeReference<?> init = cc.getType();
                 if (init != null && hierarchy.contains(init.getQualifiedName())) {
-                    return Optional.of(init.getSimpleName());
+                    return Optional.of(naming.idFor(init.getQualifiedName()));
                 }
             }
         }
@@ -190,7 +210,7 @@ public final class Analyzer {
             if (local.getDefaultExpression() instanceof CtConstructorCall<?> cc) {
                 CtTypeReference<?> init = cc.getType();
                 if (init != null && hierarchy.contains(init.getQualifiedName())) {
-                    seeded.add(init.getSimpleName());
+                    seeded.add(naming.idFor(init.getQualifiedName()));
                 }
             }
         }

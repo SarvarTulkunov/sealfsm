@@ -1,5 +1,29 @@
 # CLAUDE.md — SealFSM project context for Claude Code
 
+# Development Guidelines
+
+Act as a **Senior Advisor**, not just an implementation assistant.
+
+Before changing code, first critically evaluate whether a change is actually necessary. Challenge assumptions, identify weaknesses, and recommend improvements when appropriate.
+
+## Project Goal
+
+This project is a **Master’s thesis and research-quality open-source project**. The algorithm should reliably detect FSMs in **real-world Java projects**, not just match specific examples.
+
+Prioritize:
+
+* Generality over example-specific solutions.
+* Semantic and structural patterns over hard-coded names or syntax.
+* Correctness, robustness, and maintainability.
+* Low false positives and false negatives.
+* Solutions that generalize across different Java coding styles and architectures.
+
+When a new example fails, **do not immediately add a special case**. First determine what general limitation it reveals and whether the underlying algorithm or abstraction should be improved.
+
+Before implementing a change, consider its impact on existing cases, scalability, and research validity.
+
+The goal is to build a **general-purpose, professional FSM detection algorithm**, not an algorithm optimized to pass individual examples.
+
 ## What this project is
 
 SealFSM is a Java 21 static-analysis tool that extracts finite state machines from sealed class hierarchies. It is the implementation component of a master's thesis titled "Automated Extraction of Finite State Machines from Sealed Class Hierarchies in Modern Java: A Static Analysis Approach."
@@ -95,6 +119,7 @@ src/main/java/io/sealfsm/
 │   └── TransitionResolver.java        # expression → target state(s) data-flow
 ├── model/
 │   ├── State.java                     # state IR (id, qualifiedName, composite, initial, terminal, children)
+│   ├── StateNaming.java               # qualifiedName → id; disambiguates colliding simple names
 │   ├── Transition.java                # transition IR (from, to, event, guard, resolved, note)
 │   ├── StateMachine.java              # aggregate (states, transitions, encoding, alphabet)
 │   ├── SuccessorForm.java             # axis 2: how the successor is SPELLED
@@ -128,6 +153,7 @@ src/main/java/io/sealfsm/
 - `examples/plumbing/` — **F10 FIXTURE**: sealed `Conveyor permits Stopped, Running, Jammed`, dispatched twice (VALUE_RETURN and FIELD_MUTATION) with each host buried in the bookkeeping real code contains — a `requireNonNull` prelude, an in-model `identity(current)` call, an audit call, a log line, a counter bump. None installs a successor, so none may be an edge. 3 states, 6/6. The sharpest statement is `identity(current)`: in-model, hierarchy-typed and trivially summarisable, so F3 *would* fold it to a self-loop — only its statement position rules it out, which is why a hierarchy-type guard alone is not the rule.
 - `examples/plumbing-mutation/` — **NEGATIVE CONTROL for F10**: `@Fsm`-marked sealed `Hopper permits Empty, Filling, Full`, committed only through `ctx.setState(...)` — an expression statement that IS the commit. Separate hierarchy because the F2 path runs only as a fallback; beside a VALUE_RETURN machine it never executes and the control would assert nothing. `drive` uses **arrow** arms of a switch *statement* and `pump` **colon** arms, encoding deliberately DISJOINT relations so the two spellings stay separately attributable. 3 states, 6/6. It reports 3 nondeterminism warnings **by design**: mutation-encoding event labelling is future work, so both hosts' edges are eventless and `Empty` really does have two indistinguishable successors *as extracted*. That is an honest reading of what was recovered, not a defect.
 - `examples/foreignfold/` — NEGATIVE CONTROL for the widened centralized recognizer: sealed `Mode permits Fast, Slow, Stopped`, a driver holding a `Mode` field, and exhaustive switches over it in **both** accepted commit positions (`return switch` and field assignment) — but folding into `String`/`int`. Must be REJECTED by the commit requirement. Accepting it would report an automaton whose every state has zero transitions.
+- `examples/namecollision/` — **NAME-COLLISION FIXTURE**: sealed `Link permits Idle, Legacy.Idle, Phase, Mode`, holding both legal ways two states end up with the same simple name. `Idle` and `Legacy.Idle` are a top-level type beside a nested one — legal even outside a named module, since `permits` only requires the same *package* there and `Legacy` is in it; a cross-package pair (`a.Foo`/`b.Foo`) is the other spelling and is legal inside a named module. `Phase` and `Mode` are two permitted enums that both declare `IDLE`, and since a permitted enum contributes its constants as child states, those are two distinct states spelled identically — the likelier shape by far, because nothing discourages reusing `IDLE`/`ERROR`/`NONE`. 8 states, 12/12. Keyed on simple names it reports **11/11**: the two `UPGRADE` arms encode `Idle → Legacy.Idle` and `Legacy.Idle → Idle`, which collapse to the same `(from, to, event, guard, resolved)` tuple, and the extractor's transition `LinkedHashSet` discards one. A real transition dropped with **no unresolved marker**, behind a clean-looking `n/n` — the one outcome the record-everything invariant forbids. Graphviz hides the rest: node ids are global, so a state declared inside two clusters silently becomes one node in the first, with no warning, and the SCXML emits duplicate `id`s.
 
 Reference output in `sample-output/` — diff after building to verify.
 
@@ -138,9 +164,21 @@ Reference output in `sample-output/` — diff after building to verify.
 - `detect/CarrierTransitionDetectorTest` — carrier recognition, the sibling-vs-nested guard (accept tcp / reject treebuilder), self-loops
 - `detect/DispatchCommitDetectorTest` — the commit classification, as near-identical pairs differing only in codomain (accept `state = switch(state)` / reject `label = switch(state)`)
 - `extract/TransitionResolverTest` — the successor sub-procedure, expression shape by expression shape
+- `model/StateNamingTest` — the id-assignment rule, on qualified names directly (no Spoon): collision-free names untouched, nested/cross-package/enum-constant collisions separated, ids always distinct
 - `ExtractionIntegrationTest` — full Spoon extraction over every example
 
 ## Key implementation details
+
+### StateNaming (model/StateNaming.java)
+The single mapping from a state's qualified name to the **id** that names it everywhere downstream — DOT node ids, SCXML `id`/`target`, and both endpoints of every `Transition`.
+
+An id used to be the bare simple name, which is **not** an identity: a `permits` clause may legally name two types sharing one (a nested type beside a top-level one in the same package; two types in different packages inside a named module; two permitted enums declaring the same constant). The consequence was not cosmetic. Two distinct edges between two distinct states became the same `(from, to, event, guard, resolved)` tuple, and the extractor's transition `LinkedHashSet` discarded one — a transition dropped with **no unresolved marker**, reported as a clean `n/n`. `examples/namecollision` is the fixture; it reports 11/11 without this and 12/12 with it.
+
+- **The rule**: an id is the *shortest dot-separated suffix of the qualified name that is unique* among the machine's states. Uncollided states therefore keep their bare simple name, so existing output is byte-identical and only collided states lengthen: `namecollision.Idle` / `Legacy.Idle`, `a.Foo` / `b.Foo`, `Phase.IDLE` / `Mode.IDLE`. A package prefix alone is NOT the rule — the first pair shares a package, and the nest path is what separates them.
+- Qualified names are **canonicalised** (`$` → `.`) before anything else. Spoon spells a nested type `Owner$Nested`, so splitting on `.` alone reads that whole tail as the simple name: every nested state in the corpus gets renamed and no nested collision is ever detected. This was found by the test suite, not by inspection.
+- The naming must be built **once** and consulted by *every* producer of a state name — `StateExtractor`, `TransitionExtractor` (from-states, `dispatchedStates`), `TransitionResolver` (targets) and `Analyzer` (initial state). Disambiguating ids after the fact cannot work: by then an endpoint reads `"Idle"` and the information that would tell the two apart is gone. This is why `StateExtractor.extract` returns the naming alongside the states rather than letting callers rebuild it — a second construction of the "same" mapping is exactly how the two halves would drift.
+- `StateMachine.duplicateStateIds()` is the drift check, reported by `Analyzer` as a WARN. It should always be empty; it exists because the assignment and the extractor are separate code, and a disagreement between them would otherwise be invisible in the output. A diagnostic, not a throw — a wrong diagram on someone's repository is bad, a crash is worse.
+- Only STATE names go through it. `TransitionExtractor` derives event symbols, field names and variable names with `getSimpleName()` too, and those must stay untouched.
 
 ### SpoonCompat (detect/SpoonCompat.java)
 All version-sensitive Spoon calls live here. `isSealed()` checks `ModifierKind.SEALED` with try/catch fallback. `permittedTypes()` uses reflection for `getPermittedTypes()` with a fallback that scans the model for direct subtypes (handles implicit permits).

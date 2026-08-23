@@ -6,6 +6,7 @@ import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.StateMachine;
+import io.sealfsm.model.StateNaming;
 import io.sealfsm.model.Transition;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.BinaryOperatorKind;
@@ -181,11 +182,35 @@ public final class TransitionExtractor {
     // recovered, and calling that terminal would dress a recall gap as a result.
     private final Set<CommitForm> commitForms = new LinkedHashSet<>();
     private final Set<String> dispatchedStates = new LinkedHashSet<>();
+    private final StateNaming naming;
 
     public TransitionExtractor(Set<String> hierarchyQualifiedNames, String rootQualifiedName) {
+        this(hierarchyQualifiedNames, rootQualifiedName, StateNaming.EMPTY);
+    }
+
+    /**
+     * @param naming the id assignment produced by {@link StateExtractor} for this
+     *               hierarchy. Every state name this class emits — a from-state, a
+     *               dispatched state, a resolved target — goes through it, so an
+     *               endpoint and the state it refers to cannot be spelled
+     *               differently when two permitted subtypes share a simple name.
+     */
+    public TransitionExtractor(Set<String> hierarchyQualifiedNames, String rootQualifiedName,
+                               StateNaming naming) {
         this.hierarchyQualifiedNames = hierarchyQualifiedNames;
         this.rootQualifiedName = rootQualifiedName;
-        this.resolver = new TransitionResolver(hierarchyQualifiedNames, rootQualifiedName);
+        this.naming = naming == null ? StateNaming.EMPTY : naming;
+        this.resolver = new TransitionResolver(hierarchyQualifiedNames, rootQualifiedName, this.naming);
+    }
+
+    /** The id of the state declared by {@code type} — never its bare simple name. */
+    private String stateId(CtType<?> type) {
+        return naming.idFor(type.getQualifiedName());
+    }
+
+    /** The id of the state named by {@code ref} — never its bare simple name. */
+    private String stateId(CtTypeReference<?> ref) {
+        return naming.idFor(ref.getQualifiedName());
     }
 
     public List<String> diagnostics() {
@@ -223,7 +248,7 @@ public final class TransitionExtractor {
         this.concreteStateSimpleNames = new LinkedHashSet<>();
         for (CtType<?> t : StateMachineClassifier.hierarchyTypes(root)) {
             if (!t.getQualifiedName().equals(rootQualifiedName)) {
-                concreteStateSimpleNames.add(t.getSimpleName());
+                concreteStateSimpleNames.add(stateId(t));
             }
         }
 
@@ -322,10 +347,10 @@ public final class TransitionExtractor {
         commitForms.add(CommitForm.VALUE_RETURN);
         // The declaring class IS the source state — exact, no data-flow needed —
         // so it counts as dispatched even when the body produces nothing.
-        dispatchedStates.add(declaring.getSimpleName());
+        dispatchedStates.add(stateId(declaring));
         // The from-state is fixed to the declaring class; a switch inside the
         // body dispatches on the event, not on the state, so from is preserved.
-        walk(method.getBody(), declaring.getSimpleName(), eventName(method), null, out);
+        walk(method.getBody(), stateId(declaring), eventName(method), null, out);
     }
 
     // ---- centralized (single transition function) ----------------------------
@@ -678,7 +703,7 @@ public final class TransitionExtractor {
         CtTypeReference<?> t = instanceofType(bin.getRightHandOperand());
         if (t != null && hierarchyQualifiedNames.contains(t.getQualifiedName())
                 && !t.getQualifiedName().equals(rootQualifiedName)) {
-            return t.getSimpleName();
+            return stateId(t);
         }
         return null;
     }
@@ -786,11 +811,11 @@ public final class TransitionExtractor {
                     continue; // returns the hierarchy type — the distributed walker owns it
                 }
                 commitForms.add(CommitForm.POLY_CARRIER);
-                dispatchedStates.add(declaring.getSimpleName());
+                dispatchedStates.add(stateId(declaring));
                 // Σ and the event-parameter names are per-method, and drive the
                 // event attribution performed by splitEventCondition below.
                 enumerateEventAlphabet(m);
-                walkCarrier(m.getBody(), declaring.getSimpleName(), null, null, out);
+                walkCarrier(m.getBody(), stateId(declaring), null, null, out);
             }
         } finally {
             carrierMode = false;
@@ -1124,7 +1149,7 @@ public final class TransitionExtractor {
                 // has it set per matched arm by walkSwitch.
                 String from = declaring != null
                         && hierarchyQualifiedNames.contains(declaring.getQualifiedName())
-                        ? declaring.getSimpleName()
+                        ? stateId(declaring)
                         : null;
                 if (from != null) dispatchedStates.add(from);
                 // Mutation-style event labelling is future work (as for
@@ -2011,7 +2036,7 @@ public final class TransitionExtractor {
             for (CtExpression<?> ce : c.getCaseExpressions()) {
                 CtTypeReference<?> t = patternType(ce);
                 if (t != null && hierarchyQualifiedNames.contains(t.getQualifiedName())) {
-                    return t.getSimpleName();
+                    return stateId(t);
                 }
             }
         } catch (Throwable ignored) {

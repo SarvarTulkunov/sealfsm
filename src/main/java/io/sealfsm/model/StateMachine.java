@@ -90,6 +90,29 @@ public final class StateMachine {
 
     public void addTopLevelState(State s) { topLevelStates.add(Objects.requireNonNull(s)); }
 
+    /**
+     * State ids carried by more than one state — the empty set for every
+     * well-formed machine.
+     *
+     * <p>An id is the identity a {@link Transition} endpoint, a DOT node and an
+     * SCXML {@code id} all refer to, so two states sharing one is not a cosmetic
+     * problem: their edges become the same {@code (from, to, event, guard)} tuple
+     * and the extractor's transition set silently discards the duplicate, dropping
+     * a real transition with no unresolved marker. {@link StateNaming} assigns ids
+     * so that this cannot happen; this check exists because the assignment and the
+     * extractor are separate pieces of code, and a drift between them would
+     * otherwise be invisible in the output. Reported as a diagnostic rather than
+     * thrown — a wrong diagram on someone's repository is bad, a crash is worse.
+     */
+    public Set<String> duplicateStateIds() {
+        Set<String> seen = new LinkedHashSet<>();
+        Set<String> duplicates = new LinkedHashSet<>();
+        for (State s : allStates()) {
+            if (!seen.add(s.id())) duplicates.add(s.id());
+        }
+        return duplicates;
+    }
+
     public void addTransition(Transition t) {
         transitions.add(Objects.requireNonNull(t));
         if (t.event() != null) alphabet.add(t.event());

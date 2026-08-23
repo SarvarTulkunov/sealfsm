@@ -123,7 +123,11 @@ public class DebugHarness {
             // ── STAGE 4: Extract states ───────────────────────────────
             System.out.println("  ▸ STAGE 4: Extract states");
             StateExtractor stateExtractor = new StateExtractor();
-            List<State> states = stateExtractor.extractStates(root);
+            // The naming is carried into stage 5 rather than rebuilt: the debug view
+            // must show the same ids the pipeline assigns, or a name collision would
+            // be invisible in exactly the tool used to diagnose one.
+            StateExtractor.Result extracted = stateExtractor.extract(root);
+            List<State> states = extracted.topLevelStates();
 
             for (State s : states) {
                 printState(s, "    ");
@@ -133,7 +137,8 @@ public class DebugHarness {
             // ── STAGE 5: Extract transitions ──────────────────────────
             System.out.println("  ▸ STAGE 5: Extract transitions");
             Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
-            TransitionExtractor te = new TransitionExtractor(hierarchy, root.getQualifiedName());
+            TransitionExtractor te =
+                    new TransitionExtractor(hierarchy, root.getQualifiedName(), extracted.naming());
             List<Transition> transitions = te.extract(root, model);
 
             for (Transition t : transitions) {

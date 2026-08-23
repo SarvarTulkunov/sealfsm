@@ -1,5 +1,6 @@
 package io.sealfsm.extract;
 
+import io.sealfsm.model.StateNaming;
 import io.sealfsm.model.SuccessorForm;
 import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtConditional;
@@ -75,10 +76,23 @@ public final class TransitionResolver {
 
     private final Set<String> hierarchyQualifiedNames;
     private final String rootQualifiedName;
+    /**
+     * Maps a resolved target type to the id the state carries. Never bypassed with
+     * a bare {@code getSimpleName()}: two permitted subtypes may share a simple
+     * name, and a target spelled that way would name whichever of them the
+     * serializer happened to declare first.
+     */
+    private final StateNaming naming;
 
     public TransitionResolver(Set<String> hierarchyQualifiedNames, String rootQualifiedName) {
+        this(hierarchyQualifiedNames, rootQualifiedName, StateNaming.EMPTY);
+    }
+
+    public TransitionResolver(Set<String> hierarchyQualifiedNames, String rootQualifiedName,
+                              StateNaming naming) {
         this.hierarchyQualifiedNames = hierarchyQualifiedNames;
         this.rootQualifiedName = rootQualifiedName;
+        this.naming = naming == null ? StateNaming.EMPTY : naming;
     }
 
     public List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName) {
@@ -166,7 +180,7 @@ public final class TransitionResolver {
             if (cast == null) continue;
             String q = cast.getQualifiedName();
             if (!q.equals(rootQualifiedName) && hierarchyQualifiedNames.contains(q)) {
-                return Candidate.of(cast.getSimpleName(), guard, SuccessorForm.CAST);
+                return Candidate.of(naming.idFor(q), guard, SuccessorForm.CAST);
             }
         }
         return null;
@@ -174,7 +188,7 @@ public final class TransitionResolver {
 
     private Candidate fromTypeRef(CtTypeReference<?> ref, String guard, CtExpression<?> raw) {
         if (ref != null && hierarchyQualifiedNames.contains(ref.getQualifiedName())) {
-            return Candidate.of(ref.getSimpleName(), guard, SuccessorForm.CONSTRUCTION);
+            return Candidate.of(naming.idFor(ref.getQualifiedName()), guard, SuccessorForm.CONSTRUCTION);
         }
         return Candidate.unresolved(guard, safeText(raw));
     }
@@ -243,7 +257,7 @@ public final class TransitionResolver {
                 SuccessorForm form = decl instanceof CtField<?>
                         ? SuccessorForm.SINGLETON_FIELD
                         : SuccessorForm.LOCAL_VARIABLE;
-                return List.of(Candidate.of(declaredType.getSimpleName(), guard, form));
+                return List.of(Candidate.of(naming.idFor(dq), guard, form));
             }
             // (4) a root-typed *selector* — a parameter, or a pattern binding —
             // means "stay in the matched state". Deliberately NOT applied to a
@@ -273,7 +287,7 @@ public final class TransitionResolver {
         if (vref.getDeclaration() instanceof CtEnumValue<?> ev) {
             CtType<?> owner = ev.getDeclaringType();
             if (owner != null && hierarchyQualifiedNames.contains(owner.getQualifiedName())) {
-                return ev.getSimpleName();
+                return naming.idForEnumConstant(owner.getQualifiedName(), ev.getSimpleName());
             }
             return null;
         }
@@ -284,7 +298,7 @@ public final class TransitionResolver {
             CtTypeReference<?> owner = fref.getDeclaringType();
             if (owner != null && hierarchyQualifiedNames.contains(owner.getQualifiedName())
                     && owner.getTypeDeclaration() instanceof CtEnum<?>) {
-                return fref.getSimpleName();
+                return naming.idForEnumConstant(owner.getQualifiedName(), fref.getSimpleName());
             }
         }
         return null;
