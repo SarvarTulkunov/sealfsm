@@ -90,6 +90,8 @@ calls) instead of the combined form.
 Java source → Spoon parser → CtModel
   → SealedHierarchyDetector (finds sealed roots, filters nested)
   → StateMachineClassifier (FSM or sum type? polymorphic/centralized?)
+      ↳ a root rejected by ABSTENTION re-offers its nested sealed
+        subtypes as roots (Analyzer's worklist) — a VETOED one does not
       ↳ DispatchCommitDetector  (switch-over-H + H-typed commit; the codomain guard)
       ↳ CarrierTransitionDetector (carrier successors + sibling-vs-nested guard)
   → StateExtractor (permits → State IR, exact)
@@ -158,12 +160,15 @@ src/main/java/io/sealfsm/
 - `examples/foreignfold/` — NEGATIVE CONTROL for the widened centralized recognizer: sealed `Mode permits Fast, Slow, Stopped`, a driver holding a `Mode` field, and exhaustive switches over it in **both** accepted commit positions (`return switch` and field assignment) — but folding into `String`/`int`. Must be REJECTED by the commit requirement. Accepting it would report an automaton whose every state has zero transitions.
 - `examples/namecollision/` — **NAME-COLLISION FIXTURE**: sealed `Link permits Idle, Legacy.Idle, Phase, Mode`, holding both legal ways two states end up with the same simple name. `Idle` and `Legacy.Idle` are a top-level type beside a nested one — legal even outside a named module, since `permits` only requires the same *package* there and `Legacy` is in it; a cross-package pair (`a.Foo`/`b.Foo`) is the other spelling and is legal inside a named module. `Phase` and `Mode` are two permitted enums that both declare `IDLE`, and since a permitted enum contributes its constants as child states, those are two distinct states spelled identically — the likelier shape by far, because nothing discourages reusing `IDLE`/`ERROR`/`NONE`. 8 states, 12/12. Keyed on simple names it reports **11/11**: the two `UPGRADE` arms encode `Idle → Legacy.Idle` and `Legacy.Idle → Idle`, which collapse to the same `(from, to, event, guard, resolved)` tuple, and the extractor's transition `LinkedHashSet` discards one. A real transition dropped with **no unresolved marker**, behind a clean-looking `n/n` — the one outcome the record-everything invariant forbids. Graphviz hides the rest: node ids are global, so a state declared inside two clusters silently becomes one node in the first, with no warning, and the SCXML emits duplicate `id`s.
 
+- `examples/nestedroots/` — **NESTED-ROOT FIXTURE**: three hierarchies holding the shape fixed (an outer sealed type with a sealed permitted subtype) and varying only what the parent's rejection *means*. `Message permits Header, Body` abstains, and `@Fsm`-marked `Body` must be **re-offered and extracted** — 3 states, 3/3, initial `Empty`. `Envelope permits Stamp, Contents` abstains onto a child that is a plain sum type: re-offering must manufacture nothing, and must give `Contents` **its own diagnostic** (before the fix the only line printed named the parent, so a reader could not tell "examined and rejected" from "never looked at"). `Node permits Leaf, Branch` is **VETOED** and must release nothing, though `Branch` classifies as POLYMORPHIC on its own — the load-bearing control. `Body` needs the marker for a real reason: H(child) ⊆ H(parent), so *any* value-producing recognizer that accepts the child also keeps the parent accepted, and the parent only abstains when the child's producer returns nothing — the F2 mutation encoding, which is exactly the case that must opt in. `Branch.replaceChild` takes the child as a **parameter**, not `this.left`: Spoon models a field read's receiver as a `CtThisAccess`, which the nesting test counts as a hierarchy value unconditionally, so `new Wrap(this.left)` would look nested in *any* hierarchy set and the control would pass without testing anything.
+
 Reference output in `sample-output/` — diff after building to verify.
 
 ## Tests
 
 - `serialize/DotSerializerTest` — pure IR/serializer (no Spoon)
 - `serialize/ScxmlSerializerTest` — SCXML well-formedness + nesting (no Spoon)
+- `detect/SealedHierarchyDetectorTest` — root discovery and what a rejected root offers back
 - `detect/CarrierTransitionDetectorTest` — carrier recognition, the sibling-vs-nested guard (accept tcp / reject treebuilder), self-loops
 - `detect/DispatchCommitDetectorTest` — the commit classification, as near-identical pairs differing only in codomain (accept `state = switch(state)` / reject `label = switch(state)`)
 - `extract/TransitionResolverTest` — the successor sub-procedure, expression shape by expression shape
@@ -183,10 +188,22 @@ An id used to be the bare simple name, which is **not** an identity: a `permits`
 - `StateMachine.duplicateStateIds()` is the drift check, reported by `Analyzer` as a WARN. It should always be empty; it exists because the assignment and the extractor are separate code, and a disagreement between them would otherwise be invisible in the output. A diagnostic, not a throw — a wrong diagram on someone's repository is bad, a crash is worse.
 - Only STATE names go through it. `TransitionExtractor` derives event symbols, field names and variable names with `getSimpleName()` too, and those must stay untouched.
 
+### SealedHierarchyDetector (detect/SealedHierarchyDetector.java) + the re-offer worklist
+A sealed permitted subtype is withheld from the root list because its parent claims it as a **composite state**. That claim is only good if the parent turns out to be a machine — and the detector runs *before* classification, so it cannot know. When the parent was then rejected, the child was lost with it and the only diagnostic named the parent. `sealed interface Message permits Header, Body`, where `Body` is itself a state machine, is an ordinary shape.
+
+- `permittedSealedSubtypes(root)` offers the withheld hierarchies back; `Analyzer` iterates roots as a **worklist** rather than a list, so a rejected root can append to it. An `enum` is never offered — it is not sealed, and its constants are already exact child states.
+- **Only an ABSTENTION releases them**, which is why `Classification` now carries a `Rejection` (`NONE` / `ABSTAINED` / `VETOED`) instead of only a reason string. The two rejections mean different things: "no transition producer found" says nothing about a machine declared *inside*, whereas the compositional veto is a verdict about the data type, and a member of a recursive data type is still one.
+- The veto exclusion is **not** conservatism for its own sake. The veto is judged against the hierarchy set of whichever root is classified, and a child's set is strictly narrower — so re-offering can make the composition *invisible*. In `examples/nestedroots`, `new Wrap(child)` with `child` typed `Node` nests one hierarchy value inside another as far as `Node` is concerned; judged against `{Branch, Pair, Wrap}` the argument is a foreign type and the same expression reads as a peer production. `Branch` then classifies as POLYMORPHIC — a tree builder reported as an automaton, one level below the veto that caught it. The test asserts `Branch` *would* be accepted, so the control cannot quietly stop testing anything.
+- A machine genuinely nested inside a *compositional* hierarchy therefore stays lost. That is a recall gap and a deliberate one: closing it means judging the child against its **widest enclosing** hierarchy, which is a change to the compositional veto itself, not to the worklist.
+- `Analyzer` also claims every member of an accepted machine, so a type that is a **state** is never also re-offered as a **root**. Vacuous in the common case; it matters when a sealed type extends two sealed interfaces and only one is a machine.
+- `DebugHarness` mirrors the worklist, or the debug view would show a different root set from the one the pipeline classifies.
+
 ### SpoonCompat (detect/SpoonCompat.java)
 All version-sensitive Spoon calls live here. `isSealed()` checks `ModifierKind.SEALED` with try/catch fallback. `permittedTypes()` uses reflection for `getPermittedTypes()` with a fallback that scans the model for direct subtypes (handles implicit permits).
 
 ### StateMachineClassifier (detect/StateMachineClassifier.java)
+`Classification` carries a `Rejection` alongside the reason text: `ABSTAINED` ("no transition producer found") versus `VETOED` (the compositional veto). Only the second is a verdict about the hierarchy's members, and the difference is what decides whether a rejected root releases its nested sealed subtypes — see the re-offer worklist above. Do not collapse them back to a reason string; a caller comparing that string is a caller that breaks when the wording changes.
+
 `centralizedReason` counts **distinct hosts**, not the sum of the two recognizers' findings. The signature-based recognizer and `DispatchCommitDetector` legitimately overlap — an `H transition(H, Event)` whose body is `return switch (current)` is seen by both — so summing them reported `examples/door`, which has exactly one transition function, as two. It keys on `declaringType#signature`, the same key the extractor dedups on, so the reported number and the walked set cannot drift apart.
 
 Contains shared static helpers reused by the extractor:

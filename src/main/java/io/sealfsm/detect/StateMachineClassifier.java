@@ -45,12 +45,44 @@ public final class StateMachineClassifier {
 
     private static final Set<String> MARKER_NAMES = Set.of("Fsm", "FSM", "StateMachine");
 
-    public record Classification(boolean isStateMachine, Encoding encoding, String reason) {
+    /**
+     * Why a hierarchy was <em>not</em> accepted. The two rejections are not
+     * interchangeable, and the difference decides whether a rejected root's
+     * nested sealed hierarchies get a look of their own (see
+     * {@link io.sealfsm.Analyzer}).
+     *
+     * <ul>
+     *   <li>{@link #VETOED} is a positive verdict about the <em>data type</em>:
+     *       its members are composed into one another, which the carrier
+     *       detector treats as a property of the family rather than of one
+     *       method. Its members inherit that verdict.</li>
+     *   <li>{@link #ABSTAINED} is not a verdict at all — the recognizers found
+     *       nothing <em>here</em>, which says nothing about a machine declared
+     *       inside. This is the reading the reason text already states
+     *       ("may be event/&Sigma; type or unresolved dispatch").</li>
+     * </ul>
+     */
+    public enum Rejection {
+        /** Not a rejection: the hierarchy was accepted as a state machine. */
+        NONE,
+        /** No transition producer was found — an abstention, not a verdict. */
+        ABSTAINED,
+        /** The compositional veto: a verdict about the data type itself. */
+        VETOED
+    }
+
+    public record Classification(boolean isStateMachine, Encoding encoding, String reason,
+                                 Rejection rejection) {
+        /** Rejection by abstention: nothing was recognised, and nothing is claimed. */
         public static Classification no(String reason) {
-            return new Classification(false, Encoding.MIXED, reason);
+            return new Classification(false, Encoding.MIXED, reason, Rejection.ABSTAINED);
+        }
+        /** Rejection by verdict: a statement about the data type, binding on its members. */
+        public static Classification veto(String reason) {
+            return new Classification(false, Encoding.MIXED, reason, Rejection.VETOED);
         }
         public static Classification yes(Encoding enc, String reason) {
-            return new Classification(true, enc, reason);
+            return new Classification(true, enc, reason, Rejection.NONE);
         }
     }
 
@@ -68,7 +100,7 @@ public final class StateMachineClassifier {
         // record component of the hierarchy type, for instance, gives such a type
         // an accessor that looks exactly like a per-state transition method.
         if (CarrierTransitionDetector.composesItself(root)) {
-            return Classification.no(
+            return Classification.veto(
                     "hierarchy members are composed into one another (a hierarchy value is a "
                             + "construction argument of another) — a recursive data type, not a state machine");
         }

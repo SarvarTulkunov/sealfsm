@@ -5,6 +5,7 @@ import io.sealfsm.detect.SealedHierarchyDetector;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.detect.StateMachineClassifier.Classification;
+import io.sealfsm.detect.StateMachineClassifier.Rejection;
 import io.sealfsm.extract.StateExtractor;
 import io.sealfsm.extract.TransitionExtractor;
 import io.sealfsm.model.CommitForm;
@@ -22,6 +23,8 @@ import spoon.reflect.declaration.CtType;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -50,10 +53,24 @@ public final class Analyzer {
             return result;
         }
 
-        for (CtType<?> root : roots) {
+        // A worklist rather than a plain iteration over `roots`: a rejected root
+        // may still CONTAIN a machine. findSealedRoots withholds a sealed
+        // permitted subtype because its parent claims it as a composite state,
+        // but that claim is only good if the parent turns out to be a machine.
+        // When it does not, the child has to be offered as a root in its own
+        // right — otherwise `sealed interface Message permits Header, Body`,
+        // with Body itself a machine, loses Body entirely and the only thing
+        // reported is that Message was skipped.
+        Deque<CtType<?>> pending = new ArrayDeque<>(roots);
+        Set<String> claimed = new LinkedHashSet<>();
+        while (!pending.isEmpty()) {
+            CtType<?> root = pending.pollFirst();
+            if (!claimed.add(root.getQualifiedName())) continue;
+
             Classification c = classifier.classify(root, model);
             if (!c.isStateMachine()) {
-                result.info(root.getQualifiedName(), "skipped — " + c.reason());
+                result.info(root.getQualifiedName(),
+                        "skipped — " + c.reason() + reoffer(root, c, pending, claimed));
                 continue;
             }
 
@@ -82,6 +99,13 @@ public final class Analyzer {
             }
 
             Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
+            // Every member of an accepted machine is one of its STATES, so none of
+            // them may later be re-offered as a root. Normally vacuous (a nested
+            // sealed type is never in `roots` to begin with), it matters when a
+            // sealed type extends two sealed interfaces and only one of them is a
+            // machine: without this the type would be reported twice, once as a
+            // composite state and once as a machine of its own.
+            claimed.addAll(hierarchy);
             TransitionExtractor te =
                     new TransitionExtractor(hierarchy, root.getQualifiedName(), states.naming());
             for (Transition t : te.extract(root, model)) {
@@ -140,6 +164,54 @@ public final class Analyzer {
             result.addMachine(machine);
         }
         return result;
+    }
+
+    /**
+     * Release a rejected root's nested sealed hierarchies back onto the worklist,
+     * returning the text to append to that root's diagnostic (empty when nothing
+     * is released).
+     *
+     * <p><b>Only an abstention releases them.</b> The two rejections mean
+     * different things and only one of them is silent about the members:
+     *
+     * <ul>
+     *   <li>{@link Rejection#ABSTAINED} says the recognizers found no transition
+     *       producer <em>for this hierarchy</em>. That is not a statement about a
+     *       machine declared inside it, so the child gets its own look — and, if
+     *       it is rejected too, its own diagnostic naming <em>it</em> rather than
+     *       only its parent.</li>
+     *   <li>{@link Rejection#VETOED} says the members are composed into one
+     *       another. Re-offering there would hand the child a strictly NARROWER
+     *       hierarchy in which the composition can be invisible: in
+     *       {@code sealed interface Branch extends Node}, a {@code new Wrap(left)}
+     *       whose argument is typed {@code Node} nests one hierarchy value inside
+     *       another as far as {@code Node} is concerned, but {@code Node} is not
+     *       in {@code Branch}'s hierarchy set, so the same expression reads as a
+     *       peer production. The veto would silently evaporate and the tree
+     *       builder would be reported as an automaton one level down — exactly
+     *       the false positive the veto exists to prevent.
+     *       {@code examples/nestedroots}' {@code Node}/{@code Branch} is the
+     *       control that pins this.</li>
+     * </ul>
+     *
+     * <p>A machine really nested inside a compositional hierarchy is therefore
+     * still lost. That is a recall gap and a deliberate one: closing it means
+     * judging the child against its WIDEST enclosing hierarchy rather than its
+     * own, which is a change to the compositional veto itself, not to this
+     * worklist.
+     */
+    private String reoffer(CtType<?> root, Classification c,
+                           Deque<CtType<?>> pending, Set<String> claimed) {
+        if (c.rejection() != Rejection.ABSTAINED) return "";
+        List<CtType<?>> nested = detector.permittedSealedSubtypes(root).stream()
+                .filter(t -> !claimed.contains(t.getQualifiedName()))
+                .toList();
+        if (nested.isEmpty()) return "";
+        pending.addAll(nested);
+        boolean one = nested.size() == 1;
+        return "; re-offering nested sealed " + (one ? "hierarchy " : "hierarchies ")
+                + new TreeSet<>(nested.stream().map(CtType::getQualifiedName).toList())
+                + (one ? " as a root in its own right" : " as roots in their own right");
     }
 
     /**

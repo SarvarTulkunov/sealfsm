@@ -1,5 +1,6 @@
 package io.sealfsm;
 
+import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.ExtractionResult;
 import io.sealfsm.model.State;
@@ -9,6 +10,7 @@ import io.sealfsm.model.Transition;
 import org.junit.jupiter.api.Test;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
+import spoon.reflect.declaration.CtType;
 
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -1766,5 +1768,101 @@ class ExtractionIntegrationTest {
                 }
             }
         }
+    }
+
+    // ---- nested roots ------------------------------------------------------
+
+    /**
+     * A sealed machine declared INSIDE a hierarchy that is not one must still be
+     * found. {@code SealedHierarchyDetector} withholds {@code Body} from the root
+     * list because {@code Message} claims it as a composite state, and that claim
+     * lapses the moment {@code Message} is rejected — so the child has to be
+     * re-offered as a root in its own right. Before the fix the only thing
+     * reported about this file was that {@code Message} had been skipped.
+     */
+    @Test
+    void nestedMachineSurvivesItsParentBeingRejected() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/nestedroots"));
+        StateMachine m = single(r);
+
+        assertEquals("Body", m.name());
+        assertEquals("nestedroots.Body", m.qualifiedName());
+        assertEquals(Set.of("Empty", "Streaming", "Complete"), stateIds(m));
+        assertTrue(hasResolved(m, "Empty", "Streaming"));
+        assertTrue(hasResolved(m, "Streaming", "Complete"));
+        assertTrue(hasResolved(m, "Complete", "Empty"));
+        assertEquals(0, m.unresolvedTransitionCount());
+        assertEquals("Empty", m.initialState().orElse(null));
+
+        // The parent stays rejected, and says what it released.
+        assertTrue(r.diagnostics().stream().anyMatch(d ->
+                        d.where().equals("nestedroots.Message")
+                                && d.message().contains("nestedroots.Body")),
+                "the rejected parent must name the hierarchy it re-offered");
+    }
+
+    /**
+     * Re-offering must not manufacture a machine, and must give the child its own
+     * diagnostic. {@code Envelope} abstains and its nested {@code Contents} is a
+     * plain sum type; before the fix the only line printed named {@code Envelope},
+     * so a reader could not tell whether {@code Contents} had been examined and
+     * rejected or never looked at at all.
+     */
+    @Test
+    void aReofferedHierarchyThatIsNotAMachineGetsItsOwnDiagnostic() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/nestedroots"));
+
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Contents")),
+                "Contents is a plain sum type; re-offering must not accept it");
+        assertTrue(r.diagnostics().stream().anyMatch(d ->
+                        d.where().equals("nestedroots.Contents")
+                                && d.message().contains("skipped")),
+                "the re-offered child must be named in a diagnostic of its own");
+    }
+
+    /**
+     * NEGATIVE CONTROL, and the load-bearing one: the compositional veto must not
+     * be escapable by re-offering. The veto is judged against the hierarchy set of
+     * whichever root is classified, and a child's set is strictly narrower — in
+     * {@code new Wrap(child)} the argument is typed {@code Node}, which is in
+     * {@code Node}'s hierarchy and not in {@code Branch}'s, so the same expression
+     * reads as composition for the parent and as a peer production for the child.
+     * Classified on its own {@code Branch} is accepted as POLYMORPHIC (asserted
+     * below, so the control cannot quietly stop testing anything), which is exactly
+     * the tree-builder false positive the veto exists to prevent.
+     */
+    @Test
+    void aVetoedHierarchyDoesNotReleaseItsNestedRoots() {
+        CtModel model = modelOf("examples/nestedroots");
+        ExtractionResult r = new Analyzer().analyze(model);
+
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Branch")),
+                "a member of a recursive data type is still a recursive data type");
+        assertTrue(r.diagnostics().stream().noneMatch(d -> d.where().equals("nestedroots.Branch")),
+                "a vetoed root must not re-offer anything, so Branch is never classified");
+
+        // The control bites only if Branch WOULD be accepted on its own.
+        CtType<?> branch = model.getAllTypes().stream()
+                .filter(t -> t.getQualifiedName().equals("nestedroots.Branch"))
+                .findFirst().orElseThrow();
+        StateMachineClassifier.Classification onItsOwn =
+                new StateMachineClassifier().classify(branch, model);
+        assertTrue(onItsOwn.isStateMachine(),
+                "if Branch were rejected anyway this control would assert nothing");
+        assertEquals(StateMachine.Encoding.POLYMORPHIC, onItsOwn.encoding());
+    }
+
+    /**
+     * The withholding is only lifted by an ABSTENTION, so an accepted parent keeps
+     * its nested sealed hierarchies as composite states — the existing behaviour,
+     * pinned here because the worklist is what could break it.
+     */
+    @Test
+    void anAcceptedParentKeepsItsNestedHierarchiesAsStates() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/valueforms"));
+        StateMachine m = single(r);
+        assertTrue(m.topLevelStates().stream().anyMatch(s -> s.id().equals("Phase") && s.isComposite()),
+                "the permitted enum stays a composite state of Signal");
+        assertTrue(r.machines().stream().noneMatch(sm -> sm.name().equals("Phase")));
     }
 }

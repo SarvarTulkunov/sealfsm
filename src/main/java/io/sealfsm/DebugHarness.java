@@ -4,6 +4,7 @@ import io.sealfsm.detect.SealedHierarchyDetector;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.detect.StateMachineClassifier.Classification;
+import io.sealfsm.detect.StateMachineClassifier.Rejection;
 import io.sealfsm.extract.StateExtractor;
 import io.sealfsm.extract.TransitionExtractor;
 import io.sealfsm.model.ExtractionResult;
@@ -18,6 +19,9 @@ import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.reference.CtTypeReference;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -83,16 +87,34 @@ public class DebugHarness {
         System.out.println("▸ STAGE 3: Classify");
         StateMachineClassifier classifier = new StateMachineClassifier();
 
-        for (CtType<?> root : roots) {
+        // Mirrors Analyzer's worklist: a root rejected by ABSTENTION releases its
+        // nested sealed hierarchies as roots of their own, so the debug view shows
+        // the same set of roots the pipeline actually classifies.
+        Deque<CtType<?>> pending = new ArrayDeque<>(roots);
+        Set<String> claimed = new LinkedHashSet<>();
+        while (!pending.isEmpty()) {
+            CtType<?> root = pending.pollFirst();
+            if (!claimed.add(root.getQualifiedName())) continue;
+
             Classification c = classifier.classify(root, model);
             System.out.printf("  %-25s  isFSM=%s  encoding=%s%n",
                     root.getSimpleName(), c.isStateMachine(), c.encoding());
             System.out.printf("  %25s  reason: %s%n", "", c.reason());
 
             if (!c.isStateMachine()) {
+                if (c.rejection() == Rejection.ABSTAINED) {
+                    for (CtType<?> nested : detector.permittedSealedSubtypes(root)) {
+                        if (claimed.contains(nested.getQualifiedName())) continue;
+                        pending.addLast(nested);
+                        System.out.printf("    re-offering nested sealed root: %s%n",
+                                nested.getQualifiedName());
+                    }
+                }
                 System.out.println("    → SKIPPED (not a state machine)\n");
                 continue;
             }
+
+            claimed.addAll(StateMachineClassifier.hierarchyQualifiedNames(root));
 
             // Show discovered transition methods
             List<CtMethod<?>> dist = StateMachineClassifier.findDistributedTransitionMethods(root);
