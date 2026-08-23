@@ -1,0 +1,15 @@
+# RFC 1661 section 4.1, State Transition Table column headings (pages 12-13).
+# Listed in the RFC's own column order, i.e. RFC state numbers 0 through 9.
+# Hyphens removed from the RFC's 'Req-Sent' / 'Ack-Rcvd' / 'Ack-Sent'
+# so the names are legal Java identifiers; see ORACLE.md.
+
+Initial
+Starting
+Closed
+Stopped
+Closing
+Stopping
+ReqSent
+AckRcvd
+AckSent
+Opened

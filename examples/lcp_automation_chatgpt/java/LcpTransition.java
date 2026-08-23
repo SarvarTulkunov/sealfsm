@@ -1,3 +1,5 @@
+package lcpchatgpt;
+
 import java.util.List;
 
 /** The result of applying one LCP event: the next state and RFC-defined actions. */

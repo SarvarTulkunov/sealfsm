@@ -1,3 +1,5 @@
+package lcpchatgpt;
+
 /** An action defined by the RFC 1661 LCP option-negotiation automaton. */
 public enum LcpAction {
     TLU,

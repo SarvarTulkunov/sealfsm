@@ -1,0 +1,133 @@
+source	event	target	note
+# RFC 1661 section 4.1 State Transition Table (pages 12-13).
+# 16 events x 10 states = 160 cells; 40 cells are '-' (illegal transition)
+# and contribute no edge. 120 transitions follow.
+Initial	Up	Closed	cell=0/Up 2 -> 2
+Initial	Open	Starting	actions=tls; cell=0/Open tls/1 -> 1
+Initial	Close	Initial	cell=0/Close 0 -> 0
+
+Starting	Up	ReqSent	actions=irc,scr; cell=1/Up irc,scr/6 -> 6
+Starting	Open	Starting	cell=1/Open 1 -> 1
+Starting	Close	Initial	actions=tlf; cell=1/Close tlf/0 -> 0
+
+Closed	Down	Initial	cell=2/Down 0 -> 0
+Closed	Open	ReqSent	actions=irc,scr; cell=2/Open irc,scr/6 -> 6
+Closed	Close	Closed	cell=2/Close 2 -> 2
+Closed	RCR+	Closed	actions=sta; cell=2/RCR+ sta/2 -> 2
+Closed	RCR-	Closed	actions=sta; cell=2/RCR- sta/2 -> 2
+Closed	RCA	Closed	actions=sta; cell=2/RCA sta/2 -> 2
+Closed	RCN	Closed	actions=sta; cell=2/RCN sta/2 -> 2
+Closed	RTR	Closed	actions=sta; cell=2/RTR sta/2 -> 2
+Closed	RTA	Closed	cell=2/RTA 2 -> 2
+Closed	RUC	Closed	actions=scj; cell=2/RUC scj/2 -> 2
+Closed	RXJ+	Closed	cell=2/RXJ+ 2 -> 2
+Closed	RXJ-	Closed	actions=tlf; cell=2/RXJ- tlf/2 -> 2
+Closed	RXR	Closed	cell=2/RXR 2 -> 2
+
+Stopped	Down	Starting	actions=tls; cell=3/Down tls/1 -> 1
+Stopped	Open	Stopped	footnote=[r]; cell=3/Open 3r -> 3
+Stopped	Close	Closed	cell=3/Close 2 -> 2
+Stopped	RCR+	AckSent	actions=irc,scr,sca; cell=3/RCR+ irc,scr,sca/8 -> 8
+Stopped	RCR-	ReqSent	actions=irc,scr,scn; cell=3/RCR- irc,scr,scn/6 -> 6
+Stopped	RCA	Stopped	actions=sta; cell=3/RCA sta/3 -> 3
+Stopped	RCN	Stopped	actions=sta; cell=3/RCN sta/3 -> 3
+Stopped	RTR	Stopped	actions=sta; cell=3/RTR sta/3 -> 3
+Stopped	RTA	Stopped	cell=3/RTA 3 -> 3
+Stopped	RUC	Stopped	actions=scj; cell=3/RUC scj/3 -> 3
+Stopped	RXJ+	Stopped	cell=3/RXJ+ 3 -> 3
+Stopped	RXJ-	Stopped	actions=tlf; cell=3/RXJ- tlf/3 -> 3
+Stopped	RXR	Stopped	cell=3/RXR 3 -> 3
+
+Closing	Down	Initial	cell=4/Down 0 -> 0
+Closing	Open	Stopping	footnote=[r]; cell=4/Open 5r -> 5
+Closing	Close	Closing	cell=4/Close 4 -> 4
+Closing	TO+	Closing	actions=str; cell=4/TO+ str/4 -> 4
+Closing	TO-	Closed	actions=tlf; cell=4/TO- tlf/2 -> 2
+Closing	RCR+	Closing	cell=4/RCR+ 4 -> 4
+Closing	RCR-	Closing	cell=4/RCR- 4 -> 4
+Closing	RCA	Closing	cell=4/RCA 4 -> 4
+Closing	RCN	Closing	cell=4/RCN 4 -> 4
+Closing	RTR	Closing	actions=sta; cell=4/RTR sta/4 -> 4
+Closing	RTA	Closed	actions=tlf; cell=4/RTA tlf/2 -> 2
+Closing	RUC	Closing	actions=scj; cell=4/RUC scj/4 -> 4
+Closing	RXJ+	Closing	cell=4/RXJ+ 4 -> 4
+Closing	RXJ-	Closed	actions=tlf; cell=4/RXJ- tlf/2 -> 2
+Closing	RXR	Closing	cell=4/RXR 4 -> 4
+
+Stopping	Down	Starting	cell=5/Down 1 -> 1
+Stopping	Open	Stopping	footnote=[r]; cell=5/Open 5r -> 5
+Stopping	Close	Closing	cell=5/Close 4 -> 4
+Stopping	TO+	Stopping	actions=str; cell=5/TO+ str/5 -> 5
+Stopping	TO-	Stopped	actions=tlf; cell=5/TO- tlf/3 -> 3
+Stopping	RCR+	Stopping	cell=5/RCR+ 5 -> 5
+Stopping	RCR-	Stopping	cell=5/RCR- 5 -> 5
+Stopping	RCA	Stopping	cell=5/RCA 5 -> 5
+Stopping	RCN	Stopping	cell=5/RCN 5 -> 5
+Stopping	RTR	Stopping	actions=sta; cell=5/RTR sta/5 -> 5
+Stopping	RTA	Stopped	actions=tlf; cell=5/RTA tlf/3 -> 3
+Stopping	RUC	Stopping	actions=scj; cell=5/RUC scj/5 -> 5
+Stopping	RXJ+	Stopping	cell=5/RXJ+ 5 -> 5
+Stopping	RXJ-	Stopped	actions=tlf; cell=5/RXJ- tlf/3 -> 3
+Stopping	RXR	Stopping	cell=5/RXR 5 -> 5
+
+ReqSent	Down	Starting	cell=6/Down 1 -> 1
+ReqSent	Open	ReqSent	cell=6/Open 6 -> 6
+ReqSent	Close	Closing	actions=irc,str; cell=6/Close irc,str/4 -> 4
+ReqSent	TO+	ReqSent	actions=scr; cell=6/TO+ scr/6 -> 6
+ReqSent	TO-	Stopped	actions=tlf; footnote=[p]; cell=6/TO- tlf/3p -> 3
+ReqSent	RCR+	AckSent	actions=sca; cell=6/RCR+ sca/8 -> 8
+ReqSent	RCR-	ReqSent	actions=scn; cell=6/RCR- scn/6 -> 6
+ReqSent	RCA	AckRcvd	actions=irc; cell=6/RCA irc/7 -> 7
+ReqSent	RCN	ReqSent	actions=irc,scr; cell=6/RCN irc,scr/6 -> 6
+ReqSent	RTR	ReqSent	actions=sta; cell=6/RTR sta/6 -> 6
+ReqSent	RTA	ReqSent	cell=6/RTA 6 -> 6
+ReqSent	RUC	ReqSent	actions=scj; cell=6/RUC scj/6 -> 6
+ReqSent	RXJ+	ReqSent	cell=6/RXJ+ 6 -> 6
+ReqSent	RXJ-	Stopped	actions=tlf; cell=6/RXJ- tlf/3 -> 3
+ReqSent	RXR	ReqSent	cell=6/RXR 6 -> 6
+
+AckRcvd	Down	Starting	cell=7/Down 1 -> 1
+AckRcvd	Open	AckRcvd	cell=7/Open 7 -> 7
+AckRcvd	Close	Closing	actions=irc,str; cell=7/Close irc,str/4 -> 4
+AckRcvd	TO+	ReqSent	actions=scr; cell=7/TO+ scr/6 -> 6
+AckRcvd	TO-	Stopped	actions=tlf; footnote=[p]; cell=7/TO- tlf/3p -> 3
+AckRcvd	RCR+	Opened	actions=sca,tlu; cell=7/RCR+ sca,tlu/9 -> 9
+AckRcvd	RCR-	AckRcvd	actions=scn; cell=7/RCR- scn/7 -> 7
+AckRcvd	RCA	ReqSent	actions=scr; footnote=[x]; cell=7/RCA scr/6x -> 6
+AckRcvd	RCN	ReqSent	actions=scr; footnote=[x]; cell=7/RCN scr/6x -> 6
+AckRcvd	RTR	ReqSent	actions=sta; cell=7/RTR sta/6 -> 6
+AckRcvd	RTA	ReqSent	cell=7/RTA 6 -> 6
+AckRcvd	RUC	AckRcvd	actions=scj; cell=7/RUC scj/7 -> 7
+AckRcvd	RXJ+	ReqSent	cell=7/RXJ+ 6 -> 6
+AckRcvd	RXJ-	Stopped	actions=tlf; cell=7/RXJ- tlf/3 -> 3
+AckRcvd	RXR	AckRcvd	cell=7/RXR 7 -> 7
+
+AckSent	Down	Starting	cell=8/Down 1 -> 1
+AckSent	Open	AckSent	cell=8/Open 8 -> 8
+AckSent	Close	Closing	actions=irc,str; cell=8/Close irc,str/4 -> 4
+AckSent	TO+	AckSent	actions=scr; cell=8/TO+ scr/8 -> 8
+AckSent	TO-	Stopped	actions=tlf; footnote=[p]; cell=8/TO- tlf/3p -> 3
+AckSent	RCR+	AckSent	actions=sca; cell=8/RCR+ sca/8 -> 8
+AckSent	RCR-	ReqSent	actions=scn; cell=8/RCR- scn/6 -> 6
+AckSent	RCA	Opened	actions=irc,tlu; cell=8/RCA irc,tlu/9 -> 9
+AckSent	RCN	AckSent	actions=irc,scr; cell=8/RCN irc,scr/8 -> 8
+AckSent	RTR	ReqSent	actions=sta; cell=8/RTR sta/6 -> 6
+AckSent	RTA	AckSent	cell=8/RTA 8 -> 8
+AckSent	RUC	AckSent	actions=scj; cell=8/RUC scj/8 -> 8
+AckSent	RXJ+	AckSent	cell=8/RXJ+ 8 -> 8
+AckSent	RXJ-	Stopped	actions=tlf; cell=8/RXJ- tlf/3 -> 3
+AckSent	RXR	AckSent	cell=8/RXR 8 -> 8
+
+Opened	Down	Starting	actions=tld; cell=9/Down tld/1 -> 1
+Opened	Open	Opened	footnote=[r]; cell=9/Open 9r -> 9
+Opened	Close	Closing	actions=tld,irc,str; cell=9/Close tld,irc,str/4 -> 4
+Opened	RCR+	AckSent	actions=tld,scr,sca; cell=9/RCR+ tld,scr,sca/8 -> 8
+Opened	RCR-	ReqSent	actions=tld,scr,scn; cell=9/RCR- tld,scr,scn/6 -> 6
+Opened	RCA	ReqSent	actions=tld,scr; footnote=[x]; cell=9/RCA tld,scr/6x -> 6
+Opened	RCN	ReqSent	actions=tld,scr; footnote=[x]; cell=9/RCN tld,scr/6x -> 6
+Opened	RTR	Stopping	actions=tld,zrc,sta; cell=9/RTR tld,zrc,sta/5 -> 5
+Opened	RTA	ReqSent	actions=tld,scr; cell=9/RTA tld,scr/6 -> 6
+Opened	RUC	Opened	actions=scj; cell=9/RUC scj/9 -> 9
+Opened	RXJ+	Opened	cell=9/RXJ+ 9 -> 9
+Opened	RXJ-	Stopping	actions=tld,irc,str; cell=9/RXJ- tld,irc,str/5 -> 5
+Opened	RXR	Opened	actions=ser; cell=9/RXR ser/9 -> 9

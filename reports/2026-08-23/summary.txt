@@ -1,0 +1,66 @@
+SealFSM corpus run — 2026-08-23, scope: dev (holdout not unsealed, not run)
+Tool commit: 2d397ca5438d06b9954f7cdfacc0e7a3e74da292
+Tree: dirty (git status --porcelain non-empty; verbatim in results.json.run.git_status_porcelain)
+JDK: 21.0.8
+
+REGRESSIONS: none computed. This is the first run under CORPUS_PROTOCOL.md; no
+previous dated report exists under reports/, so there is no baseline to diff
+against. regressed / fixed / unchanged_failing are all empty by definition, not
+by result.
+
+CORPUS AS RUN
+-------------
+Exactly one example directory under examples/ is protocol-conformant (carries
+meta.json, PROVENANCE.md and oracle/): lcp_automation_chatgpt. It is split=dev.
+29 further examples/<name>/ directories carry .java with no meta.json; per
+CORPUS_PROTOCOL.md section 2 these are pre-protocol development fixtures, are
+not corpus evidence, and were not compiled, run, or scored in this report.
+
+At n=1, per-idiom and per-commit-shape stratified recall/precision are not
+meaningful figures and are not reported as rates; CORPUS_PROTOCOL.md section 13
+requires omitting the percentage below N=20 in any case. Raw counts only,
+below and in results.json.
+
+RESULT
+------
+lcp_automation_chatgpt (CENTRALIZED_DISPATCH, commit_shape=argument-passed,
+expected_verdict=fsm, oracle_provenance=external-spec, 10 states / 120
+transitions oracle):
+
+  machines emitted:     0 (expected 1)
+  verdict_correct:      false
+  states:                actual 0 / expected 10, exact_match=false, all 10 missing
+  transitions:           tp=0  fp=0  fn=120  unresolved=0  dropped_without_marker=120
+  events_extracted:      false -> event_matching: degraded
+  exit code:             1 (tool's own "no machines found" path; not a crash)
+  diagnostic:            emitted ("no transition producer found")
+  link_status:            ok (archive_url and synthesis_basis_url re-checked, HTTP 200 both)
+
+AGGREGATE (n=1, counts only, no rates)
+---------------------------------------
+  states:       0/1 exact
+  transitions:  tp=0 fp=0 fn=120 dropped_without_marker=120  precision=n/a recall=n/a
+  negative class (not_fsm): n=0 — section 8's negative quota (>=1 in 4) is unmet at
+    the corpus level; recorded as a coverage gap, not computed as a rate.
+
+FINDINGS (soundness order)
+---------------------------
+1. centralized-carrier-nondetection [wrong-state-set, diagnostic: emitted]
+   examples: [lcp_automation_chatgpt]
+   SealFSM's classifier finds no transition producer at all for this hierarchy: the
+   centralized dispatch switch over the hierarchy type commits its result as a
+   constructor argument to a non-hierarchy carrier record (reached through a second,
+   per-event switch delegated to from the outer switch's arms), a commit shape
+   neither DispatchCommitDetector's codomain check nor CarrierTransitionDetector's
+   POLYMORPHIC-only carrier recognition covers. Recovered state set (empty) does not
+   equal the oracle's 10-state set; recovered transition multiset (empty) does not
+   equal the oracle's 120-row multiset. Full node-shape in findings.md.
+
+ARTEFACTS
+---------
+reports/2026-08-23/results.json
+reports/2026-08-23/run.log
+reports/2026-08-23/findings.md
+reports/2026-08-23/summary.txt
+src/test/java/io/sealfsm/corpus/LcpAutomationChatgptTest.java  (1 test, fails as
+  described above; not disabled, not weakened, per section 9)

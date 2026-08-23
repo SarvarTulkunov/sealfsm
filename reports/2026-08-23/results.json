@@ -1,0 +1,104 @@
+{
+  "run": {
+    "timestamp_utc": "2026-08-23T11:44:05Z",
+    "tool_commit": "2d397ca5438d06b9954f7cdfacc0e7a3e74da292",
+    "tool_commit_short": "2d397ca",
+    "git_status_porcelain": "D  examples/lcp_automation_chatgpt/LcpDemo.java\nRM examples/lcp_automation_chatgpt/AckRcvd.java -> examples/lcp_automation_chatgpt/java/AckRcvd.java\nRM examples/lcp_automation_chatgpt/AckSent.java -> examples/lcp_automation_chatgpt/java/AckSent.java\nRM examples/lcp_automation_chatgpt/Closed.java -> examples/lcp_automation_chatgpt/java/Closed.java\nRM examples/lcp_automation_chatgpt/Closing.java -> examples/lcp_automation_chatgpt/java/Closing.java\nRM examples/lcp_automation_chatgpt/IllegalLcpEventException.java -> examples/lcp_automation_chatgpt/java/IllegalLcpEventException.java\nRM examples/lcp_automation_chatgpt/Initial.java -> examples/lcp_automation_chatgpt/java/Initial.java\nRM examples/lcp_automation_chatgpt/LcpAction.java -> examples/lcp_automation_chatgpt/java/LcpAction.java\nRM examples/lcp_automation_chatgpt/LcpAutomaton.java -> examples/lcp_automation_chatgpt/java/LcpAutomaton.java\nRM examples/lcp_automation_chatgpt/LcpEvent.java -> examples/lcp_automation_chatgpt/java/LcpEvent.java\nRM examples/lcp_automation_chatgpt/LcpState.java -> examples/lcp_automation_chatgpt/java/LcpState.java\nRM examples/lcp_automation_chatgpt/LcpTransition.java -> examples/lcp_automation_chatgpt/java/LcpTransition.java\nRM examples/lcp_automation_chatgpt/Opened.java -> examples/lcp_automation_chatgpt/java/Opened.java\nRM examples/lcp_automation_chatgpt/ReqSent.java -> examples/lcp_automation_chatgpt/java/ReqSent.java\nRM examples/lcp_automation_chatgpt/Starting.java -> examples/lcp_automation_chatgpt/java/Starting.java\nRM examples/lcp_automation_chatgpt/Stopped.java -> examples/lcp_automation_chatgpt/java/Stopped.java\nRM examples/lcp_automation_chatgpt/Stopping.java -> examples/lcp_automation_chatgpt/java/Stopping.java\n?? .claude/\n?? CORPUS_PROTOCOL.md\n?? FIXLOG.md\n?? examples/lcp_automation_chatgpt/PROVENANCE.md\n?? examples/lcp_automation_chatgpt/meta.json\n?? examples/lcp_automation_chatgpt/oracle/",
+    "git_status_note": "Captured against the tree as it stood when this run's tool invocation was executed, i.e. before this run's own additions of reports/2026-08-23/* and src/test/java/io/sealfsm/corpus/LcpAutomationChatgptTest.java. The tree was dirty: the lcp_automation_chatgpt intake plus CORPUS_PROTOCOL.md and FIXLOG.md were uncommitted, as recorded verbatim above. Run against a dirty tree per explicit instruction; not cleaned.",
+    "jdk_version": "21.0.8 (2025-07-15 LTS), Oracle Corporation, HotSpot 64-Bit Server VM",
+    "maven_version": "Apache Maven 3.9.15",
+    "scope": "dev",
+    "holdout_unsealed": false,
+    "invoking_instruction_contained_unseal_holdout_token": false,
+    "corpus": {
+      "note": "Counts below are for protocol-conformant corpus examples only (meta.json + PROVENANCE.md + oracle/ present), per CORPUS_PROTOCOL.md section 2. Directories under examples/ that carry .java at the top level with no meta.json are pre-protocol development fixtures and are excluded from every count in this object; they are listed separately under pre_protocol_fixtures_excluded, not scored, and not corpus evidence.",
+      "total": 1,
+      "by_split": {"dev": 1, "holdout": 0},
+      "by_idiom": {"CENTRALIZED_DISPATCH": 1},
+      "by_commit_shape": {"argument-passed": 1},
+      "by_verdict": {"fsm": 1},
+      "by_oracle_provenance": {"external-spec": 1}
+    },
+    "pre_protocol_fixtures_excluded": {
+      "count": 29,
+      "note": "examples/<name>/ directories with .java at top level and no meta.json; development fixtures of the tool, not corpus evidence under section 2. Not compiled, not run, not scored in this report.",
+      "ids": ["accumulator", "barefield", "cancellation", "dhcp-client-chatgpt", "dhcp-client-claude", "door", "errorhandling", "eventalphabet", "factory", "ffmpeg", "foreignfold", "gofcontext", "guardforms", "http2-stream-claude", "http2-stream-gemini", "lcp_automation", "localvar", "namecollision", "nondeterministic", "nonreturning", "plumbing", "plumbing-mutation", "shape", "tcp", "traffic", "treebuilder", "turnstile", "valueforms", "websocket-claude"]
+    }
+  },
+  "examples": [
+    {
+      "id": "lcp_automation_chatgpt",
+      "split": "dev",
+      "idiom": "CENTRALIZED_DISPATCH",
+      "commit_shape": "argument-passed",
+      "expected_verdict": "fsm",
+      "fp_family": null,
+      "added_at_tool_commit": "2d397ca5438d06b9954f7cdfacc0e7a3e74da292",
+      "source_permalink": null,
+      "source_permalink_note": "null in meta.json; this is a synthesized example (synthesis_basis: RFC 1661 section 4.1), not a harvested one, so there is no permalink to revalidate.",
+      "link_status": "ok",
+      "link_revalidation": {
+        "checked_at_utc": "2026-08-23T11:41:00Z",
+        "urls_checked": [
+          {"url": "https://www.rfc-editor.org/rfc/rfc1661.txt", "http_status": 200},
+          {"url": "https://web.archive.org/web/20260823112350/https://www.rfc-editor.org/rfc/rfc1661.txt", "http_status": 200}
+        ]
+      },
+      "command": "java -jar target/sealfsm.jar --src examples/lcp_automation_chatgpt/java --out out/lcp_automation_chatgpt",
+      "compiled": true,
+      "exit_code": 1,
+      "wall_time_ms": 1922,
+      "crashed": false,
+      "timed_out": false,
+      "machines_emitted": 0,
+      "dot_emitted": false,
+      "scxml_emitted": false,
+      "verdict_correct": false,
+      "verdict_note": "expected_verdict=fsm; tool emitted zero machines for lcpchatgpt.LcpState. Not a not_fsm negative control, so a zero-machine result is non-detection of a real machine, not a correct rejection.",
+      "states": {
+        "expected": 10,
+        "actual": 0,
+        "exact_match": false,
+        "missing": ["Initial", "Starting", "Closed", "Stopped", "Closing", "Stopping", "ReqSent", "AckRcvd", "AckSent", "Opened"],
+        "extra": []
+      },
+      "transitions": {
+        "oracle_n": 120,
+        "tool_n": 0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 120,
+        "unresolved_total": 0,
+        "unresolved_covering_oracle": 0,
+        "unresolved_spurious": 0,
+        "dropped_without_marker": 120,
+        "dropped_without_marker_note": "All 120 oracle transitions are neither extracted nor covered by any unresolved edge, because zero machines were emitted. Recorded separately from fn per protocol section 10; fn=120 and dropped_without_marker=120 coincide here only because unresolved_total=0."
+      },
+      "events_extracted": false,
+      "event_matching": "degraded",
+      "event_matching_note": "No machine was emitted, so the event alphabet was never enumerated; events_extracted=false and event_matching=degraded per protocol section 10. In this example the degradation is total: no (source,target) pairs were scored either, since tool_n=0.",
+      "diagnostics_emitted": ["[INFO] lcpchatgpt.LcpState: skipped - no transition producer found (may be event/? type or unresolved dispatch)"],
+      "findings": ["centralized-carrier-nondetection"]
+    }
+  ],
+  "aggregate": {
+    "note": "n=1 protocol-conformant dev example. Per-idiom/per-commit-shape stratified recall and precision/recall/F1 are not computed: a single-example corpus produces a number that reads as a stratified result but is not one, and CORPUS_PROTOCOL.md section 13 requires N < 20 cells to omit the percentage in any case. Raw counts only, below.",
+    "states": {"exact": 0, "n": 1},
+    "transitions": {
+      "tp": 0, "fp": 0, "fn": 120, "dropped_without_marker": 120,
+      "precision": null, "recall": null, "f1": null,
+      "abstentions_excluded_from_precision": 0,
+      "abstentions_note": "unresolved_total=0 across the corpus this run, so the exclusion is vacuous, not omitted."
+    },
+    "negative_class": {
+      "n": 0, "correctly_rejected": 0, "false_positives": 0,
+      "note": "No not_fsm example exists in the protocol-conformant dev corpus at this run (n=1, expected_verdict=fsm). The section 8 negative quota (>=1 in 4) is unmet at the corpus level; recorded as a coverage gap, not computed as a rate."
+    }
+  },
+  "regression_vs": {
+    "previous_run": null,
+    "previous_tool_commit": null,
+    "note": "First run under CORPUS_PROTOCOL.md. No previous dated run exists under reports/. No baseline to diff against; regressed/fixed/unchanged_failing are not computed and are not invented.",
+    "regressed": [], "fixed": [], "unchanged_failing": []
+  }
+}

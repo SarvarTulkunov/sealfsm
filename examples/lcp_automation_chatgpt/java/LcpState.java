@@ -1,3 +1,5 @@
+package lcpchatgpt;
+
 /**
  * A state of the RFC 1661 Link Control Protocol option-negotiation automaton.
  */

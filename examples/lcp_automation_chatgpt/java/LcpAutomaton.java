@@ -1,3 +1,5 @@
+package lcpchatgpt;
+
 import java.util.List;
 
 /** Implements the RFC 1661 §4.1 LCP option-negotiation state transition table. */
@@ -42,7 +44,8 @@ public final class LcpAutomaton {
         return switch (event) {
             case UP -> transition(new Closed(), List.of());
             case OPEN -> transition(new Starting(), List.of(LcpAction.TLS));
-            case DOWN, CLOSE, TO_PLUS, TO_MINUS, RCR_PLUS, RCR_MINUS, RCA, RCN, RTR, RTA, RUC, RXJ_PLUS, RXJ_MINUS, RXR -> illegal(new Initial(), event);
+            case CLOSE -> transition(new Initial(), List.of());
+            case DOWN, TO_PLUS, TO_MINUS, RCR_PLUS, RCR_MINUS, RCA, RCN, RTR, RTA, RUC, RXJ_PLUS, RXJ_MINUS, RXR -> illegal(new Initial(), event);
         };
     }
 
@@ -61,9 +64,13 @@ public final class LcpAutomaton {
             case DOWN -> transition(new Initial(), List.of());
             case OPEN -> transition(new ReqSent(), List.of(LcpAction.IRC, LcpAction.SCR));
             case CLOSE -> transition(new Closed(), List.of());
-            case RCR_PLUS, RCR_MINUS -> transition(new Closed(), List.of(LcpAction.STA));
-            case RCA, RCN, RTR, RUC, RXJ_PLUS, RXJ_MINUS, RXR -> illegal(new Closed(), event);
-            case UP, TO_PLUS, TO_MINUS, RTA -> illegal(new Closed(), event);
+            case RCR_PLUS, RCR_MINUS, RCA, RCN, RTR -> transition(new Closed(), List.of(LcpAction.STA));
+            case RTA -> transition(new Closed(), List.of());
+            case RUC -> transition(new Closed(), List.of(LcpAction.SCJ));
+            case RXJ_PLUS -> transition(new Closed(), List.of());
+            case RXJ_MINUS -> transition(new Closed(), List.of(LcpAction.TLF));
+            case RXR -> transition(new Closed(), List.of());
+            case UP, TO_PLUS, TO_MINUS -> illegal(new Closed(), event);
         };
     }
 
@@ -71,10 +78,10 @@ public final class LcpAutomaton {
         return switch (event) {
             case DOWN -> transition(new Starting(), List.of(LcpAction.TLS));
             case OPEN -> transition(new Stopped(), List.of());
-            case CLOSE -> transition(new Stopped(), List.of());
-            case RCR_PLUS -> transition(new Stopped(), List.of(LcpAction.IRC, LcpAction.SCR, LcpAction.SCA));
-            case RCR_MINUS -> transition(new Stopped(), List.of(LcpAction.IRC, LcpAction.SCR, LcpAction.SCN));
-            case RCA, RCN -> transition(new Stopped(), List.of());
+            case CLOSE -> transition(new Closed(), List.of());
+            case RCR_PLUS -> transition(new AckSent(), List.of(LcpAction.IRC, LcpAction.SCR, LcpAction.SCA));
+            case RCR_MINUS -> transition(new ReqSent(), List.of(LcpAction.IRC, LcpAction.SCR, LcpAction.SCN));
+            case RCA, RCN -> transition(new Stopped(), List.of(LcpAction.STA));
             case RTR -> transition(new Stopped(), List.of(LcpAction.STA));
             case RTA -> transition(new Stopped(), List.of());
             case RUC -> transition(new Stopped(), List.of(LcpAction.SCJ));
@@ -87,7 +94,7 @@ public final class LcpAutomaton {
 
     private LcpTransition fromClosing(LcpEvent event) {
         return switch (event) {
-            case DOWN -> transition(new Closed(), List.of());
+            case DOWN -> transition(new Initial(), List.of());
             case OPEN -> transition(new Stopping(), List.of());
             case CLOSE -> transition(new Closing(), List.of());
             case TO_PLUS -> transition(new Closing(), List.of(LcpAction.STR));
@@ -105,7 +112,7 @@ public final class LcpAutomaton {
 
     private LcpTransition fromStopping(LcpEvent event) {
         return switch (event) {
-            case DOWN -> transition(new Initial(), List.of());
+            case DOWN -> transition(new Starting(), List.of());
             case OPEN -> transition(new Stopping(), List.of());
             case CLOSE -> transition(new Closing(), List.of());
             case TO_PLUS -> transition(new Stopping(), List.of(LcpAction.STR));
@@ -147,16 +154,16 @@ public final class LcpAutomaton {
             case DOWN -> transition(new Starting(), List.of());
             case OPEN -> transition(new AckRcvd(), List.of());
             case CLOSE -> transition(new Closing(), List.of(LcpAction.IRC, LcpAction.STR));
-            case TO_PLUS -> transition(new AckRcvd(), List.of(LcpAction.SCR));
-            case TO_MINUS -> transition(new Stopped(), List.of(LcpAction.TLF));
+            case TO_PLUS -> transition(new ReqSent(), List.of(LcpAction.SCR));
+            case TO_MINUS -> configureTimeoutExpired();
             case RCR_PLUS -> transition(new Opened(), List.of(LcpAction.SCA, LcpAction.TLU));
             case RCR_MINUS -> transition(new AckRcvd(), List.of(LcpAction.SCN));
             case RCA -> transition(new ReqSent(), List.of(LcpAction.SCR));
             case RCN -> transition(new ReqSent(), List.of(LcpAction.SCR));
-            case RTR -> transition(new AckRcvd(), List.of(LcpAction.STA));
-            case RTA -> transition(new AckRcvd(), List.of());
+            case RTR -> transition(new ReqSent(), List.of(LcpAction.STA));
+            case RTA -> transition(new ReqSent(), List.of());
             case RUC -> transition(new AckRcvd(), List.of(LcpAction.SCJ));
-            case RXJ_PLUS -> transition(new AckRcvd(), List.of());
+            case RXJ_PLUS -> transition(new ReqSent(), List.of());
             case RXJ_MINUS -> transition(new Stopped(), List.of(LcpAction.TLF));
             case RXR -> transition(new AckRcvd(), List.of());
             case UP -> illegal(new AckRcvd(), event);
@@ -171,11 +178,11 @@ public final class LcpAutomaton {
             case TO_PLUS -> transition(new AckSent(), List.of(LcpAction.SCR));
             case TO_MINUS -> configureTimeoutExpired();
             case RCR_PLUS -> transition(new AckSent(), List.of(LcpAction.SCA));
-            case RCR_MINUS -> transition(new AckSent(), List.of(LcpAction.SCN));
+            case RCR_MINUS -> transition(new ReqSent(), List.of(LcpAction.SCN));
             case RCA -> transition(new Opened(), List.of(LcpAction.IRC, LcpAction.TLU));
             case RCN -> transition(new AckSent(), List.of(LcpAction.IRC, LcpAction.SCR));
-            case RTR -> transition(new AckSent(), List.of(LcpAction.STA));
-            case RTA -> transition(new Opened(), List.of());
+            case RTR -> transition(new ReqSent(), List.of(LcpAction.STA));
+            case RTA -> transition(new AckSent(), List.of());
             case RUC -> transition(new AckSent(), List.of(LcpAction.SCJ));
             case RXJ_PLUS -> transition(new AckSent(), List.of());
             case RXJ_MINUS -> transition(new Stopped(), List.of(LcpAction.TLF));

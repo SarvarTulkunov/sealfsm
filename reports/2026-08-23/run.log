@@ -1,0 +1,83 @@
+SealFSM corpus run — 2026-08-23T11:44:05Z
+Scope: split == dev (no UNSEAL-HOLDOUT token in the invoking instruction; holdout not compiled, not run, not scored)
+Tool commit: 2d397ca5438d06b9954f7cdfacc0e7a3e74da292
+JDK: 21.0.8 (2025-07-15 LTS)
+
+Build
+-----
+$ mvn -q -DskipTests package
+(exit 0, no output)
+
+target/sealfsm.jar present (15308662 bytes)
+
+Example 1/1: lcp_automation_chatgpt
+------------------------------------
+meta.json: split=dev, idiom=CENTRALIZED_DISPATCH, commit_shape=argument-passed,
+expected_verdict=fsm, oracle_provenance=external-spec
+
+$ java -jar target/sealfsm.jar --src examples/lcp_automation_chatgpt/java --out out/lcp_automation_chatgpt
+exit_code: 1
+wall_time_ms: 1922
+
+stdout:
+
+Found 0 state machine(s); wrote 0 file(s) to C:\PC\Riga Technical University\Thesis\Implmentation_V1\sealfsm\out\lcp_automation_chatgpt
+----------------------------------------------------------------------------------------------------------------
+MACHINE                DISPATCH             STATES  TRANS  RESOLVED  COMMIT                       SUCCESSOR FORMS
+------------------------------------------------------------------------
+Diagnostics:
+  [INFO] lcpchatgpt.LcpState: skipped - no transition producer found (may be event/? type or unresolved dispatch)
+
+stderr:
+SLF4J(W): No SLF4J providers were found.
+SLF4J(W): Defaulting to no-operation (NOP) logger implementation
+SLF4J(W): See https://www.slf4j.org/codes.html#noProviders for further details.
+
+Output files: none (0 files written to out/lcp_automation_chatgpt/; no .dot, no .scxml)
+crashed: false (exit code 1 is Main's deliberate "zero machines found" exit path, not an
+                uncaught exception; stderr carries only SLF4J provider warnings)
+timed_out: false
+
+Comparison against oracle/states.txt (10 states) and oracle/transitions.tsv (120 rows):
+  states:      actual=0 expected=10  exact_match=false
+               missing=[Initial, Starting, Closed, Stopped, Closing, Stopping,
+                        ReqSent, AckRcvd, AckSent, Opened]
+               extra=[]
+  transitions: oracle_n=120 tool_n=0 tp=0 fp=0 fn=120
+               unresolved_total=0 unresolved_covering_oracle=0 unresolved_spurious=0
+               dropped_without_marker=120 (all 120; no unresolved edge exists to cover any of them)
+  events_extracted: false -> event_matching: degraded (no machine emitted, Sigma never enumerated)
+
+verdict_correct: false (expected fsm; tool recovered no machine)
+
+Link revalidation
+-----------------
+source_permalink: null (synthesized example, not harvested; nothing to revalidate there)
+$ curl -s -o /dev/null -w "HTTP_%{http_code}\n" --max-time 15 https://www.rfc-editor.org/rfc/rfc1661.txt
+HTTP_200
+$ curl -s -o /dev/null -w "HTTP_%{http_code}\n" --max-time 15 "https://web.archive.org/web/20260823112350/https://www.rfc-editor.org/rfc/rfc1661.txt"
+HTTP_200
+link_status: ok (re-confirmed; matches meta.json's recorded ok)
+
+Pre-protocol fixtures (not run, not scored, per CORPUS_PROTOCOL.md section 2)
+-------------------------------------------------------------------------------
+29 directories under examples/ carry .java at the top level with no meta.json:
+accumulator, barefield, cancellation, dhcp-client-chatgpt, dhcp-client-claude, door,
+errorhandling, eventalphabet, factory, ffmpeg, foreignfold, gofcontext, guardforms,
+http2-stream-claude, http2-stream-gemini, lcp_automation, localvar, namecollision,
+nondeterministic, nonreturning, plumbing, plumbing-mutation, shape, tcp, traffic,
+treebuilder, turnstile, valueforms, websocket-claude.
+None were compiled, run, or scored under this protocol run.
+
+JUnit
+-----
+$ mvn -q -Dtest=io.sealfsm.corpus.LcpAutomationChatgptTest -DfailIfNoTests=false test
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0
+[ERROR] io.sealfsm.corpus.LcpAutomationChatgptTest.statesAndTransitionsMatchTheFrozenOracle
+org.opentest4j.AssertionFailedError: expected exactly one recovered machine for
+lcpchatgpt.LcpState (meta.json expected_verdict=fsm); diagnostics:
+[[INFO] lcpchatgpt.LcpState: skipped - no transition producer found
+(may be event/? type or unresolved dispatch)] ==> expected: <1> but was: <0>
+  at LcpAutomationChatgptTest.statesAndTransitionsMatchTheFrozenOracle(LcpAutomationChatgptTest.java:123)
+
+Test left failing (not disabled, not weakened) per CORPUS_PROTOCOL.md section 9.
