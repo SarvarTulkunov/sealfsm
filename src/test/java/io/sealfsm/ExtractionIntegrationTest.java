@@ -19,6 +19,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1262,6 +1263,163 @@ class ExtractionIntegrationTest {
                 "an inferred initial state must be reported as weaker evidence");
     }
 
+    // ---- initial state: no rule may pick between rival candidates -----------
+
+    /**
+     * The seeded-FIELD rule is the strongest of the three and was the only one
+     * that did not require its candidates to agree: it returned the first field
+     * the model walk happened to reach. Two drivers over one hierarchy, seeded
+     * from different states, therefore had the machine's start decided by
+     * filename — on this fixture the old rule reported {@code Shut}, and
+     * renaming {@code PrimaryDriver} so it sorted last reported {@code Flowing}
+     * from byte-identical logic.
+     *
+     * <p>The relation in {@code examples/rivalseeds} is strongly connected, so
+     * the structural rule below has no candidate either and cannot mask the
+     * outcome: abstaining here means the machine reports a GAP, which is the
+     * honest answer when the program does not say where it starts.
+     */
+    @Test
+    void rivalSeededFieldsAbstainRatherThanLetSourceOrderDecide() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/rivalseeds"));
+        StateMachine sluice = named(r, "Sluice");
+
+        assertEquals(3, sluice.allStates().size());
+        assertEquals(9, sluice.transitions().size(), "3 states x 3 commands");
+        assertEquals(9, sluice.resolvedTransitionCount());
+
+        assertTrue(sluice.initialState().isEmpty(),
+                "rival seeds must yield a reported gap, not a coin flip: got "
+                        + sluice.initialState().orElse(null));
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("disagree on the initial state")
+                                && d.message().contains("Shut")
+                                && d.message().contains("Flowing")),
+                "the abstention must name both rival candidates, not pass silently");
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("initial state could not be determined")),
+                "and the gap itself must still be reported");
+    }
+
+    /**
+     * The negative control, in the same model. {@code Damper} also has two
+     * drivers holding a seeded field — so the rule collects more than one
+     * candidate — but they agree, and an agreed answer must still be reported.
+     * Without this, "require unanimity" and "give up as soon as a second driver
+     * exists" are indistinguishable, and the second silently costs an initial
+     * state on every program that constructs its machine twice.
+     *
+     * <p>{@code Damper} is strongly connected too, so {@code Parked} cannot have
+     * come from the structural rule: it is the seeded-field rule answering.
+     */
+    @Test
+    void agreeingSeededFieldsStillYieldAnInitialState() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/rivalseeds"));
+        StateMachine damper = named(r, "Damper");
+
+        assertEquals("Parked", damper.initialState().orElse(null));
+        assertFalse(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("rivalseeds.Damper")
+                                && d.message().contains("disagree on the initial state")),
+                "agreeing seeds are not a disagreement");
+    }
+
+    /**
+     * The second control, and the one that keeps the unanimity rule from costing
+     * more than it saves. A state's own flyweight instance — {@code static final
+     * Ratchet INSTANCE = new Locked();} declared inside {@code Locked} — is
+     * hierarchy-typed with a constructor-call default, so it reaches the
+     * seeded-field rule looking exactly like a driver's current-state field.
+     *
+     * <p>{@code examples/rivalseeds.Ratchet} has ONE real driver, seeded FREE,
+     * beside two such flyweights. Counting the flyweights as candidates makes
+     * them disagree with the driver, at which point unanimity abstains and a
+     * machine whose start state IS stated in its source reports a gap instead.
+     * Ablating the exclusion does exactly that: {@code Free} is lost and the run
+     * warns that {@code [Free, Locked]} disagree. Fixing a fabricated answer
+     * must not manufacture a lost one.
+     */
+    @Test
+    void flyweightSingletonsDoNotVetoARealDriversSeed() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/rivalseeds"));
+        StateMachine ratchet = named(r, "Ratchet");
+
+        assertEquals("Free", ratchet.initialState().orElse(null),
+                "the driver's seed is the only seed; the flyweights are not candidates");
+        assertFalse(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("rivalseeds.Ratchet")
+                                && d.message().contains("disagree on the initial state")),
+                "a state's own singleton must not be reported as a rival seed");
+    }
+
+    /**
+     * Scope isolation for the seeded-field rule, which the fixture gets for free
+     * by holding three hierarchies in one package: each machine's seeds must be
+     * read only for that machine, or they would resolve each other's start
+     * states. The rule filters on the field's declared TYPE for the same reason
+     * the mutation path does.
+     */
+    @Test
+    void seededFieldsDoNotLeakBetweenMachinesInOneModel() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/rivalseeds"));
+
+        assertTrue(named(r, "Sluice").initialState().isEmpty(),
+                "the other machines' agreeing seeds must not resolve Sluice");
+        assertEquals("Parked", named(r, "Damper").initialState().orElse(null),
+                "Sluice's disagreement must not suppress Damper");
+        assertEquals("Free", named(r, "Ratchet").initialState().orElse(null),
+                "Sluice's disagreement must not suppress Ratchet");
+    }
+
+    /**
+     * The machine's own code does not say where the machine starts, and
+     * {@code examples/valueforms} is the fixture that proves it: it has no
+     * driver, no context object and no seeded local outside the hierarchy, so
+     * the honest report is a GAP. Two separate rules were reading its internals
+     * as evidence and each produced a different fabricated answer.
+     *
+     * <ul>
+     *   <li>The seeded-FIELD rule saw {@code Armed.INSTANCE = new Armed()} and
+     *       {@code Idle.INSTANCE = new Idle()} — flyweight singletons, both
+     *       hierarchy-typed with a constructor-call default, and it reported
+     *       {@code Armed} purely because that file was walked first. Unanimity
+     *       alone would abstain here, so what the singleton exclusion buys on
+     *       THIS fixture is the diagnostic: two flyweights are not two drivers
+     *       disagreeing, and saying so would be a false statement about the
+     *       program. Where it is load-bearing for the answer is
+     *       {@code rivalseeds.Ratchet} — see
+     *       {@link #flyweightSingletonsDoNotVetoARealDriversSeed()}.</li>
+     *   <li>The seeded-LOCAL rule then saw {@code Signal next = new Firing();}
+     *       inside {@code Armed.on} — a successor under construction, not a
+     *       seed. So abstaining at rule 1 does not by itself fix this fixture:
+     *       it moves the fabricated answer from {@code Armed} to {@code Firing}.
+     *       The rule rests on the local being a DRIVER's starting point, which
+     *       is a claim about code outside the machine.</li>
+     * </ul>
+     */
+    @Test
+    void theMachinesOwnInternalsAreNotInitialStateEvidence() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/valueforms"));
+        StateMachine m = single(r);
+
+        String got = m.initialState().orElse(null);
+        assertNotEquals("Firing", got, "a successor built in a local inside the hierarchy is not a seed");
+        assertTrue(m.initialState().isEmpty(),
+                "with no driver anywhere, the honest report is a gap: got " + got);
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("initial state could not be determined")),
+                "and the gap must be reported, not passed over in silence");
+        assertFalse(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("disagree on the initial state")),
+                "two flyweight singletons are not two drivers disagreeing");
+
+        // The initial-state rules touch nothing else: enumeration stays exact and
+        // the recovered relation is unchanged.
+        assertEquals(6, m.allStates().size());
+        assertEquals(10, m.transitions().size());
+        assertEquals(9, m.resolvedTransitionCount());
+    }
+
     @Test
     void theCentralizedFunctionCountIsOfDistinctHosts() {
         // The signature-based recognizer and DispatchCommitDetector legitimately
@@ -1274,6 +1432,95 @@ class ExtractionIntegrationTest {
         assertTrue(r.diagnostics().stream()
                         .anyMatch(d -> d.message().contains("1 centralized transition function")),
                 "door has one transition function, not two");
+    }
+
+    // ---- F14: a branch that throws does not fall through --------------------
+
+    @Test
+    void aThrowingRejectionBranchNegatesIntoTheFallThroughGuard() {
+        // `if (bad) throw ...; yield new A();` has no `else`, yet the producer
+        // below is reached only when the test failed. The fall-through guard was
+        // already threaded across siblings, but "does this branch fall through?"
+        // was answered from `return`/`yield` alone — so a branch leaving by a
+        // THROW, which is how an arm rejects an input, was read as falling
+        // through and the producer was reported as unconditional. Guards feed the
+        // SCXML `cond` attribute and the nondeterminism analysis, so this was a
+        // silent loss in a dimension the thesis reports on.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/throwguards"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of(CommitForm.VALUE_RETURN), m.commitForms());
+        assertEquals(Set.of("Charged", "Venting", "Faulted", "Bleeding", "Latched", "Purging"),
+                stateIds(m));
+        assertEquals(6, m.transitions().size());
+        assertEquals(0, m.unresolvedTransitionCount());
+
+        // A bare `throw`.
+        assertTrue(guardOf(m, "Charged", "Venting").contains("RESET"),
+                "the producer below a throwing branch fires only when the test failed");
+        // A block whose LAST statement is a throw — the bookkeeping call before
+        // it does not change how the block completes.
+        assertTrue(guardOf(m, "Venting", "Charged").contains("PURGE"),
+                "a block ending in a throw completes abruptly too");
+        // An exhaustive switch statement, every arm of which throws: no arm and
+        // no `break` can carry control past it.
+        assertTrue(guardOf(m, "Faulted", "Charged").contains("RESET"),
+                "an exhaustive all-throwing switch cannot complete normally");
+
+        // Every recovered guard here is a NEGATION of the rejection test, which
+        // is the whole content of the finding.
+        for (String from : List.of("Charged", "Venting", "Faulted")) {
+            assertTrue(guardOf(m, from, null).startsWith("!("),
+                    from + "'s guard must be the negated rejection test");
+        }
+
+        // NEGATIVE CONTROL 1 — the Bleeding arm CONTAINS a throw but takes it
+        // only conditionally, so it completes normally and its producer is
+        // unconditional. Reading "contains a throw" as "always throws" would
+        // fabricate a guard: the edge would claim not to fire on OPEN, a
+        // stronger claim than the source makes and the direction the soundness
+        // invariant forbids.
+        assertTrue(hasResolved(m, "Bleeding", "Faulted"));
+        assertNull(guardOrNull(m, "Bleeding", "Faulted"),
+                "a conditionally-thrown branch still falls through; its successor is unguarded");
+
+        // NEGATIVE CONTROL 2 — the Latched arm's switch is exhaustive, but its
+        // default arm leaves by `break`, so control resumes immediately after it.
+        // That switch is a bare sibling rather than an `if` branch, so misjudging
+        // it does not merely mislabel a guard: the producer below would be
+        // written off as unreachable and the EDGE WOULD BE LOST.
+        assertTrue(hasResolved(m, "Latched", "Venting"),
+                "a switch left by `break` completes normally; the producer after it is live");
+        assertNull(guardOrNull(m, "Latched", "Venting"),
+                "and it is reached on every input, so it carries no guard");
+
+        // NEGATIVE CONTROL 3 — the Purging arm's switch ends in a `default:`
+        // label carrying no statements. An empty arm is answered by the group
+        // below it, which is exactly why the LAST one cannot be: there is
+        // nothing below, so control falls out of the switch. Answering "yes"
+        // there deletes this edge and reports the machine as a clean 5/5 — a
+        // transition dropped with no unresolved marker, which is the one
+        // outcome the record-everything invariant forbids.
+        assertTrue(hasResolved(m, "Purging", "Charged"),
+                "an empty trailing arm falls out of the switch; the producer after it is live");
+        assertNull(guardOrNull(m, "Purging", "Charged"));
+    }
+
+    /** The guard of the one resolved edge out of {@code from} (to {@code to}, or wherever). */
+    private String guardOf(StateMachine m, String from, String to) {
+        String g = guardOrNull(m, from, to);
+        assertNotNull(g, "expected a guard on the edge out of " + from);
+        return g;
+    }
+
+    private String guardOrNull(StateMachine m, String from, String to) {
+        List<Transition> edges = m.transitions().stream()
+                .filter(t -> t.from().equals(from) && (to == null || to.equals(t.to())))
+                .toList();
+        assertEquals(1, edges.size(), "expected exactly one edge out of " + from);
+        String g = edges.get(0).guard();
+        return g == null || g.isBlank() ? null : g;
     }
 
     // ---- negative controls -------------------------------------------------

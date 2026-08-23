@@ -14,10 +14,12 @@ import spoon.reflect.code.CtAbstractSwitch;
 import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtBinaryOperator;
 import spoon.reflect.code.CtBlock;
+import spoon.reflect.code.CtBreak;
 import spoon.reflect.code.CtCase;
 import spoon.reflect.code.CtCatch;
 import spoon.reflect.code.CtConditional;
 import spoon.reflect.code.CtConstructorCall;
+import spoon.reflect.code.CtContinue;
 import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtIf;
@@ -30,8 +32,10 @@ import spoon.reflect.code.CtStatement;
 import spoon.reflect.code.CtSwitch;
 import spoon.reflect.code.CtSwitchExpression;
 import spoon.reflect.code.CtThisAccess;
+import spoon.reflect.code.CtThrow;
 import spoon.reflect.code.CtTry;
 import spoon.reflect.code.CtTypeAccess;
+import spoon.reflect.code.CtTypePattern;
 import spoon.reflect.code.CtVariableAccess;
 import spoon.reflect.code.CtYieldStatement;
 import spoon.reflect.cu.SourcePosition;
@@ -1583,12 +1587,32 @@ public final class TransitionExtractor {
     }
 
     /**
-     * Best-effort: does control leaving {@code st} never fall through to the next
-     * statement? Used only to sharpen guards, so it is deliberately conservative
-     * (returns {@code false} when unsure).
+     * Best-effort answer to JLS §14.22 — <em>can</em> this statement complete
+     * normally? — inverted: does control leaving {@code st} never fall through
+     * to the next statement? Two things ride on it: the negated condition of an
+     * {@code if} with no {@code else} becomes the guard of every later sibling,
+     * and a sibling after a statement that cannot complete normally is not
+     * walked at all. Both directions of a wrong answer are damaging — a false
+     * {@code true} either fabricates a guard the source does not impose or
+     * writes off a live producer as unreachable, a false {@code false} emits a
+     * guard weaker than the code — so the rule is exact where it fires and
+     * answers {@code false} whenever it is unsure.
+     *
+     * <p>F14: {@code throw} was missing, and it is the common way an arm
+     * rejects an input. {@code if (bad) throw ...; yield new A();} therefore
+     * reported the producer as unconditional, which is a claim the source does
+     * not make: guards reach the SCXML {@code cond} attribute and the
+     * nondeterminism analysis, so the loss was silent.
      */
     private static boolean alwaysTerminates(CtStatement st) {
-        if (st instanceof CtReturn<?> || st instanceof CtYieldStatement) {
+        if (st instanceof CtReturn<?> || st instanceof CtYieldStatement
+                || st instanceof CtThrow) {
+            return true;
+        }
+        // `break`/`continue` complete abruptly too: control leaves for the
+        // enclosing switch's end or the loop's next iteration, so the following
+        // sibling is not reached on this path either.
+        if (st instanceof CtBreak || st instanceof CtContinue) {
             return true;
         }
         if (st instanceof CtBlock<?> block) {
@@ -1600,7 +1624,95 @@ public final class TransitionExtractor {
                     && alwaysTerminates(ctIf.getThenStatement())
                     && alwaysTerminates(ctIf.getElseStatement());
         }
+        if (st instanceof CtSwitch<?> sw) {
+            return switchAlwaysTerminates(sw);
+        }
         return false;
+    }
+
+    /**
+     * A {@code switch} statement cannot complete normally only when <em>every</em>
+     * way out of it is abrupt. Three conditions, and dropping any one of them
+     * turns the rule into a fabrication:
+     *
+     * <ol>
+     *   <li>it must be <b>exhaustive</b> — otherwise a selector matching no label
+     *       falls straight through to the next statement;</li>
+     *   <li>no {@code break} may target it — a {@code break} resumes control
+     *       immediately <em>after</em> the switch, which is precisely the
+     *       fall-through this predicate denies;</li>
+     *   <li>every arm must itself terminate.</li>
+     * </ol>
+     *
+     * <p>Condition 2 is answered by the presence of any {@code break} anywhere
+     * beneath the switch, which over-counts a {@code break} belonging to a nested
+     * loop. That is the conservative direction (the predicate declines rather
+     * than claims) and it keeps the rule free of scope reasoning it would
+     * otherwise have to get exactly right.
+     */
+    private static boolean switchAlwaysTerminates(CtSwitch<?> sw) {
+        try {
+            List<? extends CtCase<?>> cases = sw.getCases();
+            if (cases.isEmpty() || !isExhaustive(cases)) return false;
+            if (!sw.getElements(new TypeFilter<>(CtBreak.class)).isEmpty()) return false;
+            for (int i = 0; i < cases.size(); i++) {
+                if (!caseAlwaysTerminates(cases.get(i), i == cases.size() - 1)) return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            return false; // unknown shape: assume it falls through, the safe direction
+        }
+    }
+
+    /**
+     * Exhaustive by a rule the compiler has already checked, never by counting
+     * labels against a type: a {@code default} arm covers everything by
+     * definition, and a pattern label makes this an <em>enhanced</em> switch
+     * statement, which JLS §14.11.2 requires to be exhaustive. An enum switch
+     * with no {@code default} is a legacy switch and is not required to cover
+     * its constants, so it answers {@code false} even when it happens to.
+     */
+    private static boolean isExhaustive(List<? extends CtCase<?>> cases) {
+        for (CtCase<?> c : cases) {
+            List<? extends CtExpression<?>> labels = c.getCaseExpressions();
+            if (labels == null || labels.isEmpty()) return true; // `default`
+            for (CtExpression<?> label : labels) {
+                if (isPatternLabel(label)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Is this case label a pattern rather than a constant? Spoon has spelled it
+     * both ways — a bare {@code CtTypePattern} in 10.x, a {@code CtCasePattern}
+     * wrapping one since 11 — so the newer form is probed reflectively, in the
+     * style of {@link #patternType}. It must not answer yes for an enum constant:
+     * a constant read carries its enum's type, and a rule keyed on "the label has
+     * a type" would call every enum switch exhaustive.
+     */
+    private static boolean isPatternLabel(CtExpression<?> label) {
+        return label instanceof CtTypePattern || tryMethod(label, "getPattern") != null;
+    }
+
+    /**
+     * Does this arm complete abruptly? An arm with no statements is a colon-style
+     * label falling into the group below, which answers for both — unless it is
+     * the LAST group, where the fall-through leaves the switch: {@code switch (x)
+     * { default: }} completes normally precisely because nothing follows it.
+     */
+    private static boolean caseAlwaysTerminates(CtCase<?> c, boolean lastGroup) {
+        List<CtStatement> body = c.getStatements();
+        if (body.isEmpty()) return !lastGroup;
+        CtStatement last = body.get(body.size() - 1);
+        // F10 — Spoon wraps the arrow arm of a switch STATEMENT in a synthetic
+        // CtYieldStatement, though `yield` is illegal outside a switch
+        // expression. It stands for an expression whose value is discarded, and
+        // an expression statement completes normally. A genuine `yield` is
+        // always nested inside an arm's own block, never a direct child of the
+        // case, so this one-level test cannot mistake the two.
+        if (last instanceof CtYieldStatement) return false;
+        return alwaysTerminates(last);
     }
 
     /** Resolve one produced expression, descending into a nested switch first. */
@@ -2071,7 +2183,7 @@ public final class TransitionExtractor {
      * accessor names have shifted across versions, so this is fully reflective
      * and best-effort.
      */
-    private CtTypeReference<?> patternType(Object caseExpr) {
+    private static CtTypeReference<?> patternType(Object caseExpr) {
         try {
             Object pattern = caseExpr;
             // CtCasePattern -> getPattern()
