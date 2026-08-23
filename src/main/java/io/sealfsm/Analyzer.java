@@ -14,12 +14,14 @@ import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.Transition;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.CtConstructorCall;
+import spoon.reflect.code.CtLocalVariable;
 import spoon.reflect.declaration.CtField;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -91,9 +93,21 @@ public final class Analyzer {
                 result.warn(root.getQualifiedName(), w);
             }
 
+            initialStateEvidence = null;
             detectInitialState(root, machine, model)
                     .ifPresentOrElse(
-                            machine::setInitialState,
+                            init -> {
+                                machine.setInitialState(init);
+                                // Name the weakest rule's evidence, so a reader can
+                                // separate a proven start point from an inferred one.
+                                if (initialStateEvidence != null) {
+                                    result.info(root.getQualifiedName(),
+                                            "initial state '" + init + "' inferred from "
+                                                    + initialStateEvidence
+                                                    + " — weaker evidence than a state field "
+                                                    + "or an unreachable-source state");
+                                }
+                            },
                             () -> result.warn(root.getQualifiedName(),
                                     "initial state could not be determined"));
 
@@ -111,10 +125,23 @@ public final class Analyzer {
      * Initial-state heuristics, in priority order:
      * <ol>
      *   <li>a field typed as the hierarchy, initialised with {@code new Concrete()};</li>
-     *   <li>the unique state with no resolved incoming edge but ≥1 outgoing edge.</li>
+     *   <li>the unique state with no resolved incoming edge but ≥1 outgoing edge;</li>
+     *   <li>a hierarchy-typed LOCAL initialised with {@code new Concrete()}, when
+     *       every such local in the model agrees on one state.</li>
      * </ol>
-     * Both are reported as heuristic; this is a known weak point and is flagged
+     * All are reported as heuristic; this is a known weak point and is flagged
      * as such in diagnostics when it fails.
+     *
+     * <p>Rule 3 is deliberately last and deliberately unanimous. A local is weaker
+     * evidence than a field — it is typically a driver's or a test's starting
+     * point, not necessarily the machine's — so it is consulted only after the two
+     * structural rules abstain, and it abstains itself the moment two locals
+     * disagree. It exists because a dense automaton defeats rule 2 exactly when it
+     * is most faithful: in RFC 1661's LCP every state including {@code Initial} has
+     * incoming edges, so "no incoming, some outgoing" has no candidate at all. The
+     * asymmetry is intentional — a machine with NO initial state reports a gap,
+     * whereas a wrong one is a fabricated claim, and unanimity is what keeps the
+     * rule from guessing between rival candidates.
      */
     private Optional<String> detectInitialState(CtType<?> root, StateMachine machine, CtModel model) {
         Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
@@ -152,8 +179,37 @@ public final class Analyzer {
         if (candidates.size() == 1) {
             return Optional.of(candidates.get(0));
         }
+
+        // Rule 3: a hierarchy-typed local seeded with a concrete state. Requires
+        // unanimity across the model, so two drivers starting from different
+        // states abstain rather than let source order pick a winner.
+        Set<String> seeded = new LinkedHashSet<>();
+        for (CtLocalVariable<?> local : model.getElements(new TypeFilter<>(CtLocalVariable.class))) {
+            CtTypeReference<?> lt = local.getType();
+            if (lt == null || !hierarchy.contains(lt.getQualifiedName())) continue;
+            if (local.getDefaultExpression() instanceof CtConstructorCall<?> cc) {
+                CtTypeReference<?> init = cc.getType();
+                if (init != null && hierarchy.contains(init.getQualifiedName())) {
+                    seeded.add(init.getSimpleName());
+                }
+            }
+        }
+        if (seeded.size() == 1) {
+            String only = seeded.iterator().next();
+            // Named as the weaker evidence it is, so a reader can tell this apart
+            // from a state the structure proved.
+            initialStateEvidence = "a hierarchy-typed local seeded with new " + only + "()";
+            return Optional.of(only);
+        }
         return Optional.empty();
     }
+
+    /**
+     * Set by {@link #detectInitialState} when the initial state came from the
+     * weakest rule, so the diagnostic can say what it rested on. Null when the
+     * state was found structurally (or not at all).
+     */
+    private String initialStateEvidence;
 
     // Exposed for completeness checks in tests/tools.
     public boolean isSealed(CtType<?> type) {

@@ -10,6 +10,9 @@ import org.junit.jupiter.api.Test;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
 
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -840,7 +843,7 @@ class ExtractionIntegrationTest {
         // unresolved one. Without F9 these were three `-> ?` edges, making the
         // spelling `default -> reject(s, e)` report a different relation from
         // `default -> throw reject(s, e)` for the same machine.
-        assertEquals(4, m.transitions().size(),
+        assertEquals(5, m.transitions().size(),
                 "a helper that cannot return normally is not a transition producer");
 
         // NEGATIVE CONTROL, and the whole risk of this rule: `escalate` DOES
@@ -848,12 +851,34 @@ class ExtractionIntegrationTest {
         // read. `collectReturns` comes back empty for it exactly as it does for
         // `reject`, so a rule keyed on that emptiness would drop a real target.
         // It must stay UNRESOLVED — recorded, never guessed, never dropped.
-        assertEquals(1, m.unresolvedTransitionCount(),
+        assertEquals(2, m.unresolvedTransitionCount(),
                 "a return hidden in a switch is unresolved, not absent");
         assertTrue(m.transitions().stream()
                         .anyMatch(t -> "Idle".equals(t.from()) && "ESCALATE".equals(t.event())
                                 && !t.isResolved()),
                 "the hidden-return helper must remain an unresolved edge from Idle");
+
+        // F11 — SECOND NEGATIVE CONTROL, and the wider hole of the two.
+        // `Objects.requireNonNull(current)` is a JDK method, so Spoon hands back a
+        // reflective SHADOW declaration: a real signature with an empty stub body.
+        // That body has no `return` for the same reason it has nothing at all — it
+        // was never parsed — so its emptiness says nothing about whether the method
+        // returns. F9 read it as proof and DELETED this edge, with no unresolved
+        // marker anywhere: 5 transitions were reported as 4. The same hole swallows
+        // `Optional.orElse(new Fired())` and `map.getOrDefault(k, new Idle())`.
+        // F9's licence to suppress comes from JLS §8.4.7 making the conclusion
+        // exact; on a body the analysis never read, there is no such licence.
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "Idle".equals(t.from()) && "HOLD".equals(t.event())
+                                && !t.isResolved()),
+                "a call into an unread (shadow) body is unresolved, never suppressed");
+
+        // The suppression count must track the three `reject` arms only. If the
+        // shadow call were counted too it would read as a fourth proven rejection —
+        // a false claim dressed in the diagnostic that exists to make F9 auditable.
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().startsWith("3 call(s) to a helper")),
+                "only the three provably-throwing arms may be reported as suppressed");
 
         // The suppression is reported, so it is reclassified rather than silent —
         // the "never silently dropped" invariant is about visibility, and this
@@ -909,6 +934,283 @@ class ExtractionIntegrationTest {
         assertTrue(s.isTerminal(), id + " should be terminal");
         assertFalse(m.transitions().stream().anyMatch(t -> t.from().equals(id)),
                 "a terminal state must have no outbound edge");
+    }
+
+    // ---- F10: an expression statement is not a produced successor -----------
+
+    @Test
+    void ordinaryPlumbingInsideADispatchIsNotATransition() {
+        // F10. `walk` ended in a catch-all that handed ANY expression reaching it
+        // to the successor resolver. Every call site passes a STATEMENT, so the
+        // only thing that catch-all ever saw was an expression statement — and
+        // Java discards an expression statement's value (JLS §14.8). A value the
+        // language throws away cannot be a committed successor, which makes this
+        // exact rather than heuristic: it belongs beside F9 on the
+        // compiler-checked side of the line, not with the approximate data-flow.
+        //
+        // Found on examples/lcp_automation, where a two-line
+        // `Objects.requireNonNull` prelude reported a 105-edge RFC 1661 automaton
+        // as 115. The corpus had never caught it because no fixture until now
+        // contained the bookkeeping real code is full of.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/plumbing"));
+        StateMachine m = single(r);
+
+        assertEquals(Set.of("Stopped", "Running", "Jammed"), stateIds(m));
+
+        // Exactly the six edges the two switches encode — two per state.
+        assertEquals(6, m.transitions().size(),
+                "only the switch arms commit a successor; the plumbing does not");
+        assertEquals(0, m.unresolvedTransitionCount(),
+                "nothing in this machine is unrecoverable, so no gap may be reported");
+
+        assertTrue(hasResolved(m, "Stopped", "Running"));
+        assertTrue(hasResolved(m, "Stopped", "Stopped"));
+        assertTrue(hasResolved(m, "Running", "Jammed"));
+        assertTrue(hasResolved(m, "Running", "Running"));
+        assertTrue(hasResolved(m, "Jammed", "Stopped"));
+        assertTrue(hasResolved(m, "Jammed", "Jammed"));
+
+        // The sharpest of the four plumbing statements: `identity(current)` is
+        // in-model, hierarchy-typed and trivially summarisable, so F3 WOULD fold
+        // it to a self-loop on the selector. Nothing about the expression is
+        // unresolvable — only its statement position rules it out. A guard that
+        // merely required a hierarchy type (as the carrier walker uses) would
+        // still have recorded it, which is why the position is the real rule.
+        assertFalse(m.transitions().stream().anyMatch(t -> t.from() == null),
+                "a discarded value must not become an edge with no source state");
+
+        // And the failure mode that made this visible: an undetermined SOURCE.
+        // `Objects.requireNonNull(event, ...)` produced exactly this in LCP.
+        assertFalse(m.transitions().stream()
+                        .anyMatch(t -> "<unknown>".equals(t.from()) || "<entry>".equals(t.from())),
+                "no pseudo-sourced edge may be manufactured out of plumbing");
+    }
+
+    @Test
+    void aStatementThatIsTheCommitIsStillClaimed() {
+        // NEGATIVE CONTROL for F10, and the whole risk of the rule. `ctx.setState(
+        // new Filling())` is an expression statement too. "Ignore expression
+        // statements" taken one step too far deletes the entire F2 mutation
+        // encoding from the tool; the rule is "ignore expression statements that no
+        // commit form claims". Separate hierarchy because F2 runs only as a
+        // fallback — beside a VALUE_RETURN machine it never executes and this
+        // control would silently assert nothing.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/plumbing-mutation"));
+        StateMachine m = single(r);
+
+        assertEquals(Set.of("Empty", "Filling", "Full"), stateIds(m));
+        assertEquals(6, m.transitions().size());
+        assertEquals(0, m.unresolvedTransitionCount());
+
+        // `drive` — arrow arms of a switch STATEMENT. This is F10's second half:
+        // Spoon wraps such an arm in a synthetic CtYieldStatement even though
+        // `yield` is illegal outside a switch expression, so the arm reached
+        // handleValue as a produced value, where a void setState call resolves to
+        // nothing. All three edges were LOST and replaced by `-> ?`. Unwrapping the
+        // synthetic yield routes them back through `walk`, where the mutator branch
+        // claims them — so F10 raises recall here, it does not only trim.
+        assertTrue(hasResolved(m, "Empty", "Filling"), "arrow-arm commit must survive");
+        assertTrue(hasResolved(m, "Filling", "Full"), "arrow-arm commit must survive");
+        assertTrue(hasResolved(m, "Full", "Empty"), "arrow-arm commit must survive");
+
+        // `pump` — colon arms, a deliberately DISJOINT relation so the two arm
+        // spellings stay separately attributable. Were both to encode the same
+        // edges the set-valued store would dedup them, and this test could not tell
+        // which spelling produced anything.
+        assertTrue(hasResolved(m, "Empty", "Full"), "colon-arm commit must survive");
+        assertTrue(hasResolved(m, "Filling", "Empty"), "colon-arm commit must survive");
+        assertTrue(hasResolved(m, "Full", "Filling"), "colon-arm commit must survive");
+    }
+
+    // ---- F12: a guarded arm excludes the arms after it ----------------------
+
+    @Test
+    void guardedArmsAreMutuallyExclusiveWithTheArmsBelowThem() {
+        // F12, part 2. Arm ORDER is part of the semantics: in
+        //   case Timeout t when t.counter() > 0 -> state;
+        //   case Timeout t                      -> new Stopped();
+        // the second arm runs only when the first guard was false, so the two can
+        // never both be enabled. Recording the fall-through arm as an unguarded
+        // `true` made GuardAnalysis report nondeterminism the source does not
+        // contain — 14 such warnings on examples/lcp_automation, a deterministic
+        // RFC 1661 automaton. Same reasoning walkBlock already applies to an `if`
+        // with no `else`, carried across sibling arms.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/lcp_automation"));
+        StateMachine m = single(r);
+
+        assertTrue(r.diagnostics().stream().noneMatch(d -> d.message().contains("nondeterminism")),
+                "a deterministic switch must not be reported as nondeterministic");
+
+        List<Transition> rcr = m.transitions().stream()
+                .filter(t -> "Stopped".equals(t.from())
+                        && "ReceiveConfigureRequest".equals(t.event()))
+                .toList();
+        assertEquals(2, rcr.size(), "RCR+ and RCR- are two edges");
+        // One carries the guard, the other its negation — never a bare null.
+        assertTrue(rcr.stream().allMatch(t -> t.guard() != null),
+                "the fall-through arm is guarded by the negation, not unguarded");
+        assertTrue(rcr.stream().anyMatch(t -> t.guard().contains("!")),
+                "the later arm must carry the negated guard");
+    }
+
+    @Test
+    void everyGuardSpellingReachesTheEdgeLabel() {
+        // The guard-form axis, held against a fixed two-state machine so the only
+        // variable is how the `when` clause is written. Spoon 10.4.2 fills
+        // CtCase.getGuard() only for a CtBinaryOperator; the other thirteen shapes
+        // here are recovered from the arm body. A silently lost guard turns a
+        // conditional edge into an unconditional CLAIM, and leaves the F12
+        // exclusion nothing to separate it from its fall-through arm with.
+        //
+        // Three of these were found losing their guard only by enumerating the
+        // table: Boxed (a `Boolean` guard failing a check written for the
+        // primitive), Cast (a cast is not its own node, so `(Boolean) t.o()`
+        // reported the invocation's own Object type), and Sw (recovered, but its
+        // five-line source reached the DOT label with the newlines intact —
+        // Graphviz accepts that, so it failed silently).
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/guardforms"));
+        StateMachine m = single(r);
+
+        Map<String, Transition> byEvent = new HashMap<>();
+        for (Transition t : m.transitions()) {
+            if (t.event() != null && "Busy".equals(t.to())) byEvent.put(t.event(), t);
+        }
+
+        Map<String, String> expected = new LinkedHashMap<>();
+        expected.put("Inv", "t.flag()");
+        expected.put("Unary", "!t.flag()");
+        expected.put("Binary", "t.n() > 10");
+        expected.put("Conj", "&&");
+        expected.put("Disj", "||");
+        expected.put("Boxed", "t.flag()");            // java.lang.Boolean, not boolean
+        expected.put("Bound", "flag");                // pattern-binding read
+        expected.put("Inst", "instanceof");
+        expected.put("Ternary", "?");
+        expected.put("Arr", "t.flags()[0]");
+        expected.put("NegBin", "!(t.n() > 3)");
+        expected.put("Static", "positive");
+        expected.put("Chain", "isEmpty()");
+        expected.put("Lib", "equals");
+        expected.put("Sw", "switch");                 // guard that is itself a switch
+        expected.put("Paren", "t.flag()");
+        expected.put("Deep", "&&");
+        expected.put("Lambda", "anyMatch");
+        expected.put("Cast", "Boolean");              // cast hangs off the expression
+        expected.put("Nest", "on");                   // nested record pattern binding
+
+        for (Map.Entry<String, String> e : expected.entrySet()) {
+            Transition t = byEvent.get(e.getKey());
+            assertNotNull(t, "no edge for guard shape " + e.getKey());
+            assertNotNull(t.guard(), "guard lost for shape " + e.getKey());
+            assertTrue(t.guard().contains(e.getValue()),
+                    e.getKey() + ": expected guard to contain '" + e.getValue()
+                            + "' but was '" + t.guard() + "'");
+        }
+
+        // Guard text reaches a DOT label and an SCXML cond attribute, so it must be
+        // one line however the source was formatted.
+        for (Transition t : m.transitions()) {
+            if (t.guard() != null) {
+                assertEquals(1, t.guard().lines().count(),
+                        "guard text must be single-line: " + t.guard());
+            }
+        }
+    }
+
+    @Test
+    void realGuardOverlapIsStillReported() {
+        // NEGATIVE CONTROL for F12, and the whole risk of it: the exclusion rule
+        // must not become a blanket "stop reporting nondeterminism". It applies
+        // ONLY to sibling arms of one switch, where Java's arm order makes the
+        // later one unreachable under the earlier guard. examples/nondeterministic
+        // overlaps by SEMANTICS instead — `coins >= 1` and `coins > 0` are two
+        // separate non-terminating assignments in the same arm, so nothing orders
+        // them and both really can fire. It must still warn.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/nondeterministic"));
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("nondeterminism")
+                                && d.message().contains("coins")),
+                "genuine semantic guard overlap must still be diagnosed");
+    }
+
+    @Test
+    void aGuardedArmExcludesTheFallThroughInEveryFixture() {
+        // The same fix, seen on a second, independently written corpus entry:
+        //   case AckReceived(boolean addressInUse) when addressInUse -> new Init();
+        //   case AckReceived ignored                                 -> new Bound();
+        // The Requesting -> Bound edge used to be reported as unconditional, which
+        // claimed a DHCPACK always commits the lease. It only does when the
+        // duplicate-address check passed (RFC 2131 §4.4.1).
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/dhcp-client-claude"));
+        StateMachine m = single(r);
+        Transition commit = m.transitions().stream()
+                .filter(t -> "Requesting".equals(t.from()) && "Bound".equals(t.to()))
+                .findFirst().orElseThrow();
+        assertNotNull(commit.guard(), "the fall-through arm is conditional, not unconditional");
+        assertTrue(commit.guard().contains("addressInUse"), commit.guard());
+    }
+
+    @Test
+    void aGuardSpelledOutsideABinaryOperatorIsStillRecovered() {
+        // F12, part 1. Spoon 10.4.2 fills CtCase.getGuard() only when the guard is
+        // a CtBinaryOperator; for a bare invocation (`when r.acceptable()`) or a
+        // unary (`when !r.catastrophic()`) it leaves the slot null and PREPENDS the
+        // guard expression into the arm body as a statement. Both halves of the
+        // machine's behaviour then went wrong: the guard vanished from the label,
+        // and the leaked expression was walked as if it produced a successor.
+        //
+        // The recovery keys on the ARROW case kind, which is exact rather than a
+        // guess: JLS §14.11.1 gives an arrow arm a single expression, block or
+        // throw, so two statements there is always the leak. See
+        // examples/plumbing's colon-arm control for why the kind check is
+        // load-bearing.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/lcp_automation"));
+        StateMachine m = single(r);
+
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "Stopped".equals(t.from()) && "AckSent".equals(t.to())
+                                && t.guard() != null && t.guard().contains("acceptable")),
+                "an invocation-shaped `when` clause must reach the edge label");
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "ReqSent".equals(t.from()) && "Stopped".equals(t.to())
+                                && t.guard() != null && t.guard().contains("catastrophic")),
+                "a unary-shaped `when` clause must reach the edge label");
+
+        // And the leaked guard must not also be an edge: 13 LcpEvent records over
+        // 10 states is 130 cells, +14 guard splits = 144 arms, of which 31 throw.
+        assertEquals(113, m.transitions().size(), "exactly the 113 value-producing arms");
+        assertEquals(0, m.unresolvedTransitionCount());
+    }
+
+    @Test
+    void initialStateFallsBackToASeededLocalOnlyWhenUnanimous() {
+        // A dense automaton defeats the structural rules exactly when it is most
+        // faithful: in RFC 1661's LCP every state INCLUDING Initial has incoming
+        // edges, so "no incoming, some outgoing" has no candidate, and the machine
+        // class holds no state field either. The weakest rule — a hierarchy-typed
+        // local seeded with `new Concrete()` — recovers it, and says so.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/lcp_automation"));
+        StateMachine m = single(r);
+
+        assertEquals("Initial", m.initialState().orElse(null));
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("inferred from")
+                                && d.message().contains("weaker evidence")),
+                "an inferred initial state must be reported as weaker evidence");
+    }
+
+    @Test
+    void theCentralizedFunctionCountIsOfDistinctHosts() {
+        // The signature-based recognizer and DispatchCommitDetector legitimately
+        // overlap — `Door transition(Door, Event)` whose body is `return switch` is
+        // seen by both — and the reason text summed them. examples/door has exactly
+        // ONE transition function and was reported as two. Extraction was never
+        // affected (it deduped on declaringType#signature); this uses the same key
+        // so the reported number and the walked set cannot drift apart.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/door"));
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("1 centralized transition function")),
+                "door has one transition function, not two");
     }
 
     // ---- negative controls -------------------------------------------------

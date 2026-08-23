@@ -94,8 +94,8 @@ public final class StateMachineClassifier {
                     "both per-state and centralized transition methods present");
         }
         if (hasCentral) {
-            return Classification.yes(Encoding.CENTRALIZED_DISPATCH, centralizedReason(
-                    centralized.size() + functional.size(), producers));
+            return Classification.yes(Encoding.CENTRALIZED_DISPATCH,
+                    centralizedReason(centralized, functional, producers));
         }
         if (hasDist) {
             return Classification.yes(Encoding.POLYMORPHIC,
@@ -124,17 +124,43 @@ public final class StateMachineClassifier {
     /**
      * Reason text for centralized dispatch, naming the commit form(s) so the
      * classification says which idiom was recognised rather than only that one was.
+     *
+     * <p>The count is of DISTINCT hosts, not the sum of the two recognizers'
+     * findings. The signature-based recognizer and {@link DispatchCommitDetector}
+     * legitimately overlap — a {@code H transition(H, Event)} whose body is
+     * {@code return switch (current)} is seen by both — so summing them reported
+     * {@code examples/door}, which has exactly one transition function, as two.
+     * (Only the VALUE_RETURN-with-hierarchy-parameter shape overlapped, which is
+     * the most common one.) The extraction itself was never affected: it already
+     * deduped on {@code declaringType#signature}, and this uses the same key so
+     * the reported number and the walked set cannot drift apart.
      */
-    private static String centralizedReason(int functionCount,
+    private static String centralizedReason(List<CtMethod<?>> centralized,
+                                            List<CtElement> functional,
                                             List<DispatchCommitDetector.Producer> producers) {
+        Set<String> hosts = new LinkedHashSet<>();
+        for (CtMethod<?> m : centralized) hosts.add(methodKey(m));
+        // A functional producer (a lambda, a method reference) has no CtMethod to
+        // key on, so each counts as its own host.
+        int functionalCount = functional.size();
+
         if (producers.isEmpty()) {
-            return functionCount + " centralized transition function(s)";
+            return (hosts.size() + functionalCount) + " centralized transition function(s)";
         }
         Set<String> commits = new LinkedHashSet<>();
-        for (DispatchCommitDetector.Producer p : producers) commits.add(p.commit().name());
-        int total = functionCount + producers.size();
-        return total + " centralized transition function(s), committing via "
+        for (DispatchCommitDetector.Producer p : producers) {
+            commits.add(p.commit().name());
+            hosts.add(methodKey(p.host()));
+        }
+        return (hosts.size() + functionalCount) + " centralized transition function(s), committing via "
                 + String.join("/", commits);
+    }
+
+    /** Declaring type + signature: unique across the model, unlike a bare signature. */
+    private static String methodKey(CtMethod<?> m) {
+        if (m == null) return "?";
+        CtType<?> declaring = m.getDeclaringType();
+        return (declaring == null ? "?" : declaring.getQualifiedName()) + "#" + m.getSignature();
     }
 
     /** Reason text for a carrier-encoded machine, naming the shared method when there is one. */

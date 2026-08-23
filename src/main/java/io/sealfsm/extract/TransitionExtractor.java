@@ -33,6 +33,7 @@ import spoon.reflect.code.CtTry;
 import spoon.reflect.code.CtTypeAccess;
 import spoon.reflect.code.CtVariableAccess;
 import spoon.reflect.code.CtYieldStatement;
+import spoon.reflect.cu.SourcePosition;
 import spoon.reflect.declaration.CtElement;
 import spoon.reflect.declaration.CtEnum;
 import spoon.reflect.declaration.CtEnumValue;
@@ -40,6 +41,7 @@ import spoon.reflect.declaration.CtField;
 import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtParameter;
 import spoon.reflect.declaration.CtType;
+import spoon.reflect.declaration.CtShadowable;
 import spoon.reflect.declaration.CtVariable;
 import spoon.reflect.reference.CtExecutableReference;
 import spoon.reflect.reference.CtFieldReference;
@@ -887,12 +889,21 @@ public final class TransitionExtractor {
     private void walkCarrierSwitch(CtAbstractSwitch<?> sw, String from, String event,
                                    String guard, Set<Transition> out) {
         boolean overEvent = isEventDispatch(sw);
+        Map<String, List<String>> guardsByLabel = new LinkedHashMap<>();
         for (CtCase<?> c : sw.getCases()) {
             List<String> caseEvents = overEvent ? caseEventNames(c) : List.of();
             if (caseEvents.isEmpty()) {
                 caseEvents = Collections.singletonList(event); // default arm inherits
             }
-            String caseGuard = merge(guard, caseGuard(c));
+            // F12 applies here too: a later arm with the same label is reached
+            // only when the earlier guard was false.
+            String ownGuard = caseGuard(c);
+            String caseGuard = merge(merge(guard, priorExclusion(caseEvents, guardsByLabel)), ownGuard);
+            if (ownGuard != null) {
+                for (String label : caseEvents) {
+                    guardsByLabel.computeIfAbsent(label, k -> new ArrayList<>()).add(ownGuard);
+                }
+            }
             boolean prev = otherwisePath;
             // A `default:` arm names no label, so whatever it produces is the
             // residual of every labelled arm — the default edge.
@@ -1316,11 +1327,46 @@ public final class TransitionExtractor {
      * nested in a lambda or local class counts as the method's own. That is the
      * conservative direction: it declines to suppress, falling back to the
      * previous unresolved-edge behaviour, and never drops a real transition.
+     *
+     * <p>F11 — the rule may only be applied to a body the analysis actually
+     * <em>read</em>. For a method outside the source set (a JDK or library call),
+     * Spoon supplies a reflective <em>shadow</em> declaration: a signature with an
+     * empty {@code { }} body. That body contains no {@code return} for the same
+     * reason it contains nothing at all — it was never parsed — so the emptiness
+     * carries no information about whether the method returns. Reading it as proof
+     * turned every library call returning a hierarchy type into a silently deleted
+     * edge: {@code Objects.requireNonNull(state, ...)},
+     * {@code Optional.orElse(new Closed())}, {@code map.getOrDefault(k, new Idle())}.
+     * That is a false drop with no unresolved marker, the one outcome the
+     * "unresolved transitions are never dropped" invariant forbids. The whole
+     * licence for F9 to suppress is that JLS §8.4.7 makes the conclusion exact;
+     * on a body that was never read there is no such licence.
      */
     private static boolean neverReturnsNormally(CtMethod<?> callee) {
         CtBlock<?> body = callee.getBody();
-        if (body == null) return false; // no body visible: never claim anything
+        if (body == null) return false;      // no body visible: never claim anything
+        if (isShadow(callee)) return false;  // F11: a stub body is not an empty body
         return body.getElements(new TypeFilter<>(CtReturn.class)).isEmpty();
+    }
+
+    /**
+     * True when {@code type} was reconstructed by reflection rather than parsed
+     * from the source set, so its body is a stub. Checked two ways because either
+     * signal alone has failed across Spoon versions: {@code isShadow()} is the
+     * declared API, and an invalid source position is the structural consequence
+     * (verified — a JDK declaration reports {@code isShadow() == true} and
+     * {@code getPosition().isValidPosition() == false}). Best-effort and never
+     * throws; when unreadable it answers "shadow", because declining to apply F9
+     * is the direction that cannot drop a transition.
+     */
+    private static boolean isShadow(CtElement element) {
+        try {
+            if (element instanceof CtShadowable s && s.isShadow()) return true;
+            SourcePosition pos = element.getPosition();
+            return pos == null || !pos.isValidPosition();
+        } catch (Throwable t) {
+            return true;
+        }
     }
 
     /** Returned / yielded expressions of a body, each with its accumulated guard. */
@@ -1425,14 +1471,52 @@ public final class TransitionExtractor {
             // enabler for F1/F2 — a producer or state mutation inside the loop
             // would otherwise vanish with no unresolved marker.
             walk(loop.getBody(), from, event, merge(guard, loopGuard(loop)), out);
-        } else if (node instanceof CtExpression<?> expr) {
-            // arrow-arm expression body: case X -> new A();  (statement is itself
-            // an expression) or  case X -> switch (event) { ... };
+        } else if (node instanceof CtExpression<?> expr
+                && isSwitchExpressionArm(expr) && isHierarchyTyped(expr)) {
+            // Arrow-arm expression body in VALUE position: case X -> new A();
+            // Spoon 10.4.2 wraps every arm form in a typed node (yield / block /
+            // return) so this is currently unreachable, but the Spoon version is a
+            // pom property meant to be bumped freely and an earlier modelling could
+            // return. Keeping the branch — narrowed to the case where it would be
+            // correct — means a version change is handled on purpose rather than by
+            // accident. See F10 below for why the unnarrowed form was wrong.
             handleValue(expr, from, event, guard, out);
         }
-        // local-variable declarations and other plain statements do not directly
-        // produce a next state (reassigned locals are a scope line), so they are
-        // intentionally not descended for value production.
+        // F10 — every OTHER expression reaching here is an expression STATEMENT,
+        // and Java discards an expression statement's value (JLS §14.8). A value
+        // the language throws away cannot be a committed successor, so this is an
+        // exact rule, not a heuristic: it belongs beside F9 and state enumeration
+        // on the compiler-checked side of the line, not with the approximate
+        // data-flow. Handing such statements to `handleValue` made every piece of
+        // ordinary plumbing inside a walked body into a transition —
+        // `Objects.requireNonNull(event, "...")`, `log.debug(...)`,
+        // `metrics.increment()` — inflating the denominator with non-transitions
+        // and, where the expression was hierarchy-typed, threatening a fabricated
+        // resolved edge. A statement that genuinely IS the commit is already
+        // claimed above by its own branch: an assignment to the state field, or a
+        // recognised mutator call (F2). Nothing else installs a successor.
+        //
+        // Local-variable declarations and other plain statements likewise do not
+        // directly produce a next state (reassigned locals are a scope line), so
+        // they are intentionally not descended for value production.
+    }
+
+    /**
+     * Is this expression the direct arm body of a switch <em>expression</em> —
+     * i.e. is its value consumed rather than discarded? Answered from the node's
+     * own position rather than a flag threaded through {@link #walk}, because it
+     * is a property of where the expression sits, and a flag would have to be
+     * passed correctly at ten call sites to say the same thing. A statement nested
+     * inside an arm's block is NOT an arm body: its value is discarded like any
+     * other statement, and the block's producer is its {@code yield}.
+     */
+    private static boolean isSwitchExpressionArm(CtExpression<?> expr) {
+        try {
+            CtElement parent = expr.getParent();
+            return parent instanceof CtCase<?> c && c.getParent() instanceof CtSwitchExpression<?, ?>;
+        } catch (Throwable t) {
+            return false; // unknown position: assume statement, the safe direction
+        }
     }
 
     /**
@@ -1696,6 +1780,16 @@ public final class TransitionExtractor {
         boolean overState = isStateDispatch(sw);
         boolean overEvent = !overState && isEventDispatch(sw);
         boolean overComponent = !overState && !overEvent && isComponentDispatch(sw);
+        // F12 — arm order is part of the semantics. A later arm carrying the same
+        // label as an earlier GUARDED one is reached only when that guard was
+        // false, so the two are mutually exclusive by construction. Without the
+        // negation, `case Timeout t when t.counter() > 0 -> ...` followed by
+        // `case Timeout t -> ...` is reported as [g] against [true], which the
+        // overlap check reads as nondeterminism the source does not contain: 14
+        // such warnings on examples/lcp_automation for a deterministic RFC 1661
+        // automaton. This is the same reasoning walkBlock already applies to an
+        // `if` with no `else`, carried across sibling arms.
+        Map<String, List<String>> guardsByLabel = new LinkedHashMap<>();
         for (CtCase<?> c : sw.getCases()) {
             String caseFrom = from;
             if (overState) {
@@ -1722,17 +1816,49 @@ public final class TransitionExtractor {
                 // component value the labelled arms did not name.
                 caseEvents = Collections.singletonList(event); // may hold null
             }
-            String caseGuard = merge(guard, caseGuard(c));
+            // Labels are the discriminator the exclusion is keyed on: only arms
+            // that can match the SAME input compete. Distinct labels are already
+            // disjoint, and negating those would bury every edge under a pile of
+            // redundant `!(event instanceof X)` clauses.
+            List<String> labels = overState ? Collections.singletonList(caseFrom) : caseEvents;
+            String ownGuard = caseGuard(c);
+            String caseGuard = merge(merge(guard, priorExclusion(labels, guardsByLabel)), ownGuard);
+            // Only a GUARDED arm constrains its successors. An unguarded arm
+            // dominates every later arm with the same label, which the compiler
+            // already rejects, so there is nothing to record for it.
+            if (ownGuard != null) {
+                for (String label : labels) {
+                    guardsByLabel.computeIfAbsent(label, k -> new ArrayList<>()).add(ownGuard);
+                }
+            }
             // If this arm deconstructed its event, remember the binding so a switch
             // on it inside the arm body refines the label instead of inheriting it.
             ComponentEvent binding = overEvent && caseEvents.size() == 1
                     ? componentBindingOf(c, caseEvents.get(0)) : null;
             ComponentEvent savedComponent = componentEvent;
             if (binding != null) componentEvent = binding;
+            // F10 — Spoon wraps the arrow arm of a switch STATEMENT in a synthetic
+            // CtYieldStatement (`case X -> ctx.setState(new A());` arrives as a
+            // yield), even though `yield` is illegal outside a switch expression.
+            // Walking it as a yield reads a discarded value as a produced one. Any
+            // yield directly under a CtSwitch is therefore synthetic and must be
+            // unwrapped to the statement it really is — which also routes it back
+            // through `walk`, where the F2 mutator branch can claim it. Inside an
+            // arm's BLOCK a yield is always genuine, so this is a one-level rule.
+            boolean discardedArms = !(sw instanceof CtSwitchExpression<?, ?>);
             try {
+                CtElement leaked = leakedGuard(c);
                 for (String caseEvent : caseEvents) {
                     for (CtStatement st : c.getStatements()) {
-                        walk(st, caseFrom, caseEvent, caseGuard, out);
+                        // The leaked `when` clause is the arm's guard, consumed
+                        // above; it is not part of the arm's body.
+                        if (st == leaked) continue;
+                        CtElement effective = st;
+                        if (discardedArms && st instanceof CtYieldStatement ys
+                                && ys.getExpression() != null) {
+                            effective = ys.getExpression();
+                        }
+                        walk(effective, caseFrom, caseEvent, caseGuard, out);
                     }
                 }
             } finally {
@@ -1972,10 +2098,74 @@ public final class TransitionExtractor {
         return out;
     }
 
-    /** Guarded-pattern {@code when} clause, if present and supported. */
+    /**
+     * Guarded-pattern {@code when} clause. Spoon 10.4.2 populates
+     * {@code getGuard()} only when the guard is a {@code CtBinaryOperator}
+     * ({@code when t.counter() > 0}); for any other shape — a bare invocation
+     * ({@code when r.acceptable()}), a unary ({@code when !r.catastrophic()}), a
+     * parenthesised invocation — the slot is left null and the guard expression is
+     * instead PREPENDED INTO THE ARM BODY as a statement. Verified empirically
+     * against all five shapes. So the guard is recovered from either place.
+     */
     private String caseGuard(CtCase<?> c) {
         Object guard = tryMethod(c, "getGuard");
-        return guard == null ? null : safeText(guard);
+        if (guard != null) return safeText(guard);
+        CtElement leaked = leakedGuard(c);
+        return leaked == null ? null : safeText(leaked);
+    }
+
+    /**
+     * The {@code when} clause Spoon leaked into the arm body, or {@code null}.
+     *
+     * <p>The discriminator is the ARROW case kind, and it is exact rather than a
+     * guess: JLS §14.11.1 gives an arrow arm a single expression, block or
+     * {@code throw}, so an arrow arm can never legitimately hold two statements.
+     * A leading extra one is therefore always the leaked guard. The restriction
+     * matters — a COLON arm holds a statement list, and {@code case X: helper();
+     * return 1;} (verified) puts an ordinary boolean-returning call exactly where
+     * the naive "first boolean statement is the guard" rule would misread it as a
+     * condition and silently drop the call.
+     */
+    private CtElement leakedGuard(CtCase<?> c) {
+        try {
+            if (!"ARROW".equals(String.valueOf(tryMethod(c, "getCaseKind")))) return null;
+            List<CtStatement> body = c.getStatements();
+            if (body.size() < 2) return null;
+            CtStatement first = body.get(0);
+            if (!(first instanceof CtExpression<?> expr)) return null;
+            // The ARROW + extra-statement structure is what PROVES this is the
+            // guard; the type is only a sanity check against that reasoning being
+            // wrong. So an unresolvable type (routine under noClasspath) is
+            // accepted, and both the primitive and the boxed spelling count — a
+            // `Boolean`-returning accessor is an ordinary way to write a guard and
+            // was silently losing its condition.
+            // A CAST is not its own node in Spoon — it hangs off the expression, so
+            // `(Boolean) v.o()` reports the invocation's own type (Object) and was
+            // rejected, losing the guard. The outermost cast is what the `when`
+            // clause actually evaluates.
+            CtTypeReference<?> t = expr.getType();
+            List<CtTypeReference<?>> casts = expr.getTypeCasts();
+            if (casts != null && !casts.isEmpty()) t = casts.get(casts.size() - 1);
+            if (t == null) return first;
+            String name = t.getSimpleName();
+            return "boolean".equals(name) || "Boolean".equals(name) ? first : null;
+        } catch (Throwable ignored) {
+            return null; // unreadable: keep the previous (guardless) behaviour
+        }
+    }
+
+    /**
+     * The conjunction of the negated guards of earlier arms carrying any of
+     * {@code labels} — the condition under which control actually reaches this arm.
+     */
+    private String priorExclusion(List<String> labels, Map<String, List<String>> guardsByLabel) {
+        String exclusion = null;
+        for (String label : labels) {
+            for (String prior : guardsByLabel.getOrDefault(label, List.of())) {
+                exclusion = merge(exclusion, negate(prior));
+            }
+        }
+        return exclusion;
     }
 
     /**
@@ -2022,10 +2212,18 @@ public final class TransitionExtractor {
         return "!(" + condText + ")";
     }
 
+    /**
+     * Source text of a node, flattened to one line. Guard text reaches a DOT edge
+     * label and an SCXML {@code cond} attribute, and a guard can legitimately span
+     * lines — {@code when switch (v.n()) { case 1 -> true; default -> false; }}
+     * pretty-prints across five. Graphviz accepts the embedded newlines, so this
+     * failed silently rather than loudly: the diagram just grew an unreadable
+     * five-line label. Runs of whitespace collapse to one space.
+     */
     private static String safeText(Object e) {
         if (e == null) return "";
         try {
-            return e.toString();
+            return e.toString().replaceAll("\\s+", " ").trim();
         } catch (Throwable t) {
             return e.getClass().getSimpleName();
         }
