@@ -2460,4 +2460,126 @@ class ExtractionIntegrationTest {
                 "the instanceof spelling of the same rewrite");
         assertEquals(2, chain.machines().size(), "and the two real machines are untouched");
     }
+
+    // ---- F22: a name corroborates, it never recognises ------------------------
+
+    /**
+     * F22 — a state mutator is a SHAPE, and a conventional name alone recognises
+     * nothing. The three methods of {@code BoltRig} have the same signature (one
+     * {@code Bolt} in, nothing out), so only their bodies can tell them apart.
+     *
+     * <p>{@code assume} commits its parameter and is named nothing in particular:
+     * finding it is the positive statement that discovery is by shape.
+     * {@code engage} commits the same parameter laundered through a null check, and
+     * is the negative control for the narrowing — losing it would be SILENT, since
+     * F10 ignores an expression statement no commit form claims, so there would be
+     * no unresolved marker to notice. {@code become} is the trap: a conventional
+     * mutator name on an audit hook that commits nothing. The old rule admitted a
+     * method whose name was one of six English words regardless of its body, and an
+     * admitted method has its call sites' ARGUMENT published as the successor — so
+     * {@code rig.become(i)} became a RESOLVED self-loop on {@code Idle}, a
+     * fabricated resolved edge and, with it, a nondeterminism warning about a
+     * machine that is deterministic.
+     */
+    @Test
+    void aStateMutatorIsRecognisedByShapeAndNotByItsName() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/mutatorshape"));
+        StateMachine m = named(r, "Bolt");
+
+        assertEquals(Set.of("Idle", "Live", "Spent"), stateIds(m));
+        assertEquals("Idle", m.initialState().orElse(null));
+        assertEquals(3, m.transitions().size(), "one edge per state, and nothing else");
+        assertEquals(0, m.unresolvedTransitionCount());
+
+        assertTrue(hasResolved(m, "Idle", "Live"), "a mutator called `assume` is still a mutator");
+        assertTrue(hasResolved(m, "Live", "Spent"));
+        assertTrue(hasResolved(m, "Spent", "Idle"), "a laundered commit is still a commit");
+
+        assertTrue(m.transitions().stream()
+                        .noneMatch(t -> "Idle".equals(t.from()) && "Idle".equals(t.to())),
+                "an audit hook named like a setter contributes NO edge — not a resolved "
+                        + "self-loop, and not an unresolved one either: nothing here is a "
+                        + "transition whose target went unrecovered");
+        assertTrue(r.diagnostics().stream().noneMatch(d -> d.where().equals("mutatorshape.Bolt")
+                        && d.message().contains("nondeterminism")),
+                "the fabricated self-loop also invented an overlap on Idle");
+        assertTrue(r.diagnostics().stream().anyMatch(d -> d.where().equals("mutatorshape.Bolt")
+                        && d.message().contains("recognised by SHAPE alone")
+                        && d.message().contains("assume") && d.message().contains("engage")),
+                "the commit channel is reported, with the spelling as corroboration");
+    }
+
+    /**
+     * The other half of F22, and the half a plain "one hierarchy-typed parameter
+     * whose body writes a hierarchy-typed field" rule misses. {@code VentRig.restart}
+     * passes exactly that test — and its parameter is the state being LEFT, read to
+     * be audited, while what lands in the field is chosen by the callee. Reading a
+     * call's argument as the successor is licensed only when the mutator commits
+     * what it was handed.
+     *
+     * <p>Held beside a real mutator on the same class, so this asserts a NARROWING
+     * and not an absence: the attributable edge survives, and the commit that cannot
+     * be attributed is RECORDED without a source rather than replaced by a fiction.
+     * At HEAD this hierarchy reports a clean-looking 2/2 in which
+     * {@code Venting -> Venting} is fabricated and the real {@code Venting -> Sealed}
+     * is missing — a wrong answer wearing a perfect score.
+     */
+    @Test
+    void aMutatorMustCommitWhatItWasHanded() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/mutatorshape"));
+        StateMachine m = named(r, "Vent");
+
+        assertEquals(Set.of("Sealed", "Venting"), stateIds(m));
+        assertTrue(hasResolved(m, "Sealed", "Venting"), "the real mutator's arm is unaffected");
+        assertTrue(m.transitions().stream()
+                        .noneMatch(t -> t.isResolved() && "Venting".equals(t.from())),
+                "restart's argument is not its successor, so its call site claims nothing");
+        assertEquals(1, m.unresolvedTransitionCount(),
+                "restart's own commit is still recovered — sourceless, hence unresolved");
+        assertTrue(r.diagnostics().stream().anyMatch(d -> d.where().equals("mutatorshape.Vent")
+                        && d.message().contains("[restart]")),
+                "the exclusion is a recall gap and must be reported, not silent");
+    }
+
+    /**
+     * F22, the labelling half — a transition method's NAME is an input symbol only
+     * when it DISCRIMINATES. This was a hard-coded list of English words held to be
+     * "neutral", which is a claim about vocabulary rather than about the program,
+     * and it failed on the corpus in the direction that fabricates: neither
+     * {@code on} nor {@code wrap} was on the list, so every edge of
+     * {@code retrystate}'s two machines was labelled with the transition function's
+     * own name while the real input sat in the guard beside it.
+     *
+     * <p>{@code examples/cancellation} is the control that keeps the rule from
+     * becoming "never label anything": its two callables are supplied by
+     * {@code add} and {@code subscribe}, so there the name really is the input.
+     * {@code examples/traffic} pins the answer the deleted list happened to get
+     * right, which must not change.
+     */
+    @Test
+    void aTransitionMethodNameIsAnEventSymbolOnlyWhenItDiscriminates() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/retrystate"));
+        for (String name : List.of("Attempt", "Frame")) {
+            StateMachine m = named(r, name);
+            assertTrue(m.transitions().stream().allMatch(t -> t.event() == null),
+                    name + ": one transition-method name across the hierarchy names the "
+                            + "FUNCTION and discriminates nothing, so it is not a Σ symbol");
+        }
+        assertTrue(named(r, "Attempt").transitions().stream()
+                        .anyMatch(t -> t.guard() != null && t.guard().contains("Signal.START")),
+                "and the real input is still recovered, as a guard");
+        assertTrue(r.diagnostics().stream().anyMatch(d -> d.where().equals("retrystate.Attempt")
+                        && d.message().contains("discriminates nothing")),
+                "the un-recovered alphabet is a gap, and is reported as one");
+
+        StateMachine cancel = single(new Analyzer().analyze(modelOf("examples/cancellation")));
+        Set<String> events = cancel.transitions().stream()
+                .map(Transition::event).filter(e -> e != null).collect(Collectors.toSet());
+        assertEquals(Set.of("add", "subscribe"), events,
+                "two suppliers: the name IS the input, and must survive");
+
+        StateMachine traffic = single(new Analyzer().analyze(modelOf("examples/traffic")));
+        assertTrue(traffic.transitions().stream().allMatch(t -> t.event() == null),
+                "the one answer the word list got right must not change");
+    }
 }

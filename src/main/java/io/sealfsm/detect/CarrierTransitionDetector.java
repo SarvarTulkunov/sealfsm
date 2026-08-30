@@ -111,6 +111,22 @@ import java.util.Set;
  * discovery is purely by shape. Consistent naming across the permitted subtypes
  * is reported as a corroborating signal in the classification reason, but is
  * never required.
+ *
+ * <p>That is a project-wide contract and not a local one, and <b>F22</b> is where
+ * it was made true. Two name lists elsewhere contradicted it: the F2 mutation
+ * recognizer admitted a method whose NAME was one of six conventional setter words
+ * regardless of what its body did, and the polymorphic event label was elided
+ * against a list of English words held to be "neutral". A word list is a claim
+ * about vocabulary rather than about the program, and both failed in the direction
+ * that fabricates — an audit hook called {@code become} published its argument as a
+ * resolved successor, and two corpus machines spelling their one transition
+ * {@code on} and {@code wrap} labelled every edge with the transition function's
+ * own name. Both lists are gone. Where a simple name still appears in the analysis
+ * it is a PREFILTER over a decision taken elsewhere (the mutator lookup, keyed on
+ * the callee's declaration) or a value the model itself discriminates with (a
+ * per-state method name, kept only where the hierarchy spells more than one), and
+ * every residual name match is reported as a diagnostic rather than passing for a
+ * proof.
  */
 public final class CarrierTransitionDetector {
 

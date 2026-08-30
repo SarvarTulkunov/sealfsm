@@ -100,13 +100,6 @@ import java.util.Set;
  */
 public final class TransitionExtractor {
 
-    private static final Set<String> NEUTRAL_METHOD_NAMES =
-            Set.of("next", "transition", "step", "advance", "nextstate", "transitionto", "tick");
-
-    /** Conventional state-mutator names recognised regardless of body (F2). */
-    private static final Set<String> MUTATOR_NAMES =
-            Set.of("setstate", "changestate", "transitionto", "goto", "setcurrent", "become");
-
     private final TransitionResolver resolver;
     private final Set<String> hierarchyQualifiedNames;
     private final String rootQualifiedName;
@@ -120,12 +113,39 @@ public final class TransitionExtractor {
     private CtVariable<?> selector = null;
     private Set<String> concreteStateSimpleNames = Set.of();
 
+    // F22: whether a transition method's NAME carries an input symbol, decided per
+    // hierarchy from whether the names DISCRIMINATE (see eventName). Two flags,
+    // because the two walks draw their names from different sets: the per-state
+    // methods of the hierarchy, and the methods that supply F7 functional callables.
+    private boolean distributedNamesDiscriminate = false;
+    private boolean functionalNamesDiscriminate = false;
+
     // F2: mutation-encoding context, populated only while the GoF/mutation
     // fallback runs (a hierarchy with no return-based transition method). Left
     // empty for distributed/centralized extraction, so those paths are unchanged.
     private boolean mutationMode = false;
     private Set<String> stateFieldNames = Set.of();
+    // F22: the recognised state mutators, keyed on `declaringType#signature` — the
+    // same key hosts are deduped on elsewhere, so the recognizer and the call
+    // matcher cannot drift into two notions of "mutator". `mutatorNames` holds the
+    // simple names of exactly those methods and is a PREFILTER only: it keeps the
+    // declaration lookup off every unrelated call, and never admits one on its own.
+    private Set<String> mutatorKeys = Set.of();
     private Set<String> mutatorNames = Set.of();
+    // F22: calls whose callee declaration Spoon could not bind, so "is this a
+    // mutator?" was answered from the call's SHAPE plus the name prefilter rather
+    // than from the declaration. Reported, so a name match never reads as a proof.
+    private final Set<String> unboundMutatorCalls = new LinkedHashSet<>();
+    // F22: state-field writes admitted on the field's NAME because its declared
+    // type could not be resolved. Answered in the direction that cannot drop an
+    // edge, and reported, so the last remaining name match is not silent either.
+    private final Set<String> unboundStateFieldWrites = new LinkedHashSet<>();
+    // F22: methods shaped like a mutator — one hierarchy-typed parameter, a write
+    // to a hierarchy-typed field — whose commit does not come FROM that parameter,
+    // so a call's argument says nothing about where the machine goes. Their call
+    // sites contribute no edge; the commit each performs is recovered from its own
+    // body instead, without a source. A recall gap, so it is reported.
+    private final Set<String> unattributedMutators = new LinkedHashSet<>();
 
     // The commit form of the dispatch currently being walked, or null outside one.
     // Only a chain consults it: a switch commits its whole result in one place the
@@ -299,6 +319,21 @@ public final class TransitionExtractor {
         // double-count and emit spurious undetermined-origin edges. Exclude those.
         Set<String> helperSignatures = interproceduralHelperSignatures(distributed, centralized);
 
+        // F22: a transition method's NAME is an input symbol only when it
+        // DISCRIMINATES — see eventName. Decided here, once per hierarchy and
+        // before any body is walked, over the methods each walk will actually own.
+        Set<String> distributedNames = new LinkedHashSet<>();
+        for (CtMethod<?> m : distributed) {
+            if (!helperSignatures.contains(m.getSignature())) distributedNames.add(m.getSimpleName());
+        }
+        this.distributedNamesDiscriminate = distributedNames.size() > 1;
+        Set<String> functionalNames = new LinkedHashSet<>();
+        for (CtElement callable : functional) {
+            String enclosing = enclosingMethodName(callable);
+            if (enclosing != null) functionalNames.add(enclosing);
+        }
+        this.functionalNamesDiscriminate = functionalNames.size() > 1;
+
         for (CtMethod<?> m : distributed) {
             if (!helperSignatures.contains(m.getSignature())) extractDistributed(m, out);
         }
@@ -383,6 +418,32 @@ public final class TransitionExtractor {
                     + "transition. Too few, and on too few members, to veto the hierarchy — "
                     + "review whether this is a recursive data type");
         }
+        if (distributedNames.size() == 1) {
+            diagnostics.add("every state spells its transition '" + distributedNames.iterator().next()
+                    + "', so that one name names the transition FUNCTION and discriminates "
+                    + "nothing; it is not emitted as an event symbol. Edges from these methods "
+                    + "therefore carry no label unless Σ is recovered from the parameter, which "
+                    + "for this encoding is future work (F22)");
+        }
+        if (!unattributedMutators.isEmpty()) {
+            diagnostics.add("method(s) " + unattributedMutators + " take a hierarchy value and "
+                    + "write the state field, but commit something OTHER than what they were "
+                    + "handed, so a call site's argument is not its successor. Their calls "
+                    + "contribute no edge; each such method's own commit is recovered from its "
+                    + "body, with no source state to attribute it to (F22)");
+        }
+        if (!unboundStateFieldWrites.isEmpty()) {
+            diagnostics.add("write(s) to field(s) " + unboundStateFieldWrites + " were taken as "
+                    + "state commits on the field's NAME, because its declared type could not be "
+                    + "resolved. Answered in the direction that cannot drop a commit, but a "
+                    + "same-named field of another machine would be absorbed here (F22)");
+        }
+        if (!unboundMutatorCalls.isEmpty()) {
+            diagnostics.add("call(s) to " + unboundMutatorCalls + " could not be bound to a "
+                    + "declaration, so 'is this a state mutator?' was answered from the call's "
+                    + "shape and its name rather than from the mutator's body — a name match "
+                    + "standing in for a proof (F22)");
+        }
         Set<String> nameOnly = new LinkedHashSet<>(nameOnlyReassignmentChecks);
         nameOnly.addAll(resolver.nameOnlyReassignmentChecks());
         if (!nameOnly.isEmpty()) {
@@ -431,7 +492,8 @@ public final class TransitionExtractor {
         dispatchedStates.add(stateId(declaring));
         // The from-state is fixed to the declaring class; a switch inside the
         // body dispatches on the event, not on the state, so from is preserved.
-        walk(method.getBody(), stateId(declaring), eventName(method), null, out);
+        walk(method.getBody(), stateId(declaring), eventName(method, distributedNamesDiscriminate),
+                null, out);
     }
 
     // ---- centralized (single transition function) ----------------------------
@@ -875,12 +937,19 @@ public final class TransitionExtractor {
 
     /**
      * Event label for a functional callable (F7 rule 7): the simple name of the
-     * enclosing method that supplies it (neutral names elided as elsewhere).
+     * enclosing method that supplies it, subject to the same discrimination test
+     * every other method name is (F22) — one supplier means one transition
+     * function, and its name is not an input symbol.
      */
     private String functionalEventLabel(CtElement callable) {
+        return functionalNamesDiscriminate ? enclosingMethodName(callable) : null;
+    }
+
+    /** Simple name of the method a functional callable is written inside, if any. */
+    private static String enclosingMethodName(CtElement callable) {
         try {
             CtMethod<?> enclosing = callable.getParent(CtMethod.class);
-            return enclosing == null ? null : eventName(enclosing);
+            return enclosing == null ? null : enclosing.getSimpleName();
         } catch (Throwable t) {
             return null;
         }
@@ -1257,8 +1326,22 @@ public final class TransitionExtractor {
      */
     private void extractMutationEncoding(CtType<?> root, CtModel model, Set<Transition> out) {
         stateFieldNames = findStateFieldNames(model);
-        mutatorNames = findMutatorNames(model);
-        if (stateFieldNames.isEmpty() && mutatorNames.isEmpty()) return;
+        Set<String> keys = new LinkedHashSet<>();
+        Set<String> names = new LinkedHashSet<>();
+        for (CtMethod<?> mutator : findMutators(model)) {
+            keys.add(methodKey(mutator));
+            names.add(mutator.getSimpleName());
+        }
+        mutatorKeys = keys;
+        mutatorNames = names;
+        if (stateFieldNames.isEmpty() && mutatorKeys.isEmpty()) return;
+        if (!mutatorKeys.isEmpty()) {
+            diagnostics.add("mutation encoding: the commit channel is " + mutatorNames + ", "
+                    + "recognised by SHAPE alone — one hierarchy-typed parameter, committed to a "
+                    + "hierarchy-typed field. The spelling is recorded here as corroboration; no "
+                    + "name is consulted to reach it, so a mutator called anything at all is "
+                    + "found and one merely NAMED like one is not (F22)");
+        }
 
         mutationMode = true;
         commitForms.add(CommitForm.FIELD_MUTATION);
@@ -1296,24 +1379,114 @@ public final class TransitionExtractor {
     }
 
     /**
-     * Simple names of <em>mutator</em> methods: a single hierarchy-typed parameter
-     * plus either a state-field assignment in the body or a conventional setter
-     * name ({@code setState}/{@code changeState}/{@code transitionTo}/{@code goTo}).
+     * The hierarchy's <em>state mutators</em>: the methods through which a
+     * {@code ctx.setState(new Locked())} call site commits a successor.
+     *
+     * <p><b>F22 — a mutator is a shape, not a vocabulary.</b> This admitted a
+     * method on either of two grounds: it assigned a state field, <em>or</em> its
+     * name was one of {@code setState}/{@code changeState}/{@code transitionTo}/
+     * {@code goTo}/{@code setCurrent}/{@code become}. The second disjunct made a
+     * word list load-bearing in a recognizer whose sibling
+     * ({@link CarrierTransitionDetector}) states in its own contract that nothing
+     * keys off a name. Both could not be true, and the name half was not merely
+     * inelegant: an admitted method has its call sites' ARGUMENT published as the
+     * committed successor, so {@code void become(Bolt observed) { this.log =
+     * observed.toString(); }} — an audit hook that commits nothing — turned every
+     * {@code become(current)} in the model into a RESOLVED self-loop. A fabricated
+     * resolved edge is the one failure mode the soundness invariant forbids
+     * outright.
+     *
+     * <p>Recognition is now structural and consults no name at all: exactly one
+     * parameter, its type inside the hierarchy, and a body that assigns a
+     * hierarchy-typed field an expression in which <em>that parameter is the only
+     * hierarchy value</em> ({@link #commitsFrom}).
+     *
+     * <p>The last clause is the half a plain "writes an H-typed field" rule misses,
+     * and it is what actually licenses reading a call's argument as the successor.
+     * {@code void restart(Vent previous) { audit(previous); this.state = new
+     * Sealed(); }} has one hierarchy-typed parameter and does write the state
+     * field — so the naive structural rule admits it just as the word list did —
+     * yet its argument is the state being LEFT, not the one being entered, and
+     * every call site reported a confident edge to the wrong target. Excluded
+     * here, such a method keeps its own commit: it is no longer a mutator, so
+     * {@link #findMutationMethods} picks it up and walks it, and the successor it
+     * really installs is recorded — unattributably, hence unresolved — instead of
+     * being replaced by a fiction.
      */
-    private Set<String> findMutatorNames(CtModel model) {
-        Set<String> names = new LinkedHashSet<>();
+    private Set<CtMethod<?>> findMutators(CtModel model) {
+        Set<CtMethod<?>> found = Collections.newSetFromMap(new IdentityHashMap<>());
         for (CtMethod<?> m : model.getElements(new TypeFilter<>(CtMethod.class))) {
+            if (m.getBody() == null) continue;
             List<CtParameter<?>> ps = m.getParameters();
             if (ps.size() != 1) continue;
-            CtTypeReference<?> pt = ps.get(0).getType();
+            CtParameter<?> param = ps.get(0);
+            CtTypeReference<?> pt = param.getType();
             if (pt == null || !hierarchyQualifiedNames.contains(pt.getQualifiedName())) continue;
-            boolean assignsField = m.getElements(new TypeFilter<>(CtAssignment.class)).stream()
-                    .anyMatch(a -> isStateFieldWrite(a.getAssigned()));
-            if (assignsField || MUTATOR_NAMES.contains(m.getSimpleName().toLowerCase())) {
-                names.add(m.getSimpleName());
+            boolean writesState = false;
+            boolean commits = false;
+            for (CtAssignment<?, ?> a : m.getElements(new TypeFilter<>(CtAssignment.class))) {
+                if (!isStateFieldWrite(a.getAssigned())) continue;
+                writesState = true;
+                if (commitsFrom(a.getAssignment(), param)) {
+                    commits = true;
+                    break;
+                }
+            }
+            if (commits) {
+                found.add(m);
+            } else if (writesState) {
+                unattributedMutators.add(m.getSimpleName());
             }
         }
-        return names;
+        return found;
+    }
+
+    /**
+     * Is {@code value} committed <em>from</em> {@code param} and from no other
+     * hierarchy value? True for {@code next} and for a laundered read of it such as
+     * {@code Objects.requireNonNull(next)}; false for {@code new Sealed()} (the
+     * parameter is not read at all) and for {@code next.spent() ? new Spent() :
+     * new Live()} (the parameter is read, but what lands in the field is chosen
+     * here rather than by the caller).
+     *
+     * <p>Only hierarchy-typed <em>leaves</em> are counted — constructions, and
+     * variable or field reads. An enclosing invocation is a transformation, not a
+     * second source of state: were it counted, the laundered form above would be
+     * rejected and every call site of a null-checking mutator would lose its edge
+     * with no unresolved marker.
+     */
+    private boolean commitsFrom(CtExpression<?> value, CtParameter<?> param) {
+        if (value == null) return false;
+        boolean readsParameter = false;
+        for (CtVariableAccess<?> va : value.getElements(new TypeFilter<>(CtVariableAccess.class))) {
+            if (isReadOf(va, param)) {
+                readsParameter = true;
+            } else if (isHierarchyTyped(va)) {
+                return false; // a second hierarchy value feeds the commit
+            }
+        }
+        if (!readsParameter) return false;
+        for (CtConstructorCall<?> cc : value.getElements(new TypeFilter<>(CtConstructorCall.class))) {
+            if (isHierarchyTyped(cc)) return false;
+        }
+        for (CtThisAccess<?> ta : value.getElements(new TypeFilter<>(CtThisAccess.class))) {
+            if (isHierarchyTyped(ta)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Does {@code access} read {@code param}? Matched on the declaration, with the
+     * simple name as a prefilter — the F13 rule. The name is decisive only when
+     * Spoon binds nothing, and that is safe HERE in a way it is not for a local:
+     * Java forbids a method body from declaring a local that shadows a parameter,
+     * so within this body a matching name can only be this parameter.
+     */
+    private static boolean isReadOf(CtVariableAccess<?> access, CtParameter<?> param) {
+        CtVariableReference<?> ref = access.getVariable();
+        if (ref == null || !param.getSimpleName().equals(ref.getSimpleName())) return false;
+        CtVariable<?> decl = ref.getDeclaration();
+        return decl == null || decl == param;
     }
 
     /**
@@ -1325,8 +1498,8 @@ public final class TransitionExtractor {
         List<CtMethod<?>> out = new ArrayList<>();
         for (CtMethod<?> m : model.getElements(new TypeFilter<>(CtMethod.class))) {
             if (m.getBody() == null) continue;
-            if (mutatorNames.contains(m.getSimpleName()) && m.getParameters().size() == 1) {
-                continue; // the setter itself
+            if (mutatorKeys.contains(methodKey(m))) {
+                continue; // the mutator itself: it stores its parameter, it does not choose it
             }
             boolean writesField = m.getElements(new TypeFilter<>(CtAssignment.class)).stream()
                     .anyMatch(a -> isStateFieldWrite(a.getAssigned()));
@@ -1349,7 +1522,10 @@ public final class TransitionExtractor {
      * avoids resolving types for every assignment in the model.
      *
      * <p>Under {@code noClasspath} an unresolvable field type falls back to the
-     * name match, which is the previous behaviour and no worse than it.
+     * name match. That is the direction that cannot silently drop a commit — an
+     * unrecognised state-field write is not recorded as an unresolved edge, it is
+     * simply not a transition site — but it is still a name standing in for a
+     * proof, so F22 reports it rather than leaving it invisible.
      */
     private boolean isStateFieldWrite(CtExpression<?> lhs) {
         if (!(lhs instanceof CtVariableAccess<?> va) || va.getVariable() == null) {
@@ -1358,26 +1534,45 @@ public final class TransitionExtractor {
         CtVariableReference<?> vref = va.getVariable();
         if (!stateFieldNames.contains(vref.getSimpleName())) return false;
         CtTypeReference<?> declared = vref.getType();
-        if (declared == null) return true; // type unresolvable — keep the name match
+        if (declared == null) {
+            unboundStateFieldWrites.add(vref.getSimpleName());
+            return true; // type unresolvable — the direction that cannot drop a commit
+        }
         return hierarchyQualifiedNames.contains(declared.getQualifiedName());
     }
 
     /**
      * Is {@code inv} a call to a recognised state mutator of <em>this</em>
-     * hierarchy? Same reasoning as {@link #isStateFieldWrite}: two machines that
-     * both expose a {@code setState} must not claim each other's calls, so the
-     * mutator's parameter type has to sit inside the hierarchy.
+     * hierarchy?
+     *
+     * <p>Decided on the callee's DECLARATION, keyed the way hosts are keyed
+     * elsewhere ({@code declaringType#signature}), so the answer is the same set
+     * {@link #findMutators} computed rather than a second, name-shaped
+     * approximation of it. Two machines in one model routinely both expose a
+     * {@code setState}, and the mutator's own body — not its name — is what says
+     * which hierarchy it commits to.
+     *
+     * <p>The simple name is a PREFILTER only: it keeps the declaration lookup off
+     * every unrelated call in the model. F22 removed the fallback beneath it,
+     * which returned {@code true} on a name match whenever the callee's parameter
+     * list came back empty — a condition that holds both for an unresolvable
+     * reference and for a genuinely zero-argument method, and that published the
+     * call's argument as a resolved successor on the strength of a word. When the
+     * declaration cannot be bound the question is answered from the call's own
+     * shape instead (one argument, hierarchy-typed) and the call is reported, so
+     * the residual name match is visible rather than silent.
      */
     private boolean isMutatorCall(CtInvocation<?> inv) {
         try {
             CtExecutableReference<?> exe = inv.getExecutable();
             if (exe == null || !mutatorNames.contains(exe.getSimpleName())) return false;
-            List<CtTypeReference<?>> params = exe.getParameters();
-            if (params == null || params.isEmpty()) return true; // unresolvable — keep the name match
-            for (CtTypeReference<?> p : params) {
-                if (p != null && hierarchyQualifiedNames.contains(p.getQualifiedName())) return true;
+            if (exe.getExecutableDeclaration() instanceof CtMethod<?> callee) {
+                return mutatorKeys.contains(methodKey(callee));
             }
-            return false;
+            List<CtExpression<?>> args = inv.getArguments();
+            boolean shaped = args.size() == 1 && isHierarchyTyped(args.get(0));
+            if (shaped) unboundMutatorCalls.add(exe.getSimpleName());
+            return shaped;
         } catch (Throwable t) {
             return false;
         }
@@ -2839,9 +3034,33 @@ public final class TransitionExtractor {
 
     // ---- misc -----------------------------------------------------------------
 
-    private static String eventName(CtMethod<?> method) {
-        String name = method.getSimpleName();
-        return NEUTRAL_METHOD_NAMES.contains(name.toLowerCase()) ? null : name;
+    /**
+     * The Σ symbol a transition method's NAME contributes, or {@code null} when it
+     * contributes none.
+     *
+     * <p><b>F22 — a method name is an input symbol only when it DISCRIMINATES.</b>
+     * This was a hard-coded list of English words ({@code next}, {@code transition},
+     * {@code step}, {@code advance}, {@code tick}) held to be "neutral", which is
+     * a claim about vocabulary rather than about the program, and it failed in
+     * both directions on the corpus. {@code retrystate.Attempt} spells its one
+     * transition {@code on(Signal)} and {@code retrystate.Frame} spells its one
+     * {@code wrap(Frame)}: neither word was on the list, so every edge of both
+     * machines was labelled with the function's own name while the real input —
+     * {@code Signal.START} and friends — sat in the guard. Adding two more words
+     * to the list would have moved the failure rather than removed it.
+     *
+     * <p>What separates the two cases is structural and already in the model. A
+     * hierarchy whose states all override <em>one</em> method has named the
+     * transition function; the choice of which transition to take is made by that
+     * method's argument, so the name is a constant across every edge and carries
+     * no information. A hierarchy whose states expose <em>several</em> — the GoF
+     * spelling, {@code coin()} beside {@code push()} — makes the call site's choice
+     * of method the input, and each name is then a genuine Σ symbol. The test is
+     * therefore whether the names discriminate, decided per hierarchy in
+     * {@link #extract} and reported as a diagnostic; no vocabulary appears here.
+     */
+    private static String eventName(CtMethod<?> method, boolean namesDiscriminate) {
+        return namesDiscriminate ? method.getSimpleName() : null;
     }
 
     private static String merge(String a, String b) {
