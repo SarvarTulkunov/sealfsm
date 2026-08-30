@@ -136,6 +136,11 @@ public final class Analyzer {
             for (CommitForm cf : te.commitForms()) {
                 machine.addCommitForm(cf);
             }
+            // A member whose declaration was never read contributes the edges that
+            // MENTION it (the permits clause names it) but not the ones it
+            // produces. That asymmetry is recorded here, never left to read as an
+            // absence of transitions.
+            recordUnreadStateGaps(root, machine, states.naming(), te.dispatchedStates(), result);
             // A state the dispatch matched but from which nothing is produced is
             // absorbing — RFC 9113's `Closed`, whose every arm throws. A state the
             // dispatch never matched is not: that is a recall gap, and
@@ -235,18 +240,22 @@ public final class Analyzer {
     private void reportResolution(CtType<?> root, ExtractionResult result,
                                   TypeResolutionAudit audit, boolean rejected) {
         String where = root.getQualifiedName();
-        Set<String> unresolvedStates = new TreeSet<>();
-        for (CtTypeReference<?> ref : SpoonCompat.unresolvedPermittedTypes(root)) {
-            unresolvedStates.add(SpoonCompat.resolutionName(ref));
-        }
+        // The same set the membership recovery admits, asked from the same helper:
+        // a report and a recovery that each derived "which members are unread"
+        // would eventually name different sets, and the disagreement would be a
+        // state warned about but not recovered, or recovered but not warned about.
+        Set<String> unresolvedStates = new TreeSet<>(
+                StateMachineClassifier.unresolvedMemberNames(root));
         if (!unresolvedStates.isEmpty()) {
             result.warn(where,
                     "permitted subtype(s) " + TypeResolutionAudit.summarize(unresolvedStates, 8)
-                            + " did not resolve — they are still enumerated as states, but their "
-                            + "declarations were never read, so any child states of a sealed or "
-                            + "enum member are missing and no transition mentioning them can be "
-                            + "recognised. State enumeration is exact only over a source set that "
-                            + "contains the whole hierarchy");
+                            + " did not resolve — their declarations were never read. They are "
+                            + "still enumerated as states, and because the permits clause is what "
+                            + "names them, edges TO them are recovered wherever the use site was "
+                            + "spelled the same way; but any child states of a sealed or enum "
+                            + "member are missing, and any transition producer declared INSIDE "
+                            + "them was never examined. State enumeration is exact only over a "
+                            + "source set that contains the whole hierarchy");
         }
 
         Set<String> memberNames =
@@ -264,10 +273,87 @@ public final class Analyzer {
 
         if (rejected && (!unresolvedStates.isEmpty() || !resembling.isEmpty())) {
             result.warn(where,
-                    "this rejection may be a type-resolution failure rather than a verdict: "
-                            + "membership is decided by qualified name, and an unresolved "
-                            + "reference is indistinguishable from a foreign type. Re-run with the "
-                            + "whole hierarchy in --src before recording it as 'not a state machine'");
+                    "this rejection may be a type-resolution failure rather than a verdict: a "
+                            + "member whose declaration was never read has no methods to "
+                            + "recognise, so a hierarchy can abstain purely because its producers "
+                            + "were not in --src, and a use site Spoon spelled differently from "
+                            + "the permits clause is still indistinguishable from a foreign type. "
+                            + "Re-run with the whole hierarchy in --src before recording it as "
+                            + "'not a state machine'");
+        }
+    }
+
+    /**
+     * Record, as an explicit unresolved edge, the outgoing transitions of a state
+     * whose declaration the analysis never read.
+     *
+     * <p>This is the half that stops
+     * {@link StateMachineClassifier#hierarchyQualifiedNames}'s recovery from
+     * buying a better-looking score than the input supports. Admitting the
+     * permits clause's spelling recovers the edges that MENTION such a state, and
+     * under a centralized dispatch that is the entire relation: the unread files
+     * are pure data, and {@code examples/door} minus its three state files reports
+     * exactly the five transitions the machine has. Under a polymorphic encoding
+     * it is not, because the transition logic lives in the file that was not read
+     * — {@code examples/traffic} minus {@code Yellow.java} recovers
+     * {@code Green → Yellow} and can never recover {@code Yellow → Red}. Reported
+     * as 2/2 that is a perfect score on a machine missing a third of its relation:
+     * a transition dropped behind a clean-looking n/n with no unresolved marker,
+     * which is the one outcome the record-everything invariant forbids by name.
+     * Reported as 2/3 it is a recovered edge beside a visible gap, which is what
+     * the input actually supports. The recovery and this record are therefore one
+     * change and must not be separated.
+     *
+     * <p><b>Eligibility asks "did any producer EXAMINE this state?"</b>, and it is
+     * answered by {@code dispatchedStates} — deliberately the same signal
+     * {@link StateMachine#markTerminalStates} already trusts to separate an
+     * absorbing state from a recall gap, rather than a second notion of the same
+     * thing. A state a dispatch arm matched had its successors computed by a host
+     * the analysis did read; a state nothing matched has no outgoing edges only
+     * because none could be recovered.
+     *
+     * <p>The residual is named in the diagnostics rather than hidden: a state a
+     * centralized dispatch matched, whose unread file ALSO declared a producer of
+     * its own, gets no marker. Nothing in the readable source separates that from
+     * a state whose file holds only data — the readable half is identical in both
+     * — so what can honestly be said is said, in the INFO line.
+     */
+    private static void recordUnreadStateGaps(CtType<?> root, StateMachine machine,
+                                              StateNaming naming, Set<String> dispatched,
+                                              ExtractionResult result) {
+        Set<String> unread = StateMachineClassifier.unresolvedMemberNames(root);
+        if (unread.isEmpty()) return;
+
+        String where = root.getQualifiedName();
+        Set<String> unexamined = new TreeSet<>();
+        Set<String> examined = new TreeSet<>();
+        for (String qn : unread) {
+            String id = naming.idFor(qn);
+            if (id == null) continue;
+            if (dispatched.contains(id)) {
+                examined.add(qn);
+                continue;
+            }
+            machine.addTransition(Transition.unresolved(id, null, null,
+                    "declaration of " + qn + " was never read, so its transition producers "
+                            + "— if it declares any — were not examined"));
+            unexamined.add(qn);
+        }
+
+        if (!unexamined.isEmpty()) {
+            result.warn(where,
+                    "state(s) " + TypeResolutionAudit.summarize(unexamined, 8)
+                            + " were enumerated from the permits clause, but their declarations "
+                            + "were never read and no dispatch examined them, so their outgoing "
+                            + "transitions are unknown. One unresolved edge is recorded per state, "
+                            + "so the gap is counted rather than read as an absence of transitions");
+        }
+        if (!examined.isEmpty()) {
+            result.info(where,
+                    "state(s) " + TypeResolutionAudit.summarize(examined, 8)
+                            + " did not resolve, but a dispatch the analysis could read computes "
+                            + "their successors, so their outgoing edges are recovered. A producer "
+                            + "declared inside the unread declaration itself would not be");
         }
     }
 

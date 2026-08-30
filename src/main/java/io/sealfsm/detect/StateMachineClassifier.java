@@ -391,17 +391,101 @@ public final class StateMachineClassifier {
 
     // ---- hierarchy helpers ----------------------------------------------------
 
-    /** Root plus all (transitively) permitted subtypes, as resolved CtTypes. */
+    /**
+     * Root plus all (transitively) permitted subtypes, as resolved CtTypes.
+     *
+     * <p>Resolved only, and necessarily so: a member whose declaration was never
+     * read has no body to walk, no methods to recognise and no {@code permits}
+     * clause to descend into. Membership is the wider question, and it does not
+     * require readability — see {@link #hierarchyQualifiedNames}.
+     */
     public static List<CtType<?>> hierarchyTypes(CtType<?> root) {
         List<CtType<?>> out = new ArrayList<>();
         collectHierarchy(root, out, new LinkedHashSet<>());
         return out;
     }
 
+    /**
+     * Every qualified name that names a member of this hierarchy, including the
+     * members whose <em>declarations</em> did not resolve.
+     *
+     * <p><b>The gap this closes.</b> Under {@code noClasspath} a member Spoon
+     * cannot bind still reaches the analysis as a reference carrying a guessed
+     * qualified name. Built from resolved declarations alone, this set answered
+     * "not in the hierarchy" for such a name — the identical answer a genuinely
+     * foreign type gives — so {@link io.sealfsm.extract.StateExtractor}
+     * enumerated the state from the {@code permits} clause while every recognizer
+     * read it as foreign, and every edge mentioning it was lost. The two halves of
+     * the tool disagreed about what the hierarchy contains. Withholding one state
+     * file from {@code examples/traffic} took it from 3/3 resolved transitions to
+     * 1/2; withholding {@code examples/door}'s three state files gave 0/5 plus six
+     * nondeterminism warnings about a state called {@code <unknown>}.
+     *
+     * <p><b>Why a permits reference may be admitted where a resemblance may
+     * not.</b> What is added here is a name the {@code permits} clause itself
+     * wrote. {@code permits X} is the compiler-checked statement that X is a
+     * member — the same statement the exact state enumeration already rests on,
+     * which is why the state appears in the output at all. Only the
+     * <em>spelling</em> Spoon assigns to the reference is a guess; that the type
+     * it denotes belongs to the hierarchy is not. So no simple name is matched
+     * here and no resemblance is consulted (contrast
+     * {@link TypeResolutionAudit#resembling}, which only ever selects the text of
+     * a diagnostic): a use site joins the hierarchy only when Spoon spelled it
+     * with the identical qualified name, which is the same equality test every
+     * resolved member already goes through.
+     *
+     * <p><b>The residual risk, stated rather than argued away.</b> Spoon derives
+     * both guesses from the same package-and-import context, so they normally
+     * agree or both fail. But if the guess is WRONG — an unreadable import makes
+     * {@code p.Yellow} the guess for a type that is really {@code q.Yellow} — a
+     * foreign type spelled the same way in the same context is admitted as a
+     * state and an edge to it is published RESOLVED, which is a fabrication and
+     * the failure mode the soundness invariant forbids outright. The guesses are
+     * also not stable: one unresolvable type was observed reaching a single model
+     * as both {@code pkg.Signal} and a bare {@code Signal}. Recovery is therefore
+     * partial by construction — a use site Spoon spelled differently stays
+     * unresolved exactly as before — and it is conditional on an input the tool
+     * should not have been handed in the first place: a source set omitting part
+     * of a hierarchy.
+     *
+     * <p><b>Recovering the incoming edges does not recover the outgoing ones.</b>
+     * The declaration is still unread, so a producer declared INSIDE it was never
+     * examined, and under a polymorphic encoding that is the state's entire
+     * outbound relation. {@link io.sealfsm.Analyzer} records that as an explicit
+     * unresolved transition out of each such state, so what this method buys is a
+     * recovered edge and never a cleaner-looking score.
+     */
     public static Set<String> hierarchyQualifiedNames(CtType<?> root) {
         Set<String> names = new LinkedHashSet<>();
         for (CtType<?> t : hierarchyTypes(root)) names.add(t.getQualifiedName());
+        names.addAll(unresolvedMemberNames(root));
         return names;
+    }
+
+    /**
+     * The members named by a {@code permits} clause the analysis could read but
+     * whose own declarations it could not — the difference between
+     * {@link #hierarchyQualifiedNames} and {@link #hierarchyTypes}.
+     *
+     * <p>Transitive over the members that DID resolve, because a composite state
+     * is where the loss compounds: an unread member of a nested sealed type is
+     * missing from the same membership set for the same reason. It cannot recurse
+     * past an unread member, which is exactly the child-state loss the resolution
+     * diagnostic reports separately.
+     *
+     * <p>Exposed rather than folded into the set above so that {@code Analyzer}
+     * can ask which states these are without rebuilding the traversal, and so the
+     * report and the recovery cannot drift into naming different sets.
+     */
+    public static Set<String> unresolvedMemberNames(CtType<?> root) {
+        Set<String> out = new LinkedHashSet<>();
+        for (CtType<?> t : hierarchyTypes(root)) {
+            for (CtTypeReference<?> ref : SpoonCompat.unresolvedPermittedTypes(t)) {
+                String qn = SpoonCompat.resolutionName(ref);
+                if (qn != null && !qn.isEmpty()) out.add(qn);
+            }
+        }
+        return out;
     }
 
     private static void collectHierarchy(CtType<?> type, List<CtType<?>> out, Set<String> seen) {

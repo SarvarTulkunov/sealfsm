@@ -186,7 +186,7 @@ Reference output in `sample-output/` — diff after building to verify.
 - `detect/DispatchCommitDetectorTest` — the commit classification, as near-identical pairs differing only in codomain, plus the F20 pair differing only in what an arm does with the value it matched (accept `case Fresh f -> new Waiting(f, 1)` / reject `case Neg n -> new Neg(fold(n.operand()))`) (accept `state = switch(state)` / reject `label = switch(state)`), and the same pairs for the `instanceof` chain (accept an H-typed field write / reject the `String` one over the identical discrimination)
 - `extract/TransitionResolverTest` — the successor sub-procedure, expression shape by expression shape
 - `model/StateNamingTest` — the id-assignment rule, on qualified names directly (no Spoon): collision-free names untouched, nested/cross-package/enum-constant collisions separated, ids always distinct
-- `ExtractionIntegrationTest` — full Spoon extraction over every example; the F23 trio holds the fixture fixed and varies only **what the analysis was allowed to read**, which is the condition itself rather than an imitation of it (no fixture can encode an unresolvable type — every example is compiled by `javac` as part of being a fixture): `examples/traffic` minus `Yellow.java` must still enumerate 3 states yet lose an edge *and name Yellow as the reason*, `examples/door` minus its three state files must attribute each arm to resolution instead of reporting an unrecognised arm, and six record-heavy fully-readable fixtures must stay **silent** — the `isImplicit` control, which fails loudly if the synthetic-record-member exclusion is dropped or regressed to a source-position test; the F21 pair is two hierarchies of one fixture asked opposite questions — that an always-throwing carrier helper contributes no edge while a returning one of the identical call shape keeps its self-loop, and that a shadow-bodied JDK carrier keeps every edge it produces; the F22 trio asks the same of a name — that an audit hook named `become` contributes nothing while a mutator named `assume` commits, that a method writing the state field from something *other* than its parameter claims no call site, and that a method name survives as an event symbol exactly where the hierarchy spells more than one (kept on `cancellation`, dropped on `retrystate`, unchanged on `traffic`)
+- `ExtractionIntegrationTest` — full Spoon extraction over every example; the F23 trio holds the fixture fixed and varies only **what the analysis was allowed to read**, which is the condition itself rather than an imitation of it (no fixture can encode an unresolvable type — every example is compiled by `javac` as part of being a fixture): `examples/traffic` minus `Yellow.java` must still enumerate 3 states, recover the edge *to* Yellow, and record an explicit unresolved edge *out of* it rather than reporting a clean n/n — *and name Yellow as the reason* for both, `examples/door` minus its three state files must report the **same relation** the whole model does (5/5) with no arm blamed and no gap fabricated, `examples/namecollision` minus `Legacy.java` the same at 12/12 through Spoon's `$`-spelled nested name, and six record-heavy fully-readable fixtures must stay **silent** — the `isImplicit` control, which fails loudly if the synthetic-record-member exclusion is dropped or regressed to a source-position test; the F21 pair is two hierarchies of one fixture asked opposite questions — that an always-throwing carrier helper contributes no edge while a returning one of the identical call shape keeps its self-loop, and that a shadow-bodied JDK carrier keeps every edge it produces; the F22 trio asks the same of a name — that an audit hook named `become` contributes nothing while a mutator named `assume` commits, that a method writing the state field from something *other* than its parameter claims no call site, and that a method name survives as an event symbol exactly where the hierarchy spells more than one (kept on `cancellation`, dropped on `retrystate`, unchanged on `traffic`)
 
 ## Key implementation details
 
@@ -218,8 +218,8 @@ All version-sensitive Spoon calls live here. `isSealed()` checks `ModifierKind.S
 
 - `isUnresolved(ref)` is the single predicate, and it keys on **`getTypeDeclaration() == null`** — measured, not assumed, to be exactly the discriminator wanted: a source type and a classpath type both answer non-null (the latter a shadow, whose qualified name is still authoritative — F11), and only a genuinely unbound reference answers null. Primitives, `void`, the null literal's type, type parameters and wildcards carry no declaration for reasons that are not failures and are excluded; an array is resolved exactly when its component type is.
 - **An IMPLICIT reference is excluded, and that exclusion is what makes the diagnostic usable rather than noise.** Spoon synthesises a `record`'s accessors, and the generated body's implicit `this` carries a type reference built from the bare simple name with no package, so it never binds — one per record component. Without the exclusion four fully-readable fixtures reported resolution failures (`Timeout`, `Pending`, `Error`, `Boxed`…) and three correctly-rejected event alphabets were told their rejection might be one. It is also right on the merits: an implicit reference was never *written*, so it is not evidence that the source mentions an unreadable type, and a genuinely missing type is always referred to explicitly somewhere too. `isImplicit()` is the signal and **source position is not**, though F11 uses position for the analogous shadow test — a type pattern's reference (`case Shut s`) reports no valid position while being a real, explicitly written failure, so a position filter would discard the true positives along with the noise.
-- **Nothing about a verdict changes, deliberately.** Membership still answers "no" for an unresolved reference. Promoting one on a simple-name match would fabricate a *resolved* edge to a state the analysis never established — the one failure mode the soundness invariant forbids outright — and a simple name is not an identity (`examples/namecollision`), while Spoon's guesses are not even stable: one unresolvable `Signal` was observed reaching the model as both `pkg.Signal` and a bare `Signal` within a single build. So the failure is *recorded*, exactly the trade the tool already makes for an unresolved successor. The whole corpus is byte-identical across this change.
-- `unresolvedPermittedTypes(root)` is the severe case, because it lands on the claim the tool makes **exactly**. `StateExtractor` reads states from the permits *references*, so such a state is still enumerated by name — but its declaration was never read, so a sealed or `enum` member's children are silently absent, and it is missing from every membership set, which costs every edge mentioning it.
+- **No verdict keys on a simple name, deliberately** — and on `master` no verdict changed at all. Membership still answers "no" for an unresolved reference whose spelling nothing vouches for. Promoting one on a simple-name match would fabricate a *resolved* edge to a state the analysis never established — the one failure mode the soundness invariant forbids outright — and a simple name is not an identity (`examples/namecollision`), while Spoon's guesses are not even stable: one unresolvable `Signal` was observed reaching the model as both `pkg.Signal` and a bare `Signal` within a single build. So the failure is *recorded*, exactly the trade the tool already makes for an unresolved successor. The whole corpus is byte-identical across this change. **On this branch one class of reference IS promoted** — the one the `permits` clause itself wrote, which is a compiler-checked membership statement rather than a resemblance; see *Membership recovery* below.
+- `unresolvedPermittedTypes(root)` is the severe case, because it lands on the claim the tool makes **exactly**. `StateExtractor` reads states from the permits *references*, so such a state is still enumerated by name — but its declaration was never read, so a sealed or `enum` member's children are silently absent, and on `master` it is missing from every membership set, which costs every edge mentioning it. This branch closes the membership half only — see below.
 
 ### TypeResolutionAudit (detect/TypeResolutionAudit.java)
 One model-wide pass collecting every distinct unresolved type name, built once per model in `Analyzer.analyze` and consulted per root — rebuilding it per candidate would repeat the traversal for an answer that cannot vary. Reporting is stratified by whether the failure can touch a hierarchy, because a severity that does not discriminate is one a reader learns to ignore:
@@ -229,6 +229,76 @@ One model-wide pass collecting every distinct unresolved type name, built once p
 - **on a rejection, WARN** — the headline: "no transition producer found" and "I could not resolve the types" were previously the same output. A rejected root whose vicinity failed to resolve now says so explicitly.
 
 `resembling()` is the one place a simple name is consulted, and it selects the **text of a diagnostic** — never an edge, a state or a classification — which is what keeps it clear of the rule that no analysis decision keys on a name (F22). The message is hedged accordingly: a match does not prove the reference *is* that member.
+
+### Membership recovery for unread permitted members (BRANCH `unresolved-member-recovery`)
+
+**This section describes a change that is NOT on `master`.** It resolves a
+disagreement F23 documented but deliberately left standing: `StateExtractor` and
+`StateMachineClassifier.collectHierarchy` answer "what is in this hierarchy?"
+from different sources. States come from the `permits` *references* (no
+declaration needed); membership came from *resolved declarations* only. Withhold
+`examples/traffic/Yellow.java` and the tool enumerates 3 states while no
+recognizer will admit that any of them is `Yellow` — `Green.next()`, fully
+readable and returning `new Yellow()`, fails `hierarchy.contains(...)` and its
+edge goes unresolved. 3 states, 1/2, and one of them is a state no edge can
+touch.
+
+- `StateMachineClassifier.hierarchyQualifiedNames` is now the resolved member
+  names ∪ `unresolvedMemberNames(root)`, the names carried by permits references
+  that did not resolve. `hierarchyTypes` is unchanged and stays resolved-only — a
+  declaration that was never read has no body to walk. Both the recovery and the
+  resolution diagnostic ask the same helper, so the set warned about and the set
+  admitted cannot drift.
+- **Why this is not the simple-name promotion F23 forbids.** `permits X` is the
+  compiler-checked statement that X is a member — the same statement the *exact*
+  state enumeration already rests on, which is why the state is in the output at
+  all. Only the **spelling** Spoon assigns the reference is a guess; membership is
+  not. No resemblance is consulted anywhere: a use site joins the hierarchy only
+  when Spoon spelled it with the byte-identical qualified name, which is the test
+  every resolved member already passes. `TypeResolutionAudit.resembling` stays
+  what it was — diagnostic text, never a decision.
+- **The residual risk, which is why this is a branch.** If Spoon's guess is
+  *wrong* (an unreadable import making `p.Yellow` the guess for a `q.Yellow`), a
+  foreign type spelled that way in the same context is admitted as a state and an
+  edge to it is published **resolved** — a fabrication. And the guesses are not
+  stable: `examples/namecollision` minus `Legacy.java` reaches the model as
+  `namecollision.Legacy$Idle`, `namecollision.Legacy` **and** a bare `Legacy.Idle`
+  at once, so recovery is partial by construction. That instability is pinned as a
+  standing probe, and if a Spoon bump ever removes it the claim needs re-measuring
+  rather than re-asserting.
+- **`Analyzer.recordUnreadStateGaps` is the other half, and is not separable from
+  it.** Recovery buys the edges that *mention* an unread state, never the ones it
+  *produces* — that producer is in the file that was not read. Under
+  CENTRALIZED_DISPATCH that costs nothing (the state files are data), but under
+  POLYMORPHIC it is the state's whole outbound relation, so `traffic` minus
+  `Yellow.java` would otherwise report **2/2**: a perfect score on a machine
+  missing a third of its relation, a dropped transition behind a clean-looking
+  n/n, which is the one outcome the record-everything invariant forbids by name.
+  Every unread state that **no dispatch examined** therefore carries an explicit
+  unresolved outgoing edge, and `traffic` reports 2/3 — one recovered edge, one
+  visible gap. Eligibility is `dispatchedStates`, deliberately the same signal
+  `markTerminalStates` already trusts for the same distinction rather than a
+  second notion of it. The residual is reported, not hidden: a state a centralized
+  dispatch matched, whose unread file *also* declared a producer of its own, gets
+  no marker — nothing in the readable source separates that from a state whose
+  file holds only data.
+- **Measured, on the three shapes that exist.** `door` minus its 3 state files:
+  0/5 → **5/5**, relation byte-identical to the whole model, no arm blamed for an
+  input problem, no gap fabricated. `namecollision` minus `Legacy.java`: **12/12**,
+  identical relation, the `$`-spelled nested id preserved. `traffic` minus
+  `Yellow.java`: 1/2 → **2/3**. The full corpus (every `.dot`, `.scxml` and summary
+  line, all 40 examples) is **byte-identical** to `master` — no fixture has an
+  unresolved member, which is also why no fixture can pin this and the tests build
+  partial models instead.
+- **The standing argument against merging**, recorded so it is not re-litigated
+  from scratch: the triggering condition is an *input error*, not a Java idiom.
+  F1–F22 are all "the algorithm mishandled legal Java"; this is "the tool was
+  pointed at incomplete source", and the right answer to bad input is the clear
+  report F23 already gives. The trigger that would change that: if harvesting real
+  GitHub projects routinely hits multi-source-root layouts, partial source sets
+  stop being an error and become normal — at which point the better fix is
+  source-root auto-discovery in `Main` (`--src <project-root>` finding every
+  `src/main/java`), which removes the cause instead of compensating for it.
 
 ### StateMachineClassifier (detect/StateMachineClassifier.java)
 `Classification` carries a `Rejection` alongside the reason text: `ABSTAINED` ("no transition producer found") versus `VETOED` (the compositional veto). Only the second is a verdict about the hierarchy's members, and the difference is what decides whether a rejected root releases its nested sealed subtypes — see the re-offer worklist above. Do not collapse them back to a reason string; a caller comparing that string is a caller that breaks when the wording changes.

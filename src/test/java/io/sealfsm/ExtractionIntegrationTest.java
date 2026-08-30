@@ -59,6 +59,17 @@ class ExtractionIntegrationTest {
                         && to.equals(t.to()) && event.equals(t.event()));
     }
 
+    /**
+     * The transition relation as comparable text, so two extractions of the same
+     * machine can be asserted equal rather than compared edge by edge.
+     */
+    private Set<String> relationOf(StateMachine m) {
+        return m.transitions().stream()
+                .map(t -> t.from() + " -" + t.event() + "[" + t.guard() + "]-> "
+                        + (t.isResolved() ? t.to() : "?"))
+                .collect(Collectors.toSet());
+    }
+
     private Set<String> stateIds(StateMachine m) {
         return m.allStates().stream().map(io.sealfsm.model.State::id).collect(Collectors.toSet());
     }
@@ -2632,50 +2643,177 @@ class ExtractionIntegrationTest {
                 "examples/traffic/TrafficController.java"));
         StateMachine thin = single(partial);
 
-        // The state itself survives: StateExtractor reads the permits clause, which
-        // is a set of references. What is lost is membership — Yellow is in no
-        // recognizer's set — so the edges mentioning it go with it.
+        // The state survives, and so now does its MEMBERSHIP. StateExtractor reads
+        // the permits clause, which is a set of references; the clause is also the
+        // compiler-checked statement that Yellow belongs to the hierarchy, and only
+        // the SPELLING Spoon gives the reference is a guess. So the edge that
+        // mentions the state comes back — this is the half the recovery buys.
         assertEquals(3, thin.allStates().size(),
                 "the permits clause still enumerates the state by name");
-        assertTrue(thin.resolvedTransitionCount() < full.resolvedTransitionCount(),
-                "withholding a state's file must cost edges");
+        assertTrue(hasResolved(thin, "Green", "Yellow"),
+                "an edge to a state the permits clause names must be recovered: that "
+                        + "clause is the same source the exact state set already rests on");
 
-        // The whole point: that loss must be attributable.
+        // ...and the half it does NOT buy must stay visible. Yellow's own producer
+        // is in the file that was not read, so `Yellow -> Red` is unrecoverable
+        // under this encoding. Reported as 2/2 that is a perfect score on a machine
+        // missing a third of its relation — a dropped transition behind a clean
+        // n/n with no unresolved marker, the one outcome the record-everything
+        // invariant forbids by name. 2/3 is what the input actually supports, and
+        // this assertion is why the recovery and the gap record are one change.
+        assertEquals(3, thin.transitions().size());
+        assertEquals(2, thin.resolvedTransitionCount());
+        assertTrue(thin.resolvedTransitionCount() < full.resolvedTransitionCount(),
+                "withholding a state's file must still cost the edges it produced");
+        assertTrue(thin.transitions().stream()
+                        .anyMatch(t -> !t.isResolved() && t.from().equals("Yellow")),
+                "a state whose declaration was never read, and which no dispatch "
+                        + "examined, must carry an explicit unresolved outgoing edge");
+        assertFalse(thin.allStates().stream()
+                        .anyMatch(s -> s.id().equals("Yellow") && s.isTerminal()),
+                "an unread state is not absorbing — nothing was read about it");
+
+        // Recovery may reconnect an edge to a state the permits clause enumerated.
+        // It may never widen the state set nor point an endpoint outside it: a
+        // resolved edge to a state the analysis never established is a fabrication,
+        // not a recovery, and this is the assertion that would catch a future
+        // "improvement" that promoted an unresolved reference on a simple-name
+        // match instead of on the permits spelling.
+        Set<String> ids = stateIds(thin);
+        for (Transition t : thin.transitions()) {
+            assertTrue(ids.contains(t.from()), "edge sourced outside the state set: " + t);
+            assertTrue(!t.isResolved() || ids.contains(t.to()),
+                    "edge resolved to a target outside the state set: " + t);
+        }
+
+        // The whole point: what was recovered and what was not must BOTH be
+        // attributable, or the reader cannot tell an unreadable input from a
+        // finding about the program.
         assertTrue(partial.diagnostics().stream().anyMatch(d ->
                         d.severity() == ExtractionResult.Severity.WARN
                                 && d.message().contains("permitted subtype(s)")
                                 && d.message().contains("examples.traffic.Yellow")),
-                "the missing edges must be attributed to Yellow not resolving, or the "
-                        + "reader cannot tell an unreadable input from a finding");
+                "the unread declaration must be named");
+        assertTrue(partial.diagnostics().stream().anyMatch(d ->
+                        d.severity() == ExtractionResult.Severity.WARN
+                                && d.message().contains("outgoing transitions are unknown")
+                                && d.message().contains("examples.traffic.Yellow")),
+                "the gap the recovery cannot close must be reported, not merely counted");
     }
 
     @Test
-    void anUnresolvedPatternTypeIsNotBlamedOnTheSwitchArm() {
-        // A centralized dispatch whose state files are absent reported "could not
-        // determine source state for a switch case" once per arm and a 0/n score —
-        // blaming the switch-arm handling for what is an input problem. In a thesis
-        // reporting recall stratified by idiom that is a misattributed recall
-        // figure, not merely a confusing message.
+    void aCentralizedDispatchSurvivesTheLossOfItsStateFiles() {
+        // The same input error as the test above, under the other encoding — and
+        // the case that makes the recovery worth having. A centralized dispatch
+        // whose state files are absent reported "could not determine source state
+        // for a switch case" once per arm, a 0/5 score, and six nondeterminism
+        // warnings about a state called <unknown>: the switch-arm handling blamed
+        // for what is an input problem. In a thesis reporting recall stratified by
+        // idiom that is a misattributed recall figure, not merely a confusing
+        // message.
+        //
+        // Under this encoding the withheld files are pure DATA — the whole
+        // transition relation lives in DoorMachine, which WAS read — so the honest
+        // answer is not a smaller relation with better wording. It is the same
+        // relation.
         ExtractionResult partial = new Analyzer().analyze(modelOfFiles(
                 "examples/door/Door.java", "examples/door/DoorMachine.java",
                 "examples/door/Event.java", "examples/door/Lock.java",
                 "examples/door/Push.java", "examples/door/Unlock.java"));
-        List<String> armFailures = partial.diagnostics().stream()
-                .map(ExtractionResult.Diagnostic::message)
-                .filter(msg -> msg.contains("could not determine source state"))
-                .toList();
-        assertFalse(armFailures.isEmpty(),
-                "the arms cannot name their state when the state files are absent");
-        assertTrue(armFailures.stream().allMatch(msg -> msg.contains("did not resolve")),
-                "an arm whose pattern type never resolved must be attributed to "
-                        + "resolution, not reported as an unrecognised arm: " + armFailures);
+        StateMachine thin = single(partial);
+        ExtractionResult wholeDoor = new Analyzer().analyze(modelOf("examples/door"));
+        StateMachine full = single(wholeDoor);
+
+        assertEquals(relationOf(full), relationOf(thin),
+                "the withheld files hold no transition logic, so withholding them "
+                        + "must cost no edge");
+        assertEquals(5, thin.transitions().size());
+        assertEquals(5, thin.resolvedTransitionCount());
+
+        assertTrue(partial.diagnostics().stream()
+                        .map(ExtractionResult.Diagnostic::message)
+                        .noneMatch(msg -> msg.contains("could not determine source state")),
+                "every arm names its state once the pattern types are members again, "
+                        + "so no arm may still be reported as unrecognised");
+        Set<String> ids = stateIds(thin);
+        assertEquals(Set.of("Open", "Closed", "Locked"), ids);
+        assertTrue(thin.transitions().stream().allMatch(t -> ids.contains(t.from())),
+                "no edge may be sourced at <unknown> or <entry> once the arms resolve");
+
+        // Negative control for the gap record, and the mirror of the failure it
+        // exists to prevent. Every state here WAS examined by a dispatch the
+        // analysis read, so no unresolved outgoing edge may be manufactured for it:
+        // one marker per unread state regardless of what examined it would report a
+        // fully recovered machine as 5/8, understating a complete answer exactly as
+        // reporting traffic 2/2 would overstate an incomplete one.
+        assertEquals(0, thin.unresolvedTransitionCount());
+
+        // Recovery changes what is LOST, never whether the reader is told. The
+        // input error is still reported, and the states it touched are named.
+        assertTrue(mentionsResolution(partial));
+        assertTrue(partial.diagnostics().stream().anyMatch(d ->
+                        d.message().contains("their successors, so their outgoing edges "
+                                + "are recovered")
+                                && d.message().contains("examples.door.Open")),
+                "a state recovered only because a readable dispatch computes its "
+                        + "successors must say so — its own declaration was still not read");
 
         // Negative control: with every file present the identical switch produces
-        // the full relation and no such diagnostic, so the message above tracks
-        // resolution and not merely the presence of a pattern arm.
-        ExtractionResult wholeDoor = new Analyzer().analyze(modelOf("examples/door"));
-        assertEquals(5, single(wholeDoor).resolvedTransitionCount());
+        // the full relation and no resolution diagnostic at all, so the messages
+        // above track resolution and not merely the presence of a pattern arm.
+        assertEquals(5, full.resolvedTransitionCount());
         assertFalse(mentionsResolution(wholeDoor));
+    }
+
+    @Test
+    void anUnreadNestedMemberIsRecoveredUnderSpoonsOwnSpelling() {
+        // The third shape the recovery meets, and the one where the SPELLING is
+        // the whole question. `Legacy.Idle` is a nested type, which Spoon names
+        // `namecollision.Legacy$Idle`; a rule that split the qualified name on `.`
+        // alone would read that tail as the simple name and match nothing. The
+        // state set already canonicalises `$` (StateNaming), and membership must
+        // agree with it or the two halves of the tool disagree about the same
+        // state again — this time about a state whose id was deliberately
+        // lengthened to keep it distinct from `namecollision.Idle`.
+        ExtractionResult whole = new Analyzer().analyze(modelOf("examples/namecollision"));
+        StateMachine full = single(whole);
+        ExtractionResult partial = new Analyzer().analyze(modelOfFiles(
+                "examples/namecollision/Idle.java", "examples/namecollision/Link.java",
+                "examples/namecollision/LinkDriver.java",
+                "examples/namecollision/LinkMachine.java", "examples/namecollision/Mode.java",
+                "examples/namecollision/Phase.java", "examples/namecollision/Signal.java"));
+        StateMachine thin = single(partial);
+
+        assertEquals(8, thin.allStates().size());
+        assertTrue(stateIds(thin).contains("Legacy.Idle"),
+                "the disambiguated id must survive the loss of the declaration, or the "
+                        + "two Idle states collapse and one edge is silently discarded");
+        assertEquals(relationOf(full), relationOf(thin),
+                "the transition logic is entirely in LinkMachine, which was read");
+        assertEquals(12, thin.resolvedTransitionCount());
+        assertEquals(0, thin.unresolvedTransitionCount());
+        assertTrue(partial.diagnostics().stream().anyMatch(d ->
+                        d.severity() == ExtractionResult.Severity.WARN
+                                && d.message().contains("permitted subtype(s)")
+                                && d.message().contains("Legacy$Idle")),
+                "the unread declaration must still be named");
+
+        // STANDING PROBE, not an assertion about this machine's edges. One
+        // withheld type reaches this model under several guessed spellings at once
+        // — the permits clause's `namecollision.Legacy$Idle` and a bare
+        // `Legacy.Idle` from elsewhere — which is exactly why recovery admits only
+        // the spelling the permits clause wrote and is therefore partial by
+        // construction: a use site Spoon spelled differently stays unresolved. If a
+        // Spoon bump ever makes the guesses agree, this fails loudly and the claim
+        // in hierarchyQualifiedNames' javadoc needs re-measuring rather than
+        // re-asserting.
+        assertTrue(partial.diagnostics().stream().anyMatch(d ->
+                        d.message().contains("did not resolve under noClasspath")
+                                && d.message().contains("Legacy.Idle")
+                                && d.message().contains("Legacy$Idle")),
+                "one unreadable type is expected to reach the model under more than "
+                        + "one guessed spelling; if it no longer does, re-measure the "
+                        + "claim that recovery is spelling-dependent");
     }
 
     @Test
