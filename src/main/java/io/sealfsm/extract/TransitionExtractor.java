@@ -1069,10 +1069,21 @@ public final class TransitionExtractor {
      *   <li>neither, meaning the successor cannot be determined without leaving
      *       this method: recorded UNRESOLVED, never guessed and never dropped.</li>
      * </ol>
+     *
+     * <p>F21 — before any of that, the value must be a value at all. See
+     * {@link #callsNonReturningHelper}: a call that cannot return is not a
+     * carrier, and the one-level unwrap below cannot tell one from the other.
      */
     private void handleCarrierValue(CtExpression<?> value, String from, String event,
                                     String guard, Set<Transition> out) {
         if (value == null) return;
+
+        // (0) F21: the call never returns, so it wraps nothing and yields nothing.
+        // The arm is an undefined input, exactly as `throw illegal(...)` would be.
+        if (callsNonReturningHelper(value)) {
+            nonReturningCalls++;
+            return;
+        }
 
         // `cond ? Transition.to(new Listen()) : Transition.to(new Closed(), ...)`
         if (value instanceof CtConditional<?> cond) {
@@ -1530,10 +1541,20 @@ public final class TransitionExtractor {
      * <p>This is <em>exact</em>, not a heuristic, and that is the whole reason it
      * is allowed to suppress an edge. JLS §8.4.7 makes it a compile-time error for
      * a method with a declared return type to have a body that can complete
-     * normally; the caller has already established that this callee's return type
-     * is the hierarchy type, so it is non-void by construction. A body containing
-     * no {@code return} anywhere therefore <em>cannot</em> return a value — it
-     * must throw or diverge. Either way there is no state to transition to.
+     * normally. A body containing no {@code return} anywhere therefore
+     * <em>cannot</em> return a value — it must throw or diverge. Either way there
+     * is no state to transition to.
+     *
+     * <p>Non-voidness is that licence's precondition, so it is checked <em>here</em>
+     * rather than left to the caller. A {@code void} method completes normally by
+     * falling off the end of its body, so an empty one proves the opposite of what
+     * this predicate reports. The inter-procedural caller establishes the point
+     * incidentally (it has already required the return type to be in the
+     * hierarchy); the carrier caller has not, and a predicate whose exactness
+     * depends on which site invokes it is one waiting to be misused. For the same
+     * reason the parameter is a {@code CtMethod}: a <em>constructor</em> contains
+     * no {@code return} for a purely grammatical reason, so this scan would report
+     * every one of them as non-returning.
      *
      * <p>It is the syntactic counterpart of the D3 rule that a {@code throw} arm
      * produces no edge. Without it, {@code default -> throw fail(s, e)} and
@@ -1564,7 +1585,59 @@ public final class TransitionExtractor {
         CtBlock<?> body = callee.getBody();
         if (body == null) return false;      // no body visible: never claim anything
         if (isShadow(callee)) return false;  // F11: a stub body is not an empty body
+        if (isVoid(callee.getType())) return false;  // no JLS §8.4.7 licence to suppress
         return body.getElements(new TypeFilter<>(CtReturn.class)).isEmpty();
+    }
+
+    /**
+     * F21 — {@link #neverReturnsNormally} asked of a produced <em>expression</em>:
+     * is this value the result of calling a helper that provably cannot return?
+     *
+     * <p>The carrier path needs the question in this form because it has no fold
+     * to hang it off. {@link #resolveInterprocedural} reaches F9 while summarising
+     * a callee, and returns early in {@code carrierMode} — deliberately, since the
+     * carrier encoding is strictly intra-procedural. But that scope line bounds
+     * <em>approximation</em>: it says a successor computed inside a helper stays
+     * unresolved rather than being guessed at. F9 is not an approximation and
+     * guesses nothing; it is the compiler-checked observation that there is no
+     * successor. Suppressing the fold therefore suppressed the wrong thing, and
+     * the carrier path was left with no F9 at all.
+     *
+     * <p>What that cost is a fabricated <em>resolved</em> edge, the one failure
+     * mode the soundness invariant forbids outright. {@code illegal(new Closed(),
+     * event)} and {@code Transition.to(new Closed(), ...)} are the same shape — a
+     * call whose own type is outside the hierarchy, carrying a hierarchy-typed
+     * argument — and {@link #handleCarrierValue}'s one-level unwrap reads the
+     * argument of either as the successor. Nothing in the expression distinguishes
+     * them; only the callee's body does. The usual spelling of an undefined cell
+     * is {@code illegal(this, event)}, so the usual fabrication is a self-loop,
+     * and a specification with many undefined cells (RFC 1661's LCP has roughly
+     * forty) grows one per cell — every one of them reported resolved, inflating
+     * both the numerator and the denominator of the recall figure the thesis
+     * reports. The suppressed calls are counted and surface as a diagnostic, the
+     * same treatment F9 already gives them on the centralized path.
+     *
+     * <p>Restricted to a {@link CtInvocation} with a {@link CtMethod} declaration:
+     * {@code new Foo(...)} contains no {@code return} for grammatical reasons, so
+     * admitting a constructor here would suppress every construction in the
+     * corpus. {@link #calleeMethod} already answers {@code null} for anything that
+     * is not a method, and {@link #neverReturnsNormally} declines on an unread
+     * (F11) or void body, so a library carrier such as {@code List.of(new Idle())}
+     * keeps its edge.
+     */
+    private static boolean callsNonReturningHelper(CtExpression<?> value) {
+        if (!(value instanceof CtInvocation<?> inv)) return false;
+        CtMethod<?> callee = calleeMethod(inv);
+        return callee != null && neverReturnsNormally(callee);
+    }
+
+    /** Best-effort {@code void} test; answers "void" when the type is unreadable. */
+    private static boolean isVoid(CtTypeReference<?> type) {
+        try {
+            return type == null || "void".equals(type.getQualifiedName());
+        } catch (Throwable t) {
+            return true;
+        }
     }
 
     /**

@@ -1045,6 +1045,124 @@ class ExtractionIntegrationTest {
         assertTerminal(m, "Fired");
     }
 
+    // ---- F21: F9 on the carrier path ---------------------------------------
+
+    @Test
+    void nonReturningCarrierHelperFabricatesNoEdge() {
+        // F21. `Undefined.illegal(new Snagged(), order)` and
+        // `Haul.to(new Snagged())` are the SAME expression shape: a static call
+        // whose own type is outside the hierarchy, carrying a hierarchy-typed
+        // argument. The carrier walk unwraps one level and reads that argument as
+        // the successor, and nothing in the expression tells the two apart — only
+        // the callee's body does.
+        //
+        // F9 is the instrument that reads the body, but it was reachable only
+        // through `resolveInterprocedural`, which returns early in carrier mode.
+        // That early return is right about folding — the carrier encoding is
+        // strictly intra-procedural, so a successor COMPUTED inside a helper stays
+        // unresolved rather than being guessed. It is wrong as a place to hide F9,
+        // which computes nothing: it observes that there is no successor, from a
+        // fact the compiler already checked (JLS §8.4.7). So the carrier path had
+        // no F9 at all, and every undefined cell became a RESOLVED edge — the one
+        // failure mode the soundness invariant forbids outright. Ablate the hook
+        // and this fixture reports 8/8 for a machine with five transitions.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/throwcarrier"));
+        StateMachine capstan = named(r, "Capstan");
+
+        assertEquals(StateMachine.Encoding.POLYMORPHIC, capstan.encoding());
+        assertEquals(Set.of(CommitForm.POLY_CARRIER), capstan.commitForms());
+        assertEquals(Set.of("Slack", "Taut", "Snagged"), stateIds(capstan));
+        assertEquals("Slack", capstan.initialState().orElse(null));
+
+        // The four real edges, plus the `demand` control below.
+        assertTrue(hasEventEdge(capstan, "Slack", "CRANK", "Taut"));
+        assertTrue(hasEventEdge(capstan, "Slack", "SNAG", "Snagged"));
+        assertTrue(hasEventEdge(capstan, "Taut", "PAY_OUT", "Slack"));
+
+        // THE FINDING, spelling one: `illegal(this, order)` is how an undefined
+        // cell is usually written, so the fabrication is usually a self-loop —
+        // roughly forty of them on a specification the size of RFC 1661's LCP,
+        // every one reported resolved.
+        assertFalse(capstan.transitions().stream()
+                        .anyMatch(t -> "Slack".equals(t.from()) && "Slack".equals(t.to())),
+                "an always-throwing helper carrying `this` is not a self-loop");
+
+        // THE FINDING, spelling two: the fabricated target is a DIFFERENT state,
+        // so the rule being tested is about the callee, not about `this`.
+        assertFalse(capstan.transitions().stream()
+                        .anyMatch(t -> "Taut".equals(t.from()) && "Snagged".equals(t.to())),
+                "an always-throwing helper carrying a sibling state is not an edge");
+
+        // NEGATIVE CONTROL, in the same method as spelling two so that no
+        // difference of file or context can stand in for the body: `Haul.stay(this)`
+        // has the identical call shape and DOES return, so its self-loop survives.
+        assertTrue(capstan.transitions().stream()
+                        .anyMatch(t -> t.isResolved() && "Taut".equals(t.from())
+                                && "Taut".equals(t.to())),
+                "a returning carrier of the same shape keeps its self-loop");
+
+        // NEGATIVE CONTROL for exactness, and the sharpest one: `demand` throws on
+        // one path and returns on another, so it CAN return. The rule is "no
+        // `return` anywhere", which JLS §8.4.7 makes a proof; "contains a `throw`"
+        // is a guess, and acting on it would delete this real edge with no
+        // unresolved marker.
+        assertTrue(hasEventEdge(capstan, "Snagged", "CLEAR", "Snagged"),
+                "a conditionally-throwing helper still returns and keeps its edge");
+
+        assertEquals(5, capstan.transitions().size(),
+                "the relation the source actually defines");
+        assertEquals(0, capstan.unresolvedTransitionCount(),
+                "a suppressed cell is an undefined input, not an unresolved target");
+
+        // Suppression is counted and reported, so it is reclassified rather than
+        // silent — the same treatment F9 already gives it centrally.
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().startsWith("3 call(s) to a helper")
+                                && d.message().contains("cannot return normally")),
+                "the three undefined cells are reported, not merely absent");
+    }
+
+    @Test
+    void aShadowBodiedCarrierKeepsEveryEdge() {
+        // F11's negative control, on the carrier path, and load-bearing in a way
+        // it is not centrally. The fold only ever asks F9 about an in-model helper
+        // returning the hierarchy type; a CARRIER is any wrapper at all, so a
+        // library one is an ordinary input rather than an exotic case. `Hoist`
+        // wraps every successor in `Optional.of(...)`, for which Spoon supplies a
+        // reflective SHADOW: a real signature with an empty `{ }` body. That body
+        // has no `return` because it was never parsed, so its emptiness carries no
+        // information — and read as proof it deletes the entire machine.
+        //
+        // Ablate the shadow check and this reports 0/0: three states, five edges
+        // gone, no unresolved marker anywhere. It also corrupts the commit axis to
+        // FIELD_MUTATION, because the F2 fallback runs once the carrier path finds
+        // nothing — so the failure would show up as a machine filed under the
+        // wrong row of the stratified table as well as an empty one.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/throwcarrier"));
+        StateMachine hoist = named(r, "Hoist");
+
+        assertEquals(StateMachine.Encoding.POLYMORPHIC, hoist.encoding());
+        assertEquals(Set.of(CommitForm.POLY_CARRIER), hoist.commitForms(),
+                "the JDK carrier is still a carrier commit, not a mutation");
+        assertEquals(Set.of("Parked", "Raising", "Held"), stateIds(hoist));
+        assertEquals("Parked", hoist.initialState().orElse(null));
+
+        assertTrue(hasEventEdge(hoist, "Parked", "RAISE", "Raising"));
+        assertTrue(hasEventEdge(hoist, "Raising", "HOLD", "Held"));
+        assertTrue(hasResolved(hoist, "Held", "Parked"));
+        assertEquals(5, hoist.transitions().size(),
+                "every edge through an unread body survives");
+        assertEquals(0, hoist.unresolvedTransitionCount());
+
+        // Nothing in this hierarchy throws, so no suppression may be attributed to
+        // it. A count here would be a false claim wearing the diagnostic that
+        // exists to make F9 auditable.
+        assertTrue(r.diagnostics().stream()
+                        .noneMatch(d -> d.message().contains("cannot return normally")
+                                && d.message().contains("Hoist")),
+                "an unread body is never reported as a proven rejection");
+    }
+
     @Test
     void dhcpRejectionHelperDoesNotManufactureUnresolvedEdges() {
         // The fixture F9 was found on. `DhcpClientStateMachine` guards all eight
