@@ -2066,6 +2066,110 @@ class ExtractionIntegrationTest {
         }
     }
 
+    // ---- F19: the stateful driver (H out, no H in) --------------------------
+
+    /**
+     * The recall half. {@code SashDriver.step(Nudge)} is a transition function that
+     * never says so in its signature: the state lives in a field, so there is no
+     * hierarchy-typed parameter for the centralized recognizer, the method is not
+     * declared on the hierarchy so the distributed one skips it, and its dispatch is
+     * a {@code switch} STATEMENT whose arms return — a commit the switch's parent
+     * cannot show, so {@code DispatchCommitDetector} finds nothing either. The whole
+     * hierarchy was reported as "no transition producer found".
+     */
+    @Test
+    void aStatefulDriverDispatchingWithASwitchStatementIsAMachine() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/statefuldriver"));
+        StateMachine m = named(r, "Sash");
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of("Seated", "Parted", "Raised"), stateIds(m));
+        assertEquals(Set.of(CommitForm.VALUE_RETURN), m.commitForms());
+
+        assertTrue(hasEventEdge(m, "Seated", "LIFT", "Parted"), "Seated --LIFT--> Parted");
+        assertTrue(hasEventEdge(m, "Parted", "LIFT", "Raised"), "Parted --LIFT--> Raised");
+        assertTrue(hasEventEdge(m, "Raised", "JAR", "Seated"), "Raised --JAR--> Seated");
+        assertTrue(hasResolved(m, "Seated", "Seated"), "the default arm folds back");
+        assertTrue(hasResolved(m, "Parted", "Seated"));
+        assertTrue(hasResolved(m, "Raised", "Parted"));
+
+        assertEquals(6, m.transitions().size());
+        assertEquals(0, m.unresolvedTransitionCount());
+        assertEquals("Seated", m.initialState().orElse(null));
+        // Σ is still enumerated from the event parameter of a host with no state
+        // parameter — the labels above are that enumeration, not method names.
+        assertTrue(m.alphabet().containsAll(Set.of("LIFT", "DROP", "JAR")));
+    }
+
+    /**
+     * The soundness half, and the one that does not announce itself: this machine
+     * was never lost, it was reported wrong. F3 keeps an inter-procedural helper
+     * from also being walked standalone by collecting the callees of every
+     * recognised transition function — and the driver was not one, so its per-state
+     * helpers were not recognised as its helpers. Each was then extracted on its own
+     * with no from-state, adding one fabricated unresolved edge per input symbol on
+     * top of the nine real ones: a complete, fully resolved relation published as
+     * 9/12, with three edges out of a source that is not a state.
+     */
+    @Test
+    void aStatefulDriversHelpersAreNotAlsoWalkedStandalone() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/statefuldriver"));
+        StateMachine m = named(r, "Pump");
+
+        assertEquals(Set.of("Idle", "Priming", "Running"), stateIds(m));
+        assertEquals(9, m.transitions().size(), "3 states x 3 inputs, and nothing else");
+        assertEquals(0, m.unresolvedTransitionCount());
+        for (Transition t : m.transitions()) {
+            assertTrue(stateIds(m).contains(t.from()),
+                    "edge sourced at " + t.from() + ", which is not a state of this machine");
+        }
+        assertEquals("Idle", m.initialState().orElse(null));
+    }
+
+    /**
+     * The negative control for the <em>routing</em> half. Recognising the host is
+     * only half a change — something then has to walk it, and the two available
+     * walks disagree about how much of it to read. A host handed the state computes
+     * a successor end to end, so its whole body is the transition relation; a host
+     * that only returns H read the state from a field, and its body is plumbing
+     * around a dispatch. Walking this one whole reports the trailing
+     * {@code return state;} as a successor with no source AND relabels the machine
+     * VALUE_RETURN, putting an edge under the wrong row of the stratified table.
+     */
+    @Test
+    void aFieldMutatingStatefulDriverIsWalkedAtItsDispatchNotWhole() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/statefuldriver"));
+        StateMachine m = named(r, "Hatch");
+
+        assertEquals(Set.of(CommitForm.FIELD_MUTATION), m.commitForms(),
+                "the detector established the commit; the walk must not overwrite it");
+        assertEquals(Set.of("Dogged", "Cracked", "Gaping"), stateIds(m));
+        assertEquals(6, m.transitions().size());
+        assertEquals(0, m.unresolvedTransitionCount());
+        assertTrue(hasResolved(m, "Dogged", "Cracked"));
+        assertTrue(hasResolved(m, "Cracked", "Gaping"));
+        assertTrue(hasResolved(m, "Gaping", "Dogged"));
+    }
+
+    /**
+     * The same control at corpus scale, and the reason the routing rule is not a
+     * special case for one fixture: {@code examples/barefield} and
+     * {@code examples/http2-stream-gemini} are both stateful drivers this recognizer
+     * now sees for the first time, and both must be unchanged by that.
+     */
+    @Test
+    void existingFieldMutationMachinesAreUnaffectedByTheWidenedRecognizer() {
+        StateMachine latch = single(new Analyzer().analyze(modelOf("examples/barefield")));
+        assertEquals(Set.of(CommitForm.FIELD_MUTATION), latch.commitForms());
+        assertEquals(4, latch.transitions().size());
+        assertEquals(0, latch.unresolvedTransitionCount());
+
+        StateMachine http2 = single(new Analyzer().analyze(modelOf("examples/http2-stream-gemini")));
+        assertEquals(Set.of(CommitForm.FIELD_MUTATION), http2.commitForms());
+        assertEquals(20, http2.transitions().size());
+        assertEquals(0, http2.unresolvedTransitionCount());
+    }
+
     /**
      * The withholding is only lifted by an ABSTENTION, so an accepted parent keeps
      * its nested sealed hierarchies as composite states — the existing behaviour,

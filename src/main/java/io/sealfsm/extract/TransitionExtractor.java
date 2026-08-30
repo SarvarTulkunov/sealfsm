@@ -294,12 +294,33 @@ public final class TransitionExtractor {
         for (CtMethod<?> m : distributed) {
             if (!helperSignatures.contains(m.getSignature())) extractDistributed(m, out);
         }
+        List<DispatchCommitDetector.Producer> producers = DispatchCommitDetector.find(root, model);
+        Set<String> producerHosts = new HashSet<>();
+        for (DispatchCommitDetector.Producer p : producers) producerHosts.add(methodKey(p.host()));
+
         Set<String> walkedMethods = new HashSet<>();
         for (CtMethod<?> m : centralized) {
-            if (!helperSignatures.contains(m.getSignature())) {
-                extractCentralized(m, out);
-                walkedMethods.add(methodKey(m));
+            if (helperSignatures.contains(m.getSignature())) continue;
+            // Which walk owns this host is decided by whether the state is an
+            // ARGUMENT of it. A method handed the state computes a successor from it
+            // end to end, so its whole body is the transition relation — that is what
+            // makes ShutterLogic's `return current;` AFTER its chain a real self-loop
+            // on the states no link claimed, rather than a stray statement.
+            //
+            // A host that only RETURNS the hierarchy type read the state out of a
+            // field, and its body is a driver method containing a dispatch: the
+            // `return this.state;` below the switch is a read-back of what the commit
+            // already installed, and walking it would emit a successor with no
+            // attributable source. Where such a host has a recognised producer, that
+            // producer walks exactly the discrimination and knows the real commit
+            // form, so it owns the body; walking it here as well would relabel a
+            // FIELD_MUTATION machine VALUE_RETURN on the commit axis.
+            if (producerHosts.contains(methodKey(m))
+                    && !StateMachineClassifier.takesHierarchyParameter(m, hierarchyQualifiedNames)) {
+                continue;
             }
+            extractCentralized(m, out);
+            walkedMethods.add(methodKey(m));
         }
         for (CtElement callable : functional) {
             extractFunctional(callable, out);
@@ -309,7 +330,7 @@ public final class TransitionExtractor {
         // the signature-based recognizer already walked are skipped so one body is
         // never walked twice (harmless for the edge set, which is a Set, but it
         // would double-count the inter-procedural fold statistic).
-        for (DispatchCommitDetector.Producer p : DispatchCommitDetector.find(root, model)) {
+        for (DispatchCommitDetector.Producer p : producers) {
             if (walkedMethods.contains(methodKey(p.host()))
                     || helperSignatures.contains(p.host().getSignature())) {
                 commitForms.add(p.commit());

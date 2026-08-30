@@ -236,12 +236,49 @@ public final class StateMachineClassifier {
     }
 
     /**
-     * Methods anywhere in the model that both take a hierarchy-typed parameter
-     * and return a hierarchy type: the {@code T transition(T current, Event e)}
-     * shape idiomatic to modern sealed-type FSMs.
+     * Methods anywhere in the model, outside the hierarchy, that <em>produce</em> a
+     * hierarchy value and <em>examine</em> one: the centralized transition
+     * function, in either of the two ways the state reaches it.
+     *
+     * <p>The recognizer used to require a hierarchy-typed <b>parameter</b>, which
+     * admits {@code T transition(T current, Event e)} and nothing else. That is one
+     * idiom, not the notion. A stateful driver spells the same function
+     *
+     * <pre>{@code
+     *   final class Driver {
+     *       private H state = new Initial();
+     *       H step(Event e) { ... discriminates this.state ... }   // H out, no H in
+     *   }
+     * }</pre>
+     *
+     * and it never matched: not distributed (not declared on the hierarchy), not
+     * centralized (no H-typed parameter). Whether it was recovered at all then
+     * depended on {@link DispatchCommitDetector} incidentally finding a commit at
+     * the discrimination — so {@code return switch (state)} survived, while a
+     * {@code switch} <em>statement</em> whose arms return, the ordinary pre-arrow
+     * spelling of the same table, was lost outright along with its whole hierarchy.
+     *
+     * <p>The parameter is therefore no longer required. What replaces it is the
+     * property the parameter was standing in for — that the method takes the state
+     * as an input — asked directly:
+     * {@link DispatchCommitDetector#discriminatesState}. The two disjuncts are the
+     * two ways a method can be handed the state: as an argument, or by reading a
+     * field it then discriminates.
+     *
+     * <p><b>Why the return type is not enough on its own.</b> "Returns H" is the
+     * commit test for a value-returning host, and it is already applied here — but
+     * for this recognizer the commit test alone degenerates into the whole
+     * predicate, and a codomain says nothing about whether the state was consulted.
+     * Dropping the parameter requirement with nothing in its place admits every
+     * factory ({@code static Bolt factoryOpen() { return new Open(); }}) and every
+     * accessor ({@code Relay state() { return state; }}) in the model, each of which
+     * the extractor would then walk as a standalone dispatch and report as an edge
+     * out of an undetermined source. Requiring the discrimination is what keeps the
+     * widening to methods that are transition functions.
      */
     public static List<CtMethod<?>> findCentralizedTransitionMethods(CtType<?> root, CtModel model) {
         Set<String> hierarchy = hierarchyQualifiedNames(root);
+        String rootQn = root.getQualifiedName();
         Set<String> hierarchyTypeNames = new LinkedHashSet<>();
         for (CtType<?> t : hierarchyTypes(root)) hierarchyTypeNames.add(t.getQualifiedName());
 
@@ -260,14 +297,27 @@ public final class StateMachineClassifier {
             // a centralized function lives outside the state classes themselves.
             boolean declaredInsideHierarchy =
                     declaring != null && hierarchyTypeNames.contains(declaring.getQualifiedName());
-            boolean takesHierarchyParam = method.getParameters().stream()
-                    .map(CtParameter::getType)
-                    .anyMatch(p -> p != null && hierarchy.contains(p.getQualifiedName()));
-            if (takesHierarchyParam && !declaredInsideHierarchy) {
+            if (declaredInsideHierarchy) continue;
+            if (takesHierarchyParameter(method, hierarchy)
+                    || DispatchCommitDetector.discriminatesState(method, hierarchy, rootQn)) {
                 out.add(method);
             }
         }
         return out;
+    }
+
+    /**
+     * Is the state an <em>argument</em> of this method? Beyond recognition this is
+     * a statement about scope, and the extractor reads it as one: a method handed
+     * the state computes a successor from it end to end, so its whole body belongs
+     * to the transition relation. A host that only returns H reads the state from a
+     * field it also writes and logs and null-checks, so only its discrimination
+     * does — which is why the two are walked differently.
+     */
+    public static boolean takesHierarchyParameter(CtMethod<?> method, Set<String> hierarchy) {
+        return method.getParameters().stream()
+                .map(CtParameter::getType)
+                .anyMatch(p -> p != null && hierarchy.contains(p.getQualifiedName()));
     }
 
     /**

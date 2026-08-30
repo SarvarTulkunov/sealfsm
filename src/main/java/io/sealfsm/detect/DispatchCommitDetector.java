@@ -463,6 +463,52 @@ public final class DispatchCommitDetector {
     }
 
     /**
+     * Does this method <em>discriminate</em> an H value anywhere in its own body —
+     * by a {@code switch} over H, or by a chain of {@code instanceof} tests over
+     * one H-typed variable?
+     *
+     * <p>This is the question {@code StateMachineClassifier} asks in place of "does
+     * it take an H-typed parameter". A parameter was only ever a proxy for "the
+     * state is an input to this method", and it is the wrong proxy for a stateful
+     * driver: {@code H step(Event e)} reading {@code this.state} has H out and no H
+     * in, so the signature recognizer never looked at it. What actually separates a
+     * transition function from a factory or an accessor that happen to share its
+     * return type is that a transition function <em>examines</em> the state.
+     *
+     * <p>Deliberately weaker than {@link #find}: no commit is required here. The
+     * commit is checked by the caller's own codomain test — a host admitted on this
+     * predicate must return H, which for a value-returning method IS
+     * {@link CommitForm#VALUE_RETURN}. This predicate answers only the other half,
+     * "is the state discriminated", and it is the same notion {@link #find} uses
+     * ({@link #dispatchesOnHierarchy}, {@link #chainOf}) rather than a second copy
+     * of it: a recognizer and an extractor that each decided for themselves what a
+     * discrimination is would eventually disagree.
+     *
+     * <p>A discrimination inside a nested lambda or anonymous class does not count.
+     * Those bodies belong to
+     * {@link StateMachineClassifier#findFunctionalTransitionCallables} (F7), which
+     * walks them with a selector and an event label of their own — the same
+     * one-body-one-walker rule {@link #addChainProducer} already applies.
+     */
+    public static boolean discriminatesState(CtMethod<?> host, Set<String> hierarchy,
+                                             String rootQn) {
+        if (host == null || host.getBody() == null) return false;
+        CtBlock<?> body = host.getBody();
+        for (CtSwitchExpression<?, ?> sw : body.getElements(new TypeFilter<>(CtSwitchExpression.class))) {
+            if (dispatchesOnHierarchy(sw, hierarchy) && !insideFunctionalCallable(sw)) return true;
+        }
+        for (CtSwitch<?> sw : body.getElements(new TypeFilter<>(CtSwitch.class))) {
+            if (dispatchesOnHierarchy(sw, hierarchy) && !insideFunctionalCallable(sw)) return true;
+        }
+        for (CtIf ctIf : body.getElements(new TypeFilter<>(CtIf.class))) {
+            if (insideFunctionalCallable(ctIf)) continue;
+            if (isChainContinuation(ctIf, hierarchy, rootQn)) continue;
+            if (chainOf(ctIf, hierarchy, rootQn) != null) return true;
+        }
+        return false;
+    }
+
+    /**
      * Is the switch selector's compile-time type inside H? The selector may be a
      * parameter, a local, {@code this.field} or a bare field read; Spoon resolves
      * all of them to the same {@link CtTypeReference}, so no special-casing per

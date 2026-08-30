@@ -4,7 +4,14 @@ package chaindispatch;
  * The dominant pre-pattern-matching dispatch shape: a chain of {@code instanceof}
  * tests over a <em>field</em>, committing by writing that field back.
  *
- * <p>Nothing here is a signature the tool could key on. {@code accept} takes no
+ * <p>F19 later widened the signature recognizer to ask for a discrimination rather
+ * than for a parameter, so this method IS now recognised there as well. That changes
+ * nothing about its edges, and why it does not is the point of
+ * {@code examples/statefuldriver/Hatch}: a host that only RETURNS the hierarchy type
+ * is walked at its discrimination, never whole, so the {@code return state;} below
+ * stays plumbing and the commit axis keeps saying FIELD_MUTATION.
+ *
+ * <p>Nothing here was a signature the tool could key on. {@code accept} takes no
  * hierarchy-typed parameter, so the signature-based centralized recognizer never
  * looked at it; it holds no {@code switch}, so the switch recognizer found
  * nothing; and it is not declared on the hierarchy, so the distributed recognizer

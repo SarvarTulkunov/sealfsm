@@ -3,8 +3,13 @@ package examples.barefield;
 /**
  * Centralized dispatch committed to a BARE field: {@code state = switch (state)
  * { ... }; return state;}. No {@code this.} qualifier anywhere, and the method
- * takes no hierarchy-typed parameter, so the signature-based recognizer
- * (hierarchy-in / hierarchy-out) sees nothing here.
+ * takes no hierarchy-typed parameter. That once put it outside the signature-based
+ * recognizer entirely (hierarchy-in / hierarchy-out); since F19 that recognizer asks
+ * whether the state is DISCRIMINATED rather than whether it is a parameter, so this
+ * driver is recognised — and the parameter's remaining job is to say how much of the
+ * body to walk. It has none, so the discrimination's own producer walks it, which is
+ * what keeps the trailing {@code return state;} below from being read as a successor
+ * and what keeps this machine FIELD_MUTATION rather than VALUE_RETURN.
  *
  * <p>{@code Fired} is terminal by construction: its arm rejects every signal, so
  * it has zero outbound edges. The {@code default -> throw} arms are likewise
