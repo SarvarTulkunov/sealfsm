@@ -42,6 +42,7 @@ import spoon.reflect.cu.SourcePosition;
 import spoon.reflect.declaration.CtElement;
 import spoon.reflect.declaration.CtEnum;
 import spoon.reflect.declaration.CtEnumValue;
+import spoon.reflect.declaration.CtExecutable;
 import spoon.reflect.declaration.CtField;
 import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtParameter;
@@ -59,6 +60,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -142,6 +144,19 @@ public final class TransitionExtractor {
     // arms they occupy carry no transition, so no edge is emitted; the count is
     // reported as a diagnostic rather than letting them vanish unremarked.
     private int nonReturningCalls = 0;
+
+    // F18: the `return` statements the inter-procedural fold currently in progress
+    // has ACCOUNTED FOR — either walked through to a producer, or proven unable to
+    // execute in the caller's context. Non-null only while a callee body is being
+    // summarised, and identity-keyed on purpose: Spoon gives CtElement deep
+    // structural equality, so two arms both spelling `return new Armed();` compare
+    // equal and one would silently stand in for the other.
+    private Set<CtReturn<?>> accountedReturns = null;
+
+    // F18: returns of an in-model helper that the walk could neither reach nor
+    // prove dead. Each one is emitted as an unresolved transition; the count is
+    // reported so a partly-read body reads as the recall gap it is.
+    private int unreadableReturns = 0;
 
     // F13: reads whose "is this local reassigned?" answer could not be decided on
     // variable identity because Spoon could not bind a same-named write to any
@@ -322,6 +337,11 @@ public final class TransitionExtractor {
             diagnostics.add(interProcResolvedEdges + " transition target(s) resolved via bounded "
                     + "inter-procedural summaries (depth ≤ " + MAX_INTERPROC_DEPTH
                     + "); precision-sensitive — audit separately");
+        }
+        if (unreadableReturns > 0) {
+            diagnostics.add(unreadableReturns + " return(s) of an in-model helper could not be "
+                    + "reached by the walk (a construct outside its modelled subset encloses "
+                    + "them); each is recorded as an unresolved transition, never dropped");
         }
         if (nonReturningCalls > 0) {
             diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
@@ -1365,25 +1385,107 @@ public final class TransitionExtractor {
             nonReturningCalls++;
             return true; // handled: nothing to emit
         }
-        List<GuardedExpr> returns = collectReturns(callee.getBody(), null);
-        if (returns.isEmpty()) return false; // nothing summarisable (e.g. returns hidden in a switch)
+        // F18 — the summary is produced by the SAME walker that reads a host
+        // body. `collectReturns` was a second, strictly weaker traversal of its
+        // own: it descended blocks and `if`s and nothing else, so a helper whose
+        // returns sat inside a `switch`, a loop or a `try` was not summarisable at
+        // all — and `private H fromIdle(E e) { switch (e) { case START: return
+        // ...; } }` is the ordinary way a large per-event table is factored, not
+        // an exotic shape. Two walkers over one construct is the arrangement this
+        // codebase already refuses elsewhere (one `chainOf`, one commit
+        // predicate); reusing `walk` also hands a folded body every rule the
+        // walker already knows — event labelling from case labels, F12 arm
+        // exclusion, F10's synthetic yields, F6's exceptional flow — instead of
+        // re-deriving them here and drifting.
+        List<CtReturn<?>> owned = ownedReturns(callee);
+        if (owned.isEmpty()) return false; // no return of its own: nothing to summarise
 
+        Set<CtReturn<?>> enclosing = accountedReturns;
+        Set<CtReturn<?>> accounted = Collections.newSetFromMap(new IdentityHashMap<>());
+        accountedReturns = accounted;
         boolean top = interProcStack.isEmpty();
         int resolvedBefore = top ? countResolved(out) : 0;
         interProcStack.push(sig);
         try {
-            for (GuardedExpr ge : returns) {
-                // Resolve each callee return in the *caller's* from-context, so a
-                // returned root-typed value ("the current state") becomes a
-                // self-loop to the caller's from-state — exactly as in a direct
-                // transition method. A returned call recurses under the budget.
-                handleValue(ge.expr(), from, event, merge(guard, ge.guard()), out);
-            }
+            // Walked in the *caller's* from-context, so a returned root-typed value
+            // ("the current state") becomes a self-loop to the caller's from-state
+            // exactly as in a direct transition method, and a returned call
+            // recurses under the depth budget.
+            walk(callee.getBody(), from, event, guard, out);
         } finally {
             interProcStack.pop();
+            accountedReturns = enclosing;
             if (top) interProcResolvedEdges += Math.max(0, countResolved(out) - resolvedBefore);
         }
+
+        // F18, and the half that makes this a soundness fix rather than only a
+        // recall one: completeness is ASKED, not assumed. The old test was
+        // `returns.isEmpty()`, which detects a summary that failed ENTIRELY and
+        // says nothing about one that reached some returns and missed others. Such
+        // a partial summary was folded and published as fact: one return inside a
+        // loop and one after it — `for (...) { if (bad) return new Halted(); }
+        // return new Running();` — reported a resolved self-loop and DROPPED the
+        // Halted target, a real transition gone with no unresolved marker behind a
+        // clean-looking n/n. Every return the walk neither reached nor proved dead
+        // is now recorded as exactly what it is: a successor that exists and could
+        // not be read.
+        for (CtReturn<?> r : owned) {
+            if (accounted.contains(r)) continue;
+            unreadableReturns++;
+            out.add(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
+                    truncate(safeText(r))));
+        }
         return true;
+    }
+
+    /**
+     * The {@code return} statements that belong to {@code callee} itself, and so
+     * are the successors a call to it can yield.
+     *
+     * <p>A {@code return} inside a lambda or a local/anonymous class is that
+     * body's exit, not this method's: it is neither a successor of this call nor
+     * something {@link #walk} is expected to reach, and counting it would report a
+     * gap on every helper that uses a stream. (F9's own scan is deliberately
+     * unfiltered for the opposite reason — there, counting a lambda's return makes
+     * it DECLINE to suppress, which is the safe direction.) When the parent chain
+     * cannot be read the return is kept, so an unwalked one is reported rather
+     * than assumed away.
+     */
+    private static List<CtReturn<?>> ownedReturns(CtMethod<?> callee) {
+        List<CtReturn<?>> owned = new ArrayList<>();
+        for (CtReturn<?> r : callee.getBody().getElements(new TypeFilter<>(CtReturn.class))) {
+            if (r.getReturnedExpression() == null) continue; // `return;` yields no successor
+            try {
+                if (r.getParent(CtExecutable.class) != callee) continue;
+            } catch (Throwable ignored) {
+                // unreadable parent chain: fall through and keep it
+            }
+            owned.add(r);
+        }
+        return owned;
+    }
+
+    /**
+     * Record that the fold in progress has reached this return (F18). Called from
+     * {@link #walk} before the value is descended, because descending may start a
+     * nested fold that swaps the frame out.
+     */
+    private void noteAccounted(CtReturn<?> ret) {
+        if (accountedReturns != null) accountedReturns.add(ret);
+    }
+
+    /**
+     * Record every return inside a subtree the walk deliberately SKIPPED because
+     * it cannot execute in this context — a switch arm for a state the selector
+     * provably is not, a chain link testing a type already excluded (F18).
+     *
+     * <p>Not reaching such a return is a proof, not a gap. Without this the
+     * completeness test cannot tell "we did not read it" from "it cannot run", and
+     * every contextually-folded helper would grow a spurious unresolved edge.
+     */
+    private void markUnreachable(CtElement subtree) {
+        if (accountedReturns == null || subtree == null) return;
+        accountedReturns.addAll(subtree.getElements(new TypeFilter<>(CtReturn.class)));
     }
 
     /**
@@ -1450,32 +1552,6 @@ public final class TransitionExtractor {
         }
     }
 
-    /** Returned / yielded expressions of a body, each with its accumulated guard. */
-    private record GuardedExpr(CtExpression<?> expr, String guard) {}
-
-    private List<GuardedExpr> collectReturns(CtElement node, String guard) {
-        List<GuardedExpr> out = new ArrayList<>();
-        collectReturnsInto(node, guard, out);
-        return out;
-    }
-
-    private void collectReturnsInto(CtElement node, String guard, List<GuardedExpr> out) {
-        if (node == null) return;
-        if (node instanceof CtBlock<?> b) {
-            for (CtStatement s : b.getStatements()) collectReturnsInto(s, guard, out);
-        } else if (node instanceof CtIf ctIf) {
-            String c = safeText(ctIf.getCondition());
-            collectReturnsInto(ctIf.getThenStatement(), merge(guard, c), out);
-            collectReturnsInto(ctIf.getElseStatement(), merge(guard, negate(c)), out);
-        } else if (node instanceof CtReturn<?> r && r.getReturnedExpression() != null) {
-            out.add(new GuardedExpr(r.getReturnedExpression(), guard));
-        } else if (node instanceof CtYieldStatement ys && ys.getExpression() != null) {
-            out.add(new GuardedExpr(ys.getExpression(), guard));
-        }
-        // A helper whose returns hide inside a switch / loop / try is not
-        // summarised here; resolveInterprocedural then reports the call unresolved.
-    }
-
     private static CtMethod<?> calleeMethod(CtInvocation<?> inv) {
         try {
             CtExecutableReference<?> exe = inv.getExecutable();
@@ -1526,6 +1602,10 @@ public final class TransitionExtractor {
         } else if (node instanceof CtSwitch<?> sw) {
             walkSwitch(sw, from, event, guard, out);
         } else if (node instanceof CtReturn<?> ret) {
+            // F18: tell the enclosing inter-procedural fold, if any, that this
+            // return was reached. Recorded BEFORE the descent, because descending
+            // may start a nested fold that swaps the frame out.
+            noteAccounted(ret);
             handleValue(ret.getReturnedExpression(), from, event, guard, out);
         } else if (node instanceof CtYieldStatement ys) {
             handleValue(ys.getExpression(), from, event, guard, out);
@@ -1744,7 +1824,13 @@ public final class TransitionExtractor {
         if (chain == null) return;
         for (DispatchCommitDetector.ChainLink link : chain.links()) {
             String from = stateId(link.type());
-            if (!candidates.contains(from)) continue;   // unreachable test, no edge
+            if (!candidates.contains(from)) {
+                // Unreachable test: the selector provably is not this type here, so
+                // a return inside the branch is proven dead rather than unread —
+                // reporting it as a gap would invent one (F18).
+                markUnreachable(link.branch());
+                continue;
+            }
             // The arm matched this state, so anything it fails to produce is an
             // absence the analysis observed rather than one it missed.
             dispatchedStates.add(from);
@@ -2183,10 +2269,42 @@ public final class TransitionExtractor {
         // automaton. This is the same reasoning walkBlock already applies to an
         // `if` with no `else`, carried across sibling arms.
         Map<String, List<String>> guardsByLabel = new LinkedHashMap<>();
+        // F18 — a state switch inside a body walked with the from-state ALREADY
+        // known re-discriminates a value whose type the caller has proven. Folding
+        // `escalate(current)` from `case Idle i ->` must not reopen that question:
+        // the arms for other states cannot run here, and a `default` arm covers
+        // only what is left over. Without this, folding any state-switching helper
+        // emits a second edge sourced at `<unknown>` — an origin invented out of a
+        // context the walk already had. `remaining` stays null, and nothing is
+        // filtered, whenever the from-state is not yet known, which is every
+        // top-level dispatch: the host walk is untouched.
+        Set<String> remaining = overState && from != null
+                ? new LinkedHashSet<>(candidateStates(from))
+                : null;
         for (CtCase<?> c : sw.getCases()) {
             String caseFrom = from;
+            String ownGuard = caseGuard(c);
             if (overState) {
                 caseFrom = caseFromState(c);
+                if (remaining != null) {
+                    if (caseFrom == null) {
+                        // An unlabelled `default` fires for the states no earlier arm
+                        // claimed — for none of them once they all have.
+                        if (remaining.isEmpty()) {
+                            markUnreachable(c);
+                            continue;
+                        }
+                        caseFrom = remaining.iterator().next();
+                    } else if (!remaining.contains(caseFrom)) {
+                        markUnreachable(c);
+                        continue;
+                    }
+                    // Only an UNGUARDED arm consumes its state: a guarded one may
+                    // not fire, so the state stays live for the arms below it. Same
+                    // reasoning `chainResidual` applies to a link carrying an extra
+                    // condition.
+                    if (ownGuard == null) remaining.remove(caseFrom);
+                }
                 if (caseFrom == null) {
                     diagnostics.add("could not determine source state for a switch case: "
                             + truncate(safeText(c)));
@@ -2214,7 +2332,6 @@ public final class TransitionExtractor {
             // disjoint, and negating those would bury every edge under a pile of
             // redundant `!(event instanceof X)` clauses.
             List<String> labels = overState ? Collections.singletonList(caseFrom) : caseEvents;
-            String ownGuard = caseGuard(c);
             String caseGuard = merge(merge(guard, priorExclusion(labels, guardsByLabel)), ownGuard);
             // Only a GUARDED arm constrains its successors. An unguarded arm
             // dominates every later arm with the same label, which the compiler

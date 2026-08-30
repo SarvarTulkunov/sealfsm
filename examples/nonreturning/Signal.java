@@ -4,6 +4,7 @@ public enum Signal {
     ARM,
     FIRE,
     ESCALATE,
+    DEFER,
     HOLD,
     RESET
 }

@@ -880,15 +880,85 @@ class ExtractionIntegrationTest {
                 "identity was decidable throughout; nothing may claim otherwise");
     }
 
+    // ---- F18: the summarisability boundary of the inter-procedural fold -----
+
+    @Test
+    void interproceduralFoldReadsReturnsHiddenInEveryModelledConstruct() {
+        // F18. The fold used to run a second, strictly weaker walker of its own
+        // (`collectReturns`) that descended blocks and `if`s and nothing else, so
+        // a helper whose returns sat inside a `switch`, a loop or a `try` was not
+        // summarisable — and `private H fromIdle(E e) { switch (e) { case START:
+        // return ...; } }` is the ordinary way a per-event table is factored.
+        //
+        // The encoding is held fixed across the four helpers and only the
+        // construct enclosing the return varies, so anything that differs between
+        // them is the walker's reach and nothing else.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/hiddenreturns"));
+        StateMachine m = single(r);
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of(CommitForm.VALUE_RETURN), m.commitForms());
+        assertEquals(Set.of("Idle", "Priming", "Running", "Halted"), stateIds(m));
+        assertEquals("Idle", m.initialState().orElse(null));
+
+        // switch STATEMENT: three returns, three edges, each labelled with the Σ
+        // symbol its arm matched. The labels are the proof that the fold reuses
+        // the real walker — a bespoke return-collector has no notion of a case
+        // label and would have had to invent one.
+        assertTrue(hasEventEdge(m, "Idle", "START", "Priming"));
+        assertTrue(hasEventEdge(m, "Idle", "STOP", "Halted"));
+        assertTrue(hasResolved(m, "Idle", "Idle"), "the default arm is a self-loop");
+
+        // try / catch: the catch is the classic error transition and must arrive
+        // under the exceptional guard, not as an unconditional edge.
+        assertTrue(hasResolved(m, "Priming", "Running"));
+        assertTrue(hasResolved(m, "Priming", "Priming"));
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> t.isResolved() && "Priming".equals(t.from())
+                                && "Halted".equals(t.to())
+                                && t.guard() != null && t.guard().contains("exception")),
+                "the catch-block producer is reached, and under the exceptional guard");
+
+        // THE SOUNDNESS CASE. `fromRunning` has one return inside a loop and one
+        // after it. The old test for summarisability was `returns.isEmpty()`,
+        // which only detects a summary that failed ENTIRELY; this one succeeded
+        // partially, so the trailing `new Running()` was folded and published as a
+        // resolved self-loop while the `Halted` target was DROPPED — a real
+        // transition gone with no unresolved marker, behind a clean-looking n/n.
+        // That is the one outcome the record-everything invariant forbids.
+        assertTrue(hasResolved(m, "Running", "Running"));
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> t.isResolved() && "Running".equals(t.from())
+                                && "Halted".equals(t.to())
+                                && t.guard() != null && t.guard().contains("FAULT")),
+                "a return inside a loop is a real successor, not one to be dropped");
+
+        // NEGATIVE CONTROL and standing probe: `fromHalted` returns from inside a
+        // `synchronized` block, which the walker does not descend. It must be
+        // recorded as unresolved, and reported. The test is what the walk ACTUALLY
+        // reached, not whether the body matched a list of constructs someone
+        // remembered to extend; teach the walker about `synchronized` and this
+        // fails loudly rather than quietly ceasing to test anything.
+        assertEquals(1, m.unresolvedTransitionCount());
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "Halted".equals(t.from()) && !t.isResolved()),
+                "a return the walk cannot reach stays an unresolved edge");
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("could not be reached by the walk")),
+                "an unread return is reported, not silently folded away");
+
+        assertEquals(9, m.transitions().size());
+    }
+
     // ---- F9: a helper that cannot return normally is not a producer ---------
 
     @Test
-    void nonReturningHelperYieldsNoEdgeButAHiddenReturnStaysUnresolved() {
-        // F9 and its own negative control in one hierarchy. Both helpers return
-        // the hierarchy type and both defeat the shallow `collectReturns` walk,
-        // which does not descend into a switch — so the two are indistinguishable
-        // to the summariser and can only be separated by whether a `return` exists
-        // at all.
+    void nonReturningHelperYieldsNoEdgeButAnUnreadableReturnStaysUnresolved() {
+        // F9 and its negative control in one hierarchy. Every producer returns the
+        // hierarchy type and every one of them yields an EMPTY return-summary to a
+        // walker that stops at the first construct it does not model, so they are
+        // indistinguishable by the summary alone and only the REASON the summary
+        // is empty separates them.
         //
         // `reject` has none. JLS §8.4.7 already forbids a non-void method whose
         // body can complete normally, so the compiler has PROVEN it always throws
@@ -909,20 +979,37 @@ class ExtractionIntegrationTest {
         // unresolved one. Without F9 these were three `-> ?` edges, making the
         // spelling `default -> reject(s, e)` report a different relation from
         // `default -> throw reject(s, e)` for the same machine.
-        assertEquals(5, m.transitions().size(),
+        assertEquals(6, m.transitions().size(),
                 "a helper that cannot return normally is not a transition producer");
 
-        // NEGATIVE CONTROL, and the whole risk of this rule: `escalate` DOES
-        // return a state, but only from inside a switch the summariser cannot
-        // read. `collectReturns` comes back empty for it exactly as it does for
-        // `reject`, so a rule keyed on that emptiness would drop a real target.
-        // It must stay UNRESOLVED — recorded, never guessed, never dropped.
-        assertEquals(2, m.unresolvedTransitionCount(),
-                "a return hidden in a switch is unresolved, not absent");
+        // F18 — `escalate` returns from inside a `switch`. That used to be the
+        // negative control (an unreadable target) and is now the positive case:
+        // the fold runs the ordinary walker over a callee body, so the arm
+        // resolves. It is ALSO the context-sensitivity control. `escalate`
+        // re-switches on the state, and its `default:` arm cannot run at the only
+        // call site, which has already matched `Idle`. Fold it without that
+        // reasoning and a second edge appears sourced at `<unknown>` — an origin
+        // invented out of a context the walk was holding all along.
+        assertTrue(hasEventEdge(m, "Idle", "ESCALATE", "Fired"),
+                "a return inside a switch is readable and must be read");
         assertTrue(m.transitions().stream()
-                        .anyMatch(t -> "Idle".equals(t.from()) && "ESCALATE".equals(t.event())
+                        .noneMatch(t -> "<unknown>".equals(t.from())),
+                "the caller's from-state is known, so no folded edge may invent an origin");
+
+        // NEGATIVE CONTROL, and the whole risk of F9: `defer` DOES return a state,
+        // but from inside a `synchronized` block the walker does not descend. Its
+        // summary is empty exactly as `reject`'s is, so a rule keyed on that
+        // emptiness would drop a real target. It must stay UNRESOLVED — recorded,
+        // never guessed, never dropped.
+        assertEquals(2, m.unresolvedTransitionCount(),
+                "a return the walk cannot reach is unresolved, not absent");
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> "Idle".equals(t.from()) && "DEFER".equals(t.event())
                                 && !t.isResolved()),
-                "the hidden-return helper must remain an unresolved edge from Idle");
+                "the unreadable-return helper must remain an unresolved edge from Idle");
+        assertTrue(r.diagnostics().stream()
+                        .anyMatch(d -> d.message().contains("could not be reached by the walk")),
+                "a partly-read body is reported, so the gap is auditable against the source");
 
         // F11 — SECOND NEGATIVE CONTROL, and the wider hole of the two.
         // `Objects.requireNonNull(current)` is a JDK method, so Spoon hands back a
