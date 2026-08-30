@@ -2582,4 +2582,125 @@ class ExtractionIntegrationTest {
         assertTrue(traffic.transitions().stream().allMatch(t -> t.event() == null),
                 "the one answer the word list got right must not change");
     }
+
+    // ---- noClasspath type resolution ------------------------------------------
+    //
+    // Models are built with setNoClasspath(true), so a type Spoon cannot bind
+    // still reaches the analysis as a reference carrying a guessed qualified
+    // name. Every recognizer decides membership with
+    // hierarchy.contains(ref.getQualifiedName()) against a set built from
+    // RESOLVED declarations, so such a reference always answers "not in the
+    // hierarchy" — exactly what a genuinely foreign type answers. Nothing
+    // downstream could tell the two apart, so a result thinned by unreadable
+    // input was reported as a finding about the program.
+    //
+    // These three hold the fixture fixed and vary only WHAT THE ANALYSIS WAS
+    // ALLOWED TO READ, which is the condition itself rather than an imitation of
+    // it: no fixture can encode an unresolvable type, because every example is
+    // compiled by javac as part of being a fixture.
+
+    private CtModel modelOfFiles(String... paths) {
+        Launcher launcher = new Launcher();
+        for (String p : paths) launcher.addInputResource(p);
+        launcher.getEnvironment().setComplianceLevel(17);
+        launcher.getEnvironment().setNoClasspath(true);
+        launcher.getEnvironment().setCommentEnabled(false);
+        launcher.buildModel();
+        return launcher.getModel();
+    }
+
+    private boolean mentionsResolution(ExtractionResult r) {
+        return r.diagnostics().stream().anyMatch(d -> d.message().contains("did not resolve"));
+    }
+
+    @Test
+    void anUnresolvedPermittedSubtypeIsReportedRatherThanSilentlyUnderReported() {
+        ExtractionResult whole = new Analyzer().analyze(modelOf("examples/traffic"));
+        StateMachine full = single(whole);
+        assertEquals(3, full.allStates().size());
+        assertEquals(3, full.resolvedTransitionCount());
+        // Negative control: a hierarchy the analysis could read entirely says
+        // nothing about resolution. Without this the test would pass on a tool
+        // that simply warned about everything.
+        assertFalse(mentionsResolution(whole),
+                "a fully readable hierarchy must not report a resolution failure");
+
+        ExtractionResult partial = new Analyzer().analyze(modelOfFiles(
+                "examples/traffic/TrafficLight.java",
+                "examples/traffic/Red.java",
+                "examples/traffic/Green.java",
+                "examples/traffic/TrafficController.java"));
+        StateMachine thin = single(partial);
+
+        // The state itself survives: StateExtractor reads the permits clause, which
+        // is a set of references. What is lost is membership — Yellow is in no
+        // recognizer's set — so the edges mentioning it go with it.
+        assertEquals(3, thin.allStates().size(),
+                "the permits clause still enumerates the state by name");
+        assertTrue(thin.resolvedTransitionCount() < full.resolvedTransitionCount(),
+                "withholding a state's file must cost edges");
+
+        // The whole point: that loss must be attributable.
+        assertTrue(partial.diagnostics().stream().anyMatch(d ->
+                        d.severity() == ExtractionResult.Severity.WARN
+                                && d.message().contains("permitted subtype(s)")
+                                && d.message().contains("examples.traffic.Yellow")),
+                "the missing edges must be attributed to Yellow not resolving, or the "
+                        + "reader cannot tell an unreadable input from a finding");
+    }
+
+    @Test
+    void anUnresolvedPatternTypeIsNotBlamedOnTheSwitchArm() {
+        // A centralized dispatch whose state files are absent reported "could not
+        // determine source state for a switch case" once per arm and a 0/n score —
+        // blaming the switch-arm handling for what is an input problem. In a thesis
+        // reporting recall stratified by idiom that is a misattributed recall
+        // figure, not merely a confusing message.
+        ExtractionResult partial = new Analyzer().analyze(modelOfFiles(
+                "examples/door/Door.java", "examples/door/DoorMachine.java",
+                "examples/door/Event.java", "examples/door/Lock.java",
+                "examples/door/Push.java", "examples/door/Unlock.java"));
+        List<String> armFailures = partial.diagnostics().stream()
+                .map(ExtractionResult.Diagnostic::message)
+                .filter(msg -> msg.contains("could not determine source state"))
+                .toList();
+        assertFalse(armFailures.isEmpty(),
+                "the arms cannot name their state when the state files are absent");
+        assertTrue(armFailures.stream().allMatch(msg -> msg.contains("did not resolve")),
+                "an arm whose pattern type never resolved must be attributed to "
+                        + "resolution, not reported as an unrecognised arm: " + armFailures);
+
+        // Negative control: with every file present the identical switch produces
+        // the full relation and no such diagnostic, so the message above tracks
+        // resolution and not merely the presence of a pattern arm.
+        ExtractionResult wholeDoor = new Analyzer().analyze(modelOf("examples/door"));
+        assertEquals(5, single(wholeDoor).resolvedTransitionCount());
+        assertFalse(mentionsResolution(wholeDoor));
+    }
+
+    @Test
+    void aSynthesisedRecordMemberIsNotAResolutionFailure() {
+        // The narrowing that makes the diagnostic usable, and the one this change
+        // was measured into rather than assumed. Spoon synthesises a record's
+        // accessors, and the implicit `this` in a generated body carries a type
+        // reference built from the bare simple name with no package, so it never
+        // binds — one per record component. Counting those reported resolution
+        // failures on four fixtures whose sources are entirely present, and told
+        // three correctly-rejected event alphabets that their rejection might be a
+        // resolution failure. A diagnostic that cries wolf trains a reader to
+        // ignore the channel, which costs more than it can pay back.
+        //
+        // Every fixture here is record-heavy and completely readable, so each must
+        // be silent. isImplicit() is what separates them: source position does NOT
+        // — a type pattern's reference reports no valid position while being a real
+        // failure — so a regression to the position test fails here.
+        for (String fixture : List.of("examples/lcp_automation", "examples/cancellation",
+                "examples/ffmpeg", "examples/guardforms", "examples/retrystate",
+                "examples/http2-stream-claude")) {
+            ExtractionResult r = new Analyzer().analyze(modelOf(fixture));
+            assertFalse(mentionsResolution(r),
+                    fixture + " is fully readable, so no synthesised record member may "
+                            + "be reported as a type-resolution failure");
+        }
+    }
 }

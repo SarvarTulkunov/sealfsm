@@ -6,6 +6,7 @@ import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.detect.StateMachineClassifier.Classification;
 import io.sealfsm.detect.StateMachineClassifier.Rejection;
+import io.sealfsm.detect.TypeResolutionAudit;
 import io.sealfsm.extract.StateExtractor;
 import io.sealfsm.extract.TransitionExtractor;
 import io.sealfsm.model.CommitForm;
@@ -47,11 +48,22 @@ public final class Analyzer {
     public ExtractionResult analyze(CtModel model) {
         ExtractionResult result = new ExtractionResult();
 
+        // What the model could not resolve, gathered once. Models are built with
+        // setNoClasspath(true), so an unresolvable type still reaches the analysis
+        // as a reference with a guessed qualified name, and every membership test
+        // reads that as "not in the hierarchy" - the same answer a genuinely
+        // foreign type gives. Without this the two are indistinguishable in the
+        // output, and a result thinned by missing sources is reported as a
+        // finding about the program.
+        TypeResolutionAudit resolution = TypeResolutionAudit.of(model);
+
         List<CtType<?>> roots = detector.findSealedRoots(model);
         if (roots.isEmpty()) {
             result.info("model", "no sealed hierarchies found");
+            reportModelResolution(result, resolution);
             return result;
         }
+        reportModelResolution(result, resolution);
 
         // A worklist rather than a plain iteration over `roots`: a rejected root
         // may still CONTAIN a machine. findSealedRoots withholds a sealed
@@ -71,8 +83,10 @@ public final class Analyzer {
             if (!c.isStateMachine()) {
                 result.info(root.getQualifiedName(),
                         "skipped — " + c.reason() + reoffer(root, c, pending, claimed));
+                reportResolution(root, result, resolution, true);
                 continue;
             }
+            reportResolution(root, result, resolution, false);
 
             StateMachine machine =
                     new StateMachine(root.getSimpleName(), root.getQualifiedName(), c.encoding());
@@ -164,6 +178,97 @@ public final class Analyzer {
             result.addMachine(machine);
         }
         return result;
+    }
+
+    /**
+     * Model-level note that some type references did not resolve.
+     *
+     * <p>Deliberately INFO, and deliberately a count rather than a list. Run over
+     * a real project with {@code --src src/main/java}, every third-party and
+     * otherwise off-classpath type is unresolved and almost none of it matters; a
+     * WARN there would be noise that trains a reader to ignore the channel. The
+     * severity is raised only where a failure actually touches a hierarchy under
+     * consideration — see {@link #reportResolution}.
+     */
+    private static void reportModelResolution(ExtractionResult result, TypeResolutionAudit audit) {
+        if (audit.isEmpty()) return;
+        result.info("model",
+                audit.size() + " type reference(s) did not resolve under noClasspath "
+                        + audit.summary(8)
+                        + " — these read as 'not in the hierarchy' wherever they appear, so any "
+                        + "analysis of code mentioning them is incomplete. Harmless for types no "
+                        + "machine uses; pass the missing sources with --src if any belong to one");
+    }
+
+    /**
+     * Raise the resolution failures that touch <em>this</em> hierarchy, so a thin
+     * result can be attributed to unreadable input rather than read as a finding
+     * about the program.
+     *
+     * <p>Two failures are reported, and they differ in kind:
+     *
+     * <ul>
+     *   <li><b>A permitted subtype that did not resolve.</b> The severe one,
+     *       because it lands on the claim the tool makes <em>exactly</em>.
+     *       {@link StateExtractor} reads states from the permits references, so
+     *       the state is still enumerated by name — but its declaration was never
+     *       read, so a sealed or {@code enum} member's children are silently
+     *       absent, and since the membership set is built from resolved
+     *       declarations it is absent from that too, which costs every edge
+     *       mentioning it.</li>
+     *   <li><b>An unresolved type sharing a simple name with a member.</b> Weaker,
+     *       and explicitly hedged: it does not prove the reference IS that member.
+     *       It is reported because it is the only available evidence that a thin
+     *       result may be a resolution failure, and the name is consulted to pick
+     *       the TEXT of a diagnostic — never an edge, a state or a classification,
+     *       which is what keeps it clear of the rule that no analysis decision
+     *       keys on a name.</li>
+     * </ul>
+     *
+     * <p>Neither changes a verdict. Promoting an unresolved reference into the
+     * hierarchy on a name match would fabricate a resolved edge to a state the
+     * analysis never established — the one outcome the soundness invariant forbids
+     * outright — so membership still answers "no" and the failure is recorded
+     * instead. That is the same trade the tool already makes for an unresolved
+     * successor: record the gap, never guess past it.
+     */
+    private void reportResolution(CtType<?> root, ExtractionResult result,
+                                  TypeResolutionAudit audit, boolean rejected) {
+        String where = root.getQualifiedName();
+        Set<String> unresolvedStates = new TreeSet<>();
+        for (CtTypeReference<?> ref : SpoonCompat.unresolvedPermittedTypes(root)) {
+            unresolvedStates.add(SpoonCompat.resolutionName(ref));
+        }
+        if (!unresolvedStates.isEmpty()) {
+            result.warn(where,
+                    "permitted subtype(s) " + TypeResolutionAudit.summarize(unresolvedStates, 8)
+                            + " did not resolve — they are still enumerated as states, but their "
+                            + "declarations were never read, so any child states of a sealed or "
+                            + "enum member are missing and no transition mentioning them can be "
+                            + "recognised. State enumeration is exact only over a source set that "
+                            + "contains the whole hierarchy");
+        }
+
+        Set<String> memberNames =
+                new LinkedHashSet<>(StateMachineClassifier.hierarchyQualifiedNames(root));
+        memberNames.addAll(unresolvedStates);
+        List<String> resembling = audit.resembling(TypeResolutionAudit.simpleNames(memberNames))
+                .stream().filter(n -> !unresolvedStates.contains(n)).toList();
+        if (!resembling.isEmpty()) {
+            result.warn(where,
+                    "unresolved type reference(s) " + TypeResolutionAudit.summarize(resembling, 8)
+                            + " share a simple name with a member of this hierarchy — if any of "
+                            + "them IS that member, every recognizer read it as a foreign type and "
+                            + "the edges mentioning it are missing");
+        }
+
+        if (rejected && (!unresolvedStates.isEmpty() || !resembling.isEmpty())) {
+            result.warn(where,
+                    "this rejection may be a type-resolution failure rather than a verdict: "
+                            + "membership is decided by qualified name, and an unresolved "
+                            + "reference is indistinguishable from a foreign type. Re-run with the "
+                            + "whole hierarchy in --src before recording it as 'not a state machine'");
+        }
     }
 
     /**

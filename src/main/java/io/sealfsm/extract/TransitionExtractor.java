@@ -2625,8 +2625,7 @@ public final class TransitionExtractor {
                     if (ownGuard == null) remaining.remove(caseFrom);
                 }
                 if (caseFrom == null) {
-                    diagnostics.add("could not determine source state for a switch case: "
-                            + truncate(safeText(c)));
+                    diagnostics.add(unresolvedArmDiagnostic(c));
                     // fall through with a null from so produced targets are still
                     // recorded (as undetermined-origin) rather than dropped.
                 } else {
@@ -2854,6 +2853,52 @@ public final class TransitionExtractor {
             }
         } catch (Throwable ignored) {
             // fall through to null -> diagnostic
+        }
+        return null;
+    }
+
+    /**
+     * Why this arm's from-state could not be determined — an unrecognised arm, or
+     * an arm whose pattern type Spoon never resolved.
+     *
+     * <p>The two are the same event to {@link #caseFromState}, which answers null
+     * for both, and the difference is invisible downstream: membership is decided
+     * by qualified name against a set built from resolved declarations, so
+     * {@code case Shut s} whose {@code Shut} did not resolve reads exactly like a
+     * pattern naming some foreign type. Reporting both as "could not determine
+     * source state" blamed the switch-arm handling for what is an input problem —
+     * a machine with its state files missing from {@code --src} produced this
+     * diagnostic once per arm and a 0/n score, and nothing said the types had not
+     * been read. In a thesis reporting recall stratified by idiom that is a
+     * misattributed recall figure, not merely a confusing message.
+     *
+     * <p>Nothing changes about the walk: the arm still contributes an edge with an
+     * undetermined origin, exactly as before. Only the attribution changes.
+     */
+    private String unresolvedArmDiagnostic(CtCase<?> c) {
+        CtTypeReference<?> pattern = casePatternType(c);
+        if (pattern != null && SpoonCompat.isUnresolved(pattern)) {
+            return "could not determine source state for a switch case because its pattern "
+                    + "type '" + SpoonCompat.resolutionName(pattern) + "' did not resolve "
+                    + "— a type-resolution failure, not an unrecognised arm: "
+                    + truncate(safeText(c));
+        }
+        return "could not determine source state for a switch case: " + truncate(safeText(c));
+    }
+
+    /**
+     * The first type named by a pattern label of {@code c}, whether or not it is a
+     * hierarchy member. {@link #caseFromState} deliberately returns only members;
+     * this returns what was written, which is what lets a failure be attributed.
+     */
+    private static CtTypeReference<?> casePatternType(CtCase<?> c) {
+        try {
+            for (CtExpression<?> ce : c.getCaseExpressions()) {
+                CtTypeReference<?> t = patternType(ce);
+                if (t != null) return t;
+            }
+        } catch (Throwable ignored) {
+            // best effort: the caller falls back to the unattributed message
         }
         return null;
     }
