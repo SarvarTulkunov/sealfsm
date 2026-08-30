@@ -186,7 +186,7 @@ Reference output in `sample-output/` — diff after building to verify.
 - `detect/DispatchCommitDetectorTest` — the commit classification, as near-identical pairs differing only in codomain, plus the F20 pair differing only in what an arm does with the value it matched (accept `case Fresh f -> new Waiting(f, 1)` / reject `case Neg n -> new Neg(fold(n.operand()))`) (accept `state = switch(state)` / reject `label = switch(state)`), and the same pairs for the `instanceof` chain (accept an H-typed field write / reject the `String` one over the identical discrimination)
 - `extract/TransitionResolverTest` — the successor sub-procedure, expression shape by expression shape
 - `model/StateNamingTest` — the id-assignment rule, on qualified names directly (no Spoon): collision-free names untouched, nested/cross-package/enum-constant collisions separated, ids always distinct
-- `ExtractionIntegrationTest` — full Spoon extraction over every example; the F23 trio holds the fixture fixed and varies only **what the analysis was allowed to read**, which is the condition itself rather than an imitation of it (no fixture can encode an unresolvable type — every example is compiled by `javac` as part of being a fixture): `examples/traffic` minus `Yellow.java` must still enumerate 3 states, recover the edge *to* Yellow, and record an explicit unresolved edge *out of* it rather than reporting a clean n/n — *and name Yellow as the reason* for both, `examples/door` minus its three state files must report the **same relation** the whole model does (5/5) with no arm blamed and no gap fabricated, `examples/namecollision` minus `Legacy.java` the same at 12/12 through Spoon's `$`-spelled nested name, and six record-heavy fully-readable fixtures must stay **silent** — the `isImplicit` control, which fails loudly if the synthetic-record-member exclusion is dropped or regressed to a source-position test; the F21 pair is two hierarchies of one fixture asked opposite questions — that an always-throwing carrier helper contributes no edge while a returning one of the identical call shape keeps its self-loop, and that a shadow-bodied JDK carrier keeps every edge it produces; the F22 trio asks the same of a name — that an audit hook named `become` contributes nothing while a mutator named `assume` commits, that a method writing the state field from something *other* than its parameter claims no call site, and that a method name survives as an event symbol exactly where the hierarchy spells more than one (kept on `cancellation`, dropped on `retrystate`, unchanged on `traffic`)
+- `ExtractionIntegrationTest` — full Spoon extraction over every example; the F23 trio holds the fixture fixed and varies only **what the analysis was allowed to read**, which is the condition itself rather than an imitation of it (no fixture can encode an unresolvable type — every example is compiled by `javac` as part of being a fixture): `examples/traffic` minus `Yellow.java` must still enumerate 3 states, recover the edge *to* Yellow, and record an explicit unresolved edge *out of* it rather than reporting a clean n/n — *and name Yellow as the reason* for both, `examples/door` minus its three state files must report the **same relation** the whole model does (5/5) with no arm blamed and no gap fabricated, `examples/namecollision` minus `Legacy.java` the same at 12/12 through Spoon's `$`-spelled nested name, `src/test/resources/unreadmember/` must recover the same-package use site while **declining** the one behind an explicit foreign import (the fabrication control) and the one degraded by a wildcard import, every partial model must additionally report which of its edges rest on a guessed name, and six record-heavy fully-readable fixtures must stay **silent** — the `isImplicit` control, which fails loudly if the synthetic-record-member exclusion is dropped or regressed to a source-position test; the F21 pair is two hierarchies of one fixture asked opposite questions — that an always-throwing carrier helper contributes no edge while a returning one of the identical call shape keeps its self-loop, and that a shadow-bodied JDK carrier keeps every edge it produces; the F22 trio asks the same of a name — that an audit hook named `become` contributes nothing while a mutator named `assume` commits, that a method writing the state field from something *other* than its parameter claims no call site, and that a method name survives as an event symbol exactly where the hierarchy spells more than one (kept on `cancellation`, dropped on `retrystate`, unchanged on `traffic`)
 
 ## Key implementation details
 
@@ -257,15 +257,29 @@ touch.
   when Spoon spelled it with the byte-identical qualified name, which is the test
   every resolved member already passes. `TypeResolutionAudit.resembling` stays
   what it was — diagnostic text, never a decision.
-- **The residual risk, which is why this is a branch.** If Spoon's guess is
-  *wrong* (an unreadable import making `p.Yellow` the guess for a `q.Yellow`), a
-  foreign type spelled that way in the same context is admitted as a state and an
-  edge to it is published **resolved** — a fabrication. And the guesses are not
-  stable: `examples/namecollision` minus `Legacy.java` reaches the model as
-  `namecollision.Legacy$Idle`, `namecollision.Legacy` **and** a bare `Legacy.Idle`
-  at once, so recovery is partial by construction. That instability is pinned as a
-  standing probe, and if a Spoon bump ever removes it the claim needs re-measuring
-  rather than re-asserting.
+- **The residual risk, MEASURED rather than argued** — `src/test/resources/unreadmember/`,
+  three variants of one hierarchy differing by a single import line. The worry was
+  that a *wrong* guess (an unreadable import making `p.Amber` the guess for a
+  `q.Amber`) would admit a foreign type as a state and publish a **resolved** edge
+  to it, which is a fabrication. It is **not constructible**, and the reason is
+  structural: `permits` requires the same package outside a named module, so the
+  only way a simple name there can denote a foreign type is an explicit
+  single-type import — and Spoon honours it.
+
+  | variant | Spoon's guess for `new Amber()` | admitted | outcome |
+  |---|---|---|---|
+  | `samepkg/` — bare, same package | `samepkg.Amber` | yes | edge recovered; the intended case |
+  | `explicitimport/` — `import ext.Amber;` | `ext.Amber` | **no** | edge stays unresolved — **the fabrication control** |
+  | `wildcardimport/` — `import ext.*;` | bare `Amber`, no package | **no** | edge stays unresolved |
+
+  `wildcardimport` is the opposite error and a real **recall gap**: JLS §7.5.2 makes
+  the same-package type shadow a wildcard import, so the reference *is* the state
+  and the edge is real — Spoon simply degrades the guess to a bare name and nothing
+  matches. Recovery is partial by construction, in that exact way. The same
+  instability shows at corpus scale: `examples/namecollision` minus `Legacy.java`
+  reaches one model as `namecollision.Legacy$Idle`, `namecollision.Legacy` **and** a
+  bare `Legacy.Idle` at once, pinned as a standing probe. These inputs deliberately
+  do not compile, which is why they live in test resources and not in `examples/`.
 - **`Analyzer.recordUnreadStateGaps` is the other half, and is not separable from
   it.** Recovery buys the edges that *mention* an unread state, never the ones it
   *produces* — that producer is in the file that was not read. Under
@@ -282,6 +296,23 @@ touch.
   dispatch matched, whose unread file *also* declared a producer of its own, gets
   no marker — nothing in the readable source separates that from a state whose
   file holds only data.
+- **A recovered edge is separable from a proven one, because the SCORE cannot tell
+  them apart.** This is what makes the branch usable as a thesis instrument rather
+  than merely correct. `door` minus its three state files reports **5/5** — the
+  exact relation — and a 5/5 read from complete source is a strictly stronger
+  claim, yet nothing in the number says so. So the weaker evidence is carried in
+  the model: `State.isDeclarationUnread()` flags a state enumerated from a permits
+  reference whose declaration was never read, and
+  `StateMachine.transitionsViaUnreadDeclaration()` counts the edges touching one
+  (derived, so it cannot drift from the flags). The count reaches the extraction
+  diagnostic, DOT draws such a state **dotted amber** (dotted, not dashed —
+  dashed already means "unresolved edge" and these are different claims), SCXML
+  carries a comment inside the `<state>`, and `Main` prints a footnote under the
+  table **regardless of `--quiet`**, because it qualifies the numbers directly
+  above rather than being a diagnostic about them. On the corpus every flag is
+  false and every count is zero, so all of it is invisible on well-formed input.
+  Door's honest report is "5/5, and all five rest on guessed names"; namecollision's
+  is "12/12, of which 5".
 - **Measured, on the three shapes that exist.** `door` minus its 3 state files:
   0/5 → **5/5**, relation byte-identical to the whole model, no arm blamed for an
   input problem, no gap fabricated. `namecollision` minus `Legacy.java`: **12/12**,
@@ -291,14 +322,18 @@ touch.
   unresolved member, which is also why no fixture can pin this and the tests build
   partial models instead.
 - **The standing argument against merging**, recorded so it is not re-litigated
-  from scratch: the triggering condition is an *input error*, not a Java idiom.
-  F1–F22 are all "the algorithm mishandled legal Java"; this is "the tool was
-  pointed at incomplete source", and the right answer to bad input is the clear
-  report F23 already gives. The trigger that would change that: if harvesting real
-  GitHub projects routinely hits multi-source-root layouts, partial source sets
-  stop being an error and become normal — at which point the better fix is
-  source-root auto-discovery in `Main` (`--src <project-root>` finding every
-  `src/main/java`), which removes the cause instead of compensating for it.
+  from scratch. It is *not* the soundness worry — that was measured above and does
+  not reproduce. It is that the triggering condition is an **input error**, not a
+  Java idiom: F1–F22 are all "the algorithm mishandled legal Java", whereas this is
+  "the tool was pointed at incomplete source", and every number in the validation
+  chapter comes from complete source sets, so merging moves no reported result. The
+  trigger that would change it: if harvesting real GitHub projects routinely hits
+  multi-source-root layouts, partial source sets stop being an error and become
+  normal — at which point the better fix is source-root auto-discovery in `Main`
+  (`--src <project-root>` finding every `src/main/java`), which removes the cause
+  instead of compensating for it, and leaves this recovery for the case
+  auto-discovery cannot reach: a hierarchy genuinely unobtainable (split across a
+  module boundary, generated, or only present in a dependency).
 
 ### StateMachineClassifier (detect/StateMachineClassifier.java)
 `Classification` carries a `Rejection` alongside the reason text: `ABSTAINED` ("no transition producer found") versus `VETOED` (the compositional veto). Only the second is a verdict about the hierarchy's members, and the difference is what decides whether a rejected root releases its nested sealed subtypes — see the re-offer worklist above. Do not collapse them back to a reason string; a caller comparing that string is a caller that breaks when the wording changes.
@@ -419,6 +454,8 @@ Reporting is stratified along three independent axes. Collapsing any two of them
 | `StateMachine.Encoding` | where does dispatch **live**? | `POLYMORPHIC`, `CENTRALIZED_DISPATCH` (+ `MIXED`) |
 | `SuccessorForm` | how is the successor **spelled**? | CONSTRUCTION / SINGLETON_FIELD / ENUM_CONSTANT / SELF / LOCAL_VARIABLE / CAST |
 | `CommitForm` | how is the successor **installed**? | VALUE_RETURN / FIELD_MUTATION / LOCAL_ACCUMULATOR / POLY_CARRIER |
+
+(On the `unresolved-member-recovery` branch, `State.isDeclarationUnread()` is deliberately **not** a fourth axis. The three axes classify how a machine is *written*; that flag records how much of it the tool was allowed to *read*, which is a property of the invocation and not of the program. Stratify by it if you like, but never fold it into these.)
 
 A carrier-returning per-state method is `POLYMORPHIC` dispatch with a `POLY_CARRIER` commit — not an encoding of its own. `return switch (s)` and `this.f = switch (this.f)` are the same encoding with different commits.
 

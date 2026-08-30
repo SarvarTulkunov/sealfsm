@@ -194,6 +194,36 @@ public final class StateMachine {
         for (State c : s.children()) collect(c, out);
     }
 
+    /**
+     * The states enumerated from a {@code permits} reference whose declaration was
+     * never read — see {@link State#isDeclarationUnread()}. Empty for every input
+     * whose whole hierarchy was readable, which is every well-formed run.
+     */
+    public Set<String> statesWithUnreadDeclaration() {
+        Set<String> out = new LinkedHashSet<>();
+        for (State s : allStates()) {
+            if (s.isDeclarationUnread()) out.add(s.id());
+        }
+        return out;
+    }
+
+    /**
+     * Edges with at least one endpoint whose declaration was never read.
+     *
+     * <p>The quantity a stratified recall table needs: these edges were matched
+     * through a guessed qualified name rather than against a declaration, so
+     * pooling them with the rest would report two different strengths of evidence
+     * as one number. Derived rather than stored, so it cannot drift from the
+     * flags on the states.
+     */
+    public long transitionsViaUnreadDeclaration() {
+        Set<String> unread = statesWithUnreadDeclaration();
+        if (unread.isEmpty()) return 0;
+        return transitions.stream()
+                .filter(t -> unread.contains(t.from()) || (t.to() != null && unread.contains(t.to())))
+                .count();
+    }
+
     public long resolvedTransitionCount() {
         return transitions.stream().filter(Transition::isResolved).count();
     }

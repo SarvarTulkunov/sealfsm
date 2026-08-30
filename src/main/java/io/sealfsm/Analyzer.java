@@ -140,7 +140,7 @@ public final class Analyzer {
             // MENTION it (the permits clause names it) but not the ones it
             // produces. That asymmetry is recorded here, never left to read as an
             // absence of transitions.
-            recordUnreadStateGaps(root, machine, states.naming(), te.dispatchedStates(), result);
+            recordUnreadDeclarations(root, machine, states.naming(), te.dispatchedStates(), result);
             // A state the dispatch matched but from which nothing is produced is
             // absorbing — RFC 9113's `Closed`, whose every arm throws. A state the
             // dispatch never matched is not: that is a recall gap, and
@@ -175,11 +175,22 @@ public final class Analyzer {
                             () -> result.warn(root.getQualifiedName(),
                                     "initial state could not be determined"));
 
+            // The suffix is empty for every input whose hierarchy was fully readable,
+            // so this line is unchanged on the whole corpus. Where it is not empty,
+            // it separates two strengths of evidence that must not be pooled: an
+            // edge matched against a declaration, and one matched through a name
+            // Spoon guessed for a declaration nobody read.
+            long viaUnread = machine.transitionsViaUnreadDeclaration();
             result.info(root.getQualifiedName(),
                     "extracted — " + c.reason() + "; "
                             + machine.allStates().size() + " states, "
                             + machine.resolvedTransitionCount() + "/"
-                            + machine.transitions().size() + " transitions resolved");
+                            + machine.transitions().size() + " transitions resolved"
+                            + (viaUnread > 0
+                                    ? "; " + viaUnread + " of them touch a state whose declaration "
+                                            + "was never read and are therefore weaker evidence "
+                                            + "than the rest"
+                                    : ""));
             result.addMachine(machine);
         }
         return result;
@@ -318,18 +329,20 @@ public final class Analyzer {
      * a state whose file holds only data — the readable half is identical in both
      * — so what can honestly be said is said, in the INFO line.
      */
-    private static void recordUnreadStateGaps(CtType<?> root, StateMachine machine,
-                                              StateNaming naming, Set<String> dispatched,
-                                              ExtractionResult result) {
+    private static void recordUnreadDeclarations(CtType<?> root, StateMachine machine,
+                                                StateNaming naming, Set<String> dispatched,
+                                                ExtractionResult result) {
         Set<String> unread = StateMachineClassifier.unresolvedMemberNames(root);
         if (unread.isEmpty()) return;
 
         String where = root.getQualifiedName();
         Set<String> unexamined = new TreeSet<>();
         Set<String> examined = new TreeSet<>();
+        Set<String> unreadIds = new LinkedHashSet<>();
         for (String qn : unread) {
             String id = naming.idFor(qn);
             if (id == null) continue;
+            unreadIds.add(id);
             if (dispatched.contains(id)) {
                 examined.add(qn);
                 continue;
@@ -338,6 +351,15 @@ public final class Analyzer {
                     "declaration of " + qn + " was never read, so its transition producers "
                             + "— if it declares any — were not examined"));
             unexamined.add(qn);
+        }
+
+        // Provenance, carried in the model rather than only in this report: every
+        // edge touching one of these states was matched through a name Spoon
+        // guessed, which is weaker evidence than a match against a declaration the
+        // tool read. Marked for ALL unread members, examined or not — the flag is
+        // about what was read, not about what a dispatch happened to do with it.
+        for (State st : machine.allStates()) {
+            if (unreadIds.contains(st.id())) st.setDeclarationUnread(true);
         }
 
         if (!unexamined.isEmpty()) {

@@ -12,6 +12,10 @@ import spoon.Launcher;
 import spoon.reflect.CtModel;
 import spoon.reflect.declaration.CtType;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -2620,6 +2624,38 @@ class ExtractionIntegrationTest {
         return launcher.getModel();
     }
 
+    /**
+     * Every {@code .java} file in {@code dir} except the named ones — the source
+     * set with a hole in it.
+     *
+     * <p>Derived from the directory rather than listed by hand, and this is not
+     * tidiness. A hard-coded list of the files to KEEP goes quietly stale: add a
+     * file to the fixture and the partial model silently stops containing it, so
+     * the test still passes while testing a different input than it says. Listing
+     * what is WITHHELD states the condition directly, and the existence check
+     * below makes the withholding itself falsifiable — rename the withheld file
+     * and the test fails loudly instead of passing while withholding nothing.
+     */
+    private CtModel modelOfDirExcept(String dir, String... withheld) {
+        for (String name : withheld) {
+            assertTrue(Files.exists(Path.of(dir, name)),
+                    "withheld file " + name + " is not in " + dir + " — this test would "
+                            + "otherwise pass while withholding nothing");
+        }
+        Set<String> excluded = Set.of(withheld);
+        try (var entries = Files.list(Path.of(dir))) {
+            List<String> kept = entries
+                    .filter(f -> f.getFileName().toString().endsWith(".java"))
+                    .filter(f -> !excluded.contains(f.getFileName().toString()))
+                    .map(Path::toString)
+                    .sorted()
+                    .toList();
+            return modelOfFiles(kept.toArray(new String[0]));
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
     private boolean mentionsResolution(ExtractionResult r) {
         return r.diagnostics().stream().anyMatch(d -> d.message().contains("did not resolve"));
     }
@@ -2636,11 +2672,8 @@ class ExtractionIntegrationTest {
         assertFalse(mentionsResolution(whole),
                 "a fully readable hierarchy must not report a resolution failure");
 
-        ExtractionResult partial = new Analyzer().analyze(modelOfFiles(
-                "examples/traffic/TrafficLight.java",
-                "examples/traffic/Red.java",
-                "examples/traffic/Green.java",
-                "examples/traffic/TrafficController.java"));
+        ExtractionResult partial =
+                new Analyzer().analyze(modelOfDirExcept("examples/traffic", "Yellow.java"));
         StateMachine thin = single(partial);
 
         // The state survives, and so now does its MEMBERSHIP. StateExtractor reads
@@ -2699,6 +2732,17 @@ class ExtractionIntegrationTest {
                                 && d.message().contains("outgoing transitions are unknown")
                                 && d.message().contains("examples.traffic.Yellow")),
                 "the gap the recovery cannot close must be reported, not merely counted");
+
+        // PROVENANCE. A recovered edge and an edge resolved against a declaration
+        // count the same in `2/3`, and a reader of a diagram or a recall table
+        // cannot tell them apart from the score. So the weaker evidence is carried
+        // in the model: the state is flagged, and the edges touching it are
+        // countable. Both edges here touch Yellow.
+        assertEquals(Set.of("Yellow"), thin.statesWithUnreadDeclaration());
+        assertEquals(2, thin.transitionsViaUnreadDeclaration());
+        assertTrue(full.statesWithUnreadDeclaration().isEmpty(),
+                "the fully readable model must claim no degraded provenance at all");
+        assertEquals(0, full.transitionsViaUnreadDeclaration());
     }
 
     @Test
@@ -2716,10 +2760,8 @@ class ExtractionIntegrationTest {
         // transition relation lives in DoorMachine, which WAS read — so the honest
         // answer is not a smaller relation with better wording. It is the same
         // relation.
-        ExtractionResult partial = new Analyzer().analyze(modelOfFiles(
-                "examples/door/Door.java", "examples/door/DoorMachine.java",
-                "examples/door/Event.java", "examples/door/Lock.java",
-                "examples/door/Push.java", "examples/door/Unlock.java"));
+        ExtractionResult partial = new Analyzer().analyze(modelOfDirExcept(
+                "examples/door", "Open.java", "Closed.java", "Locked.java"));
         StateMachine thin = single(partial);
         ExtractionResult wholeDoor = new Analyzer().analyze(modelOf("examples/door"));
         StateMachine full = single(wholeDoor);
@@ -2758,6 +2800,22 @@ class ExtractionIntegrationTest {
                 "a state recovered only because a readable dispatch computes its "
                         + "successors must say so — its own declaration was still not read");
 
+        // The initial state comes back too: DoorContext seeds `new Closed()`, and
+        // that seed is only a candidate once Closed is a member again. Master
+        // cannot answer this at all.
+        assertEquals("Closed", thin.initialState().orElse(null));
+
+        // PROVENANCE, and the reason a 5/5 here is not the same claim as the 5/5
+        // beside it. Every one of these five edges was matched through a name
+        // Spoon guessed for a declaration nobody read; the score cannot show that,
+        // so the model carries it and the CLI prints it under the table.
+        assertEquals(Set.of("Open", "Closed", "Locked"), thin.statesWithUnreadDeclaration());
+        assertEquals(5, thin.transitionsViaUnreadDeclaration());
+        assertTrue(full.statesWithUnreadDeclaration().isEmpty());
+        assertEquals(0, full.transitionsViaUnreadDeclaration(),
+                "the same relation read from complete source claims full provenance, "
+                        + "which is the difference the flag exists to record");
+
         // Negative control: with every file present the identical switch produces
         // the full relation and no resolution diagnostic at all, so the messages
         // above track resolution and not merely the presence of a pattern arm.
@@ -2777,11 +2835,8 @@ class ExtractionIntegrationTest {
         // lengthened to keep it distinct from `namecollision.Idle`.
         ExtractionResult whole = new Analyzer().analyze(modelOf("examples/namecollision"));
         StateMachine full = single(whole);
-        ExtractionResult partial = new Analyzer().analyze(modelOfFiles(
-                "examples/namecollision/Idle.java", "examples/namecollision/Link.java",
-                "examples/namecollision/LinkDriver.java",
-                "examples/namecollision/LinkMachine.java", "examples/namecollision/Mode.java",
-                "examples/namecollision/Phase.java", "examples/namecollision/Signal.java"));
+        ExtractionResult partial = new Analyzer().analyze(
+                modelOfDirExcept("examples/namecollision", "Legacy.java"));
         StateMachine thin = single(partial);
 
         assertEquals(8, thin.allStates().size());
@@ -2797,6 +2852,12 @@ class ExtractionIntegrationTest {
                                 && d.message().contains("permitted subtype(s)")
                                 && d.message().contains("Legacy$Idle")),
                 "the unread declaration must still be named");
+
+        // Provenance is keyed on the disambiguated id, so it survives the collision
+        // that made this fixture exist: 5 of the 12 edges touch `Legacy.Idle`, and
+        // the other 7 are as strong as they were.
+        assertEquals(Set.of("Legacy.Idle"), thin.statesWithUnreadDeclaration());
+        assertEquals(5, thin.transitionsViaUnreadDeclaration());
 
         // STANDING PROBE, not an assertion about this machine's edges. One
         // withheld type reaches this model under several guessed spellings at once
@@ -2814,6 +2875,61 @@ class ExtractionIntegrationTest {
                 "one unreadable type is expected to reach the model under more than "
                         + "one guessed spelling; if it no longer does, re-measure the "
                         + "claim that recovery is spelling-dependent");
+    }
+
+    @Test
+    void recoveryAdmitsOnlyTheSpellingThePermitsClauseWrote() {
+        // The measurement the whole recovery rests on, and the one thing about it
+        // that is a question about SPOON rather than about SealFSM: membership now
+        // admits the qualified name Spoon guessed for an unresolved permits
+        // reference, so the safety of that depends entirely on whether Spoon can
+        // produce the same guess for a use site denoting something else. That is
+        // measured here rather than argued, on three variants of one hierarchy
+        // that differ by a single import line. See
+        // src/test/resources/unreadmember/README.md.
+        String root = "src/test/resources/unreadmember/";
+
+        // (1) The intended case. Same package, no import — the only shape `permits`
+        // actually allows outside a named module — so both guesses are
+        // `samepkg.Amber` and the edge comes back.
+        StateMachine samePkg = single(new Analyzer().analyze(modelOf(root + "samepkg")));
+        assertEquals(Set.of("Red", "Amber"), stateIds(samePkg));
+        assertTrue(hasResolved(samePkg, "Red", "Amber"),
+                "a use site in the permitted type's own package must recover");
+        assertEquals(Set.of("Amber"), samePkg.statesWithUnreadDeclaration());
+        assertEquals(2, samePkg.transitionsViaUnreadDeclaration());
+
+        // (2) THE FABRICATION CONTROL, and the load-bearing one. `import ext.Amber;`
+        // makes `new Amber()` denote a foreign type, and it is the only way a simple
+        // name in this package can. Spoon honours the import and guesses `ext.Amber`,
+        // which does not equal the permits spelling, so membership declines it and
+        // the edge stays unresolved. Were it admitted, the tool would publish a
+        // RESOLVED edge to a type that is not the state — a fabrication, and the one
+        // failure mode the soundness invariant forbids outright. Delete one import
+        // line from this fixture and it becomes case (1), which is why the two are
+        // held together.
+        StateMachine imported = single(new Analyzer().analyze(modelOf(root + "explicitimport")));
+        assertFalse(hasResolved(imported, "Red", "Amber"),
+                "an import naming a foreign type must not be recovered as the state: "
+                        + "that would resolve an edge to a type the analysis never established");
+        assertTrue(imported.transitions().stream()
+                        .anyMatch(t -> t.from().equals("Red") && !t.isResolved()),
+                "and it must be recorded unresolved rather than dropped");
+        assertEquals(1, imported.transitionsViaUnreadDeclaration(),
+                "only the gap edge out of Amber touches an unread state here");
+
+        // (3) The opposite error, kept because a limitation that is measured is
+        // worth more than one discovered later. A wildcard import leaves Spoon
+        // unable to qualify the name at all, so the use site arrives as a bare
+        // `Amber` and matches nothing — yet JLS 7.5.2 makes the same-package type
+        // shadow that import, so the reference really IS the state and the edge is
+        // real. Recovery is partial by construction, in this exact way.
+        StateMachine wildcard = single(new Analyzer().analyze(modelOf(root + "wildcardimport")));
+        assertFalse(hasResolved(wildcard, "Red", "Amber"),
+                "a degraded guess must not be matched by resemblance to the simple name");
+        assertTrue(wildcard.transitions().stream()
+                        .anyMatch(t -> t.from().equals("Red") && !t.isResolved()),
+                "the missed edge is a recorded gap, never a silent drop");
     }
 
     @Test

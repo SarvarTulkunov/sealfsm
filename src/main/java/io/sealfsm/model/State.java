@@ -25,6 +25,7 @@ public final class State {
     private final String qualifiedName; // fully-qualified type name
     private boolean initial;
     private boolean terminal;
+    private boolean declarationUnread;
     private final boolean composite;
     private final List<State> children = new ArrayList<>();
 
@@ -69,6 +70,35 @@ public final class State {
         return composite;
     }
 
+    /**
+     * True when this state was enumerated from a {@code permits} reference whose
+     * <em>declaration</em> the analysis never read.
+     *
+     * <p>The state itself is not in doubt — the {@code permits} clause is
+     * compiler-checked, which is why enumeration stays exact even here. What is
+     * weaker is everything that depends on the state's <em>identity</em>: its
+     * membership rests on the qualified name Spoon guessed for that reference
+     * rather than on a declaration, so an edge touching it was matched by a
+     * guessed spelling. Measured, that guess is conservative rather than
+     * fabricating — Spoon honours an explicit import, and degrades to a bare
+     * simple name under a wildcard one, and neither matches the permits spelling,
+     * so the edge is declined rather than invented. But "declined rather than
+     * invented" is a property worth carrying in the output instead of asserting
+     * in prose, because a reader of a diagram or a recall table cannot otherwise
+     * tell these edges from the ones resolved against a declaration.
+     *
+     * <p>Also, and separately: a composite state can never carry this flag. Its
+     * children come from the declaration, so an unread member is always a leaf as
+     * far as the tool can see — which is itself part of what is lost.
+     */
+    public boolean isDeclarationUnread() {
+        return declarationUnread;
+    }
+
+    public void setDeclarationUnread(boolean declarationUnread) {
+        this.declarationUnread = declarationUnread;
+    }
+
     public List<State> children() {
         return Collections.unmodifiableList(children);
     }
@@ -92,6 +122,7 @@ public final class State {
     @Override
     public String toString() {
         return "State{" + id + (composite ? ", composite" : "") + (initial ? ", initial" : "")
-                + (terminal ? ", terminal" : "") + '}';
+                + (terminal ? ", terminal" : "")
+                + (declarationUnread ? ", declaration-unread" : "") + '}';
     }
 }

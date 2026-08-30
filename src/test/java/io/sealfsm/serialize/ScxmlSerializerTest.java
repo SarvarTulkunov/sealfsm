@@ -16,6 +16,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** Pure checks on SCXML emission, including well-formedness of the output. */
 class ScxmlSerializerTest {
 
+    @Test
+    void aStateWhoseDeclarationWasNeverReadSaysSoAndStaysWellFormed() {
+        // The SCXML consumer sees a <state> with transitions and nothing to suggest
+        // that the identity behind it was guessed. The comment is the only place
+        // that can be said, and it must not cost well-formedness: an XML comment may
+        // not contain a double hyphen, and this text is generated, so the check is
+        // worth having rather than assuming.
+        StateMachine m = compositeSample();
+        m.allStates().stream().filter(s -> s.id().equals("Idle")).findFirst()
+                .orElseThrow().setDeclarationUnread(true);
+        String xml = new ScxmlSerializer().serialize(m);
+
+        assertTrue(xml.contains("declaration never read"), xml);
+        assertDoesNotThrow(() -> DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                .parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8))),
+                "the provenance comment must not break the document");
+    }
+
     private StateMachine compositeSample() {
         StateMachine m = new StateMachine("Phone",
                 "examples.phone.Phone", StateMachine.Encoding.POLYMORPHIC);

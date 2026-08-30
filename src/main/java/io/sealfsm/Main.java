@@ -108,12 +108,43 @@ public final class Main {
                     commitList(m),
                     formList(m));
         }
+        printUnreadDeclarationNote(result);
         printEncodingRollup(result);
         if (!quiet && !result.diagnostics().isEmpty()) {
             System.out.println("-".repeat(72));
             System.out.println("Diagnostics:");
             result.diagnostics().forEach(d -> System.out.println("  " + d));
         }
+    }
+
+    /**
+     * A footnote naming the states whose declarations were never read, printed
+     * only when there are any.
+     *
+     * <p>The table above cannot carry this: it reports a resolved count, and an
+     * edge matched through a guessed qualified name counts there exactly like one
+     * matched against a declaration. That is the whole difficulty — the score
+     * looks the same either way, so the condition has to be said out loud next to
+     * it. Printed unconditionally of {@code --quiet}, which suppresses
+     * diagnostics: this is not a diagnostic but a qualification on the numbers
+     * directly above, and suppressing it would leave the numbers looking stronger
+     * than they are.
+     */
+    private static void printUnreadDeclarationNote(ExtractionResult result) {
+        var affected = result.machines().stream()
+                .filter(m -> !m.statesWithUnreadDeclaration().isEmpty())
+                .toList();
+        if (affected.isEmpty()) return;
+        System.out.println();
+        for (StateMachine m : affected) {
+            System.out.printf("  ! %s: state(s) %s enumerated from the permits clause but never "
+                            + "read; %d edge(s) touch them%n",
+                    m.name(), m.statesWithUnreadDeclaration(), m.transitionsViaUnreadDeclaration());
+        }
+        System.out.println("    Those edges were matched through a qualified name Spoon guessed "
+                + "for a declaration");
+        System.out.println("    that was not in --src. Re-run with the whole hierarchy before "
+                + "quoting these counts.");
     }
 
     /** The successor spellings a machine's edges used, compactly. */

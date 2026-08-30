@@ -183,12 +183,27 @@ public final class DotSerializer {
             List<String> attrs = new ArrayList<>();
             if (s.isInitial()) {
                 attrs.add("penwidth=2");
-                attrs.add("color=\"#1a73e8\"");
+                // The colour is yielded to the unread-declaration rule below when
+                // both apply: a state can be the machine's start AND rest on a
+                // guessed name, and emitting `color` twice leaves Graphviz to pick
+                // (it takes the last) rather than the serializer saying which
+                // signal matters. The thicker border still shows the initial state.
+                if (!s.isDeclarationUnread()) attrs.add("color=\"#1a73e8\"");
             }
             if (s.isTerminal()) {
                 // Double border, the conventional accepting/terminal notation: the
                 // dispatch matched this state and every path out of it throws.
                 attrs.add("peripheries=2");
+            }
+            if (s.isDeclarationUnread()) {
+                // Dotted, not dashed: dashed already means "unresolved edge" in this
+                // file and the two are different claims. The state is certain — the
+                // permits clause is compiler-checked — while its identity, and so
+                // every edge matched to it, rests on a guessed qualified name. Last
+                // in the list so its colour wins over `initial`'s while that rule's
+                // penwidth still shows, since a state can be both.
+                attrs.add("style=\"rounded,dotted\"");
+                attrs.add("color=\"#b8860b\"");
             }
             if (!attrs.isEmpty()) sb.append(" [").append(String.join(", ", attrs)).append("]");
             sb.append(";\n");

@@ -136,6 +136,16 @@ public final class ScxmlSerializer {
             sb.append(indent).append("  <!-- terminal: the dispatch matched this state and every\n")
               .append(indent).append("       path out of it rejects, so it has no outbound edge -->\n");
         }
+        if (s.isDeclarationUnread()) {
+            // The state is real and exact (the permits clause is compiler-checked);
+            // what is weaker is that its identity, and every edge matched to it,
+            // rests on a qualified name Spoon guessed for a declaration that was
+            // never read. A consumer of this document cannot see that otherwise.
+            sb.append(indent).append("  <!-- declaration never read: this state comes from the\n")
+              .append(indent).append("       permits clause, but its own source was not in the\n")
+              .append(indent).append("       analysed set, so any edge touching it was matched\n")
+              .append(indent).append("       through a guessed qualified name -->\n");
+        }
 
         // Outgoing transitions whose source is this state.
         for (Transition t : m.transitions()) {

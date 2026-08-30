@@ -5,6 +5,7 @@ import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.Transition;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -34,6 +35,45 @@ class DotSerializerTest {
         assertTrue(dot.startsWith("digraph"));
         assertTrue(dot.contains("\"Red\" -> \"Green\""));
         assertTrue(dot.contains("__start -> \"Red\""), "initial entry arrow expected");
+    }
+
+    @Test
+    void aStateWhoseDeclarationWasNeverReadIsDrawnApart() {
+        // Dotted, not dashed: dashed is already this file's spelling of "unresolved
+        // edge", and the two are different claims. The state is exact — the permits
+        // clause is compiler-checked — while every edge matched TO it went through a
+        // qualified name Spoon guessed for a declaration nobody read. A reader of
+        // the diagram has no other way to see that, since such an edge is drawn and
+        // counted exactly like one resolved against a declaration.
+        StateMachine m = sample();
+        m.allStates().stream().filter(s -> s.id().equals("Yellow")).findFirst()
+                .orElseThrow().setDeclarationUnread(true);
+        String dot = new DotSerializer().serialize(m);
+
+        assertTrue(dot.contains("\"Yellow\" [style=\"rounded,dotted\", color=\"#b8860b\"]"),
+                "the unread state must be drawn distinctly:\n" + dot);
+        assertTrue(dot.contains("\"Green\";"), "a read state keeps its plain rendering");
+    }
+
+    @Test
+    void anInitialStateThatWasNeverReadEmitsExactlyOneColour() {
+        // Both rules want the colour attribute, and a state can be the machine's
+        // start AND rest on a guessed name (a readable driver seeding
+        // `new Closed()` while Closed's own file is absent — examples/door minus
+        // its state files is exactly this). Emitting `color` twice leaves Graphviz
+        // to pick, which is the serializer declining to say which signal matters.
+        // The weaker-evidence colour wins and the initial state keeps its border.
+        StateMachine m = sample();
+        m.allStates().stream().filter(s -> s.id().equals("Red")).findFirst()
+                .orElseThrow().setDeclarationUnread(true);
+        String dot = new DotSerializer().serialize(m);
+
+        String line = dot.lines().filter(l -> l.trim().startsWith("\"Red\" ["))
+                .findFirst().orElseThrow();
+        assertEquals(1, line.split("color=", -1).length - 1,
+                "exactly one colour attribute expected, got: " + line);
+        assertTrue(line.contains("penwidth=2"), "the initial state keeps its border: " + line);
+        assertTrue(line.contains("#b8860b"), "degraded provenance decides the colour: " + line);
     }
 
     @Test
