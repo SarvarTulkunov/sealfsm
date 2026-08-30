@@ -2183,4 +2183,163 @@ class ExtractionIntegrationTest {
                 "the permitted enum stays a composite state of Signal");
         assertTrue(r.machines().stream().noneMatch(sm -> sm.name().equals("Phase")));
     }
+
+    // ---- F20: the compositional veto is bounded ----------------------------
+
+    /**
+     * The shape the finding is about. {@code Retrying} carries the {@code Attempt}
+     * it succeeded — the ordinary way a retry or backoff protocol is written, and
+     * exactly the {@code record Retrying(LcpState previous, int attempts)} an RFC
+     * automaton declares. Every producer therefore writes
+     * {@code new Retrying(this, ...)}, a hierarchy value in a constructor argument
+     * list, and the unbounded veto read one such expression as proof that the whole
+     * type was a tree. Four states, ten edges and a complete relation were deleted
+     * on it, under a diagnostic asserting "recursive data type".
+     *
+     * <p>What separates the two is checkable and is what the fix keys on:
+     * structural recursion DESCENDS into the value it matched and rebuilds a node
+     * out of its parts, whereas this wraps the value WHOLE. A fold never does the
+     * latter — a node containing itself is not a smaller problem.
+     */
+    @Test
+    void aStateCarryingItsPredecessorIsStillAStateMachine() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/retrystate"));
+        StateMachine m = named(r, "Attempt");
+
+        assertEquals(StateMachine.Encoding.POLYMORPHIC, m.encoding());
+        assertEquals(Set.of("Ready", "Retrying", "Exhausted", "Done"), stateIds(m));
+        assertEquals(10, m.transitions().size());
+        assertEquals(0, m.unresolvedTransitionCount(),
+                "a predecessor pointer resolves like any other construction");
+
+        assertTrue(hasResolved(m, "Ready", "Retrying"), "new Retrying(this, 1)");
+        assertTrue(hasResolved(m, "Retrying", "Retrying"), "new Retrying(this, attempts + 1)");
+        assertTrue(hasResolved(m, "Retrying", "Exhausted"), "new Exhausted(this)");
+        assertTrue(hasResolved(m, "Retrying", "Done"));
+        assertTrue(hasResolved(m, "Exhausted", "Ready"));
+        assertEquals("Ready", m.initialState().orElse(null));
+    }
+
+    /**
+     * The same finding on the centralized path, where the current state is spelled
+     * as the arm's type-pattern binding rather than {@code this}. It carries the
+     * receiver half too: {@code new Waiting(w, w.misses() + 1)} passes an
+     * {@code int} computed off the current state, and a flat scan of that argument's
+     * subtree saw the RECEIVER {@code w} and called the whole argument a hierarchy
+     * value — so the most ordinary thing a retry state does, counting, read as
+     * composition.
+     *
+     * <p>{@code PollDriver.handle} returns {@code void}, so this dispatch is the
+     * hierarchy's only producer: rejecting it does not mislabel an edge, it loses
+     * the machine. At HEAD this fixture reported "no transition producer found".
+     */
+    @Test
+    void aCentralizedDispatchCarryingItsMatchedBindingIsStillAMachine() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/retrystate"));
+        StateMachine m = named(r, "Poll");
+
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertEquals(Set.of(CommitForm.FIELD_MUTATION), m.commitForms());
+        assertEquals(Set.of("Fresh", "Waiting", "Stale"), stateIds(m));
+        assertEquals(7, m.transitions().size());
+        assertEquals(0, m.unresolvedTransitionCount());
+
+        assertTrue(hasResolved(m, "Fresh", "Waiting"), "new Waiting(f, 1)");
+        assertTrue(hasEventEdge(m, "Waiting", "MISS", "Waiting"), "new Waiting(w, w.misses() + 1)");
+        assertTrue(hasEventEdge(m, "Waiting", "EXPIRE", "Stale"), "new Stale(w)");
+        assertEquals("Fresh", m.initialState().orElse(null));
+    }
+
+    /**
+     * NEGATIVE CONTROL for the threshold, and the load-bearing one: bounding the
+     * veto by a count alone opens a hole exactly where recursive sealed types are
+     * commonest — the two-member tree ({@code permits Base, Stack}) whose single
+     * recursive member rebuilds itself. One production, one member, so
+     * "two across two" clears it; {@code flatten()} returns the hierarchy type on
+     * both members so the distributed recognizer accepts it; and a tree is published
+     * as an automaton whose one edge is {@code Stack -> Stack}.
+     *
+     * <p>The self-composition disjunct is what closes it, and it is not an extra
+     * heuristic: descending into the current state's PARTS and reassembling a node
+     * around them is the definition of a fold.
+     */
+    @Test
+    void aSingleMemberTreeIsStillVetoed() {
+        CtModel model = modelOf("examples/retrystate");
+        ExtractionResult r = new Analyzer().analyze(model);
+
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Layer")),
+                "a recursive data type with one recursive member is still a recursive data type");
+        assertTrue(r.diagnostics().stream().anyMatch(d -> d.where().equals("retrystate.Layer")
+                        && d.message().toLowerCase().contains("composed into one another")),
+                "the rejection must name the compositional guard");
+
+        // The control bites only if something WOULD otherwise accept it.
+        CtType<?> layer = model.getAllTypes().stream()
+                .filter(t -> t.getQualifiedName().equals("retrystate.Layer"))
+                .findFirst().orElseThrow();
+        assertFalse(StateMachineClassifier.findDistributedTransitionMethods(layer).isEmpty(),
+                "if no recognizer claimed Layer, this control would assert nothing");
+    }
+
+    /**
+     * NEGATIVE CONTROL for the downgrade: what happens to the one nested production
+     * the bounded veto now lets through. {@code Plain.wrap(Frame other) -> new
+     * Boxed(other)} nests a hierarchy value that is neither the current state nor a
+     * part of it, so it is evidence about one expression and not about the type.
+     *
+     * <p>Two things must both hold, and they pull in opposite directions. The
+     * hierarchy is NOT deleted — that was the unbounded veto, and the other two
+     * members' edges must still resolve. And the composing edge is NOT published as
+     * a resolved transition: a composed node's relationship to the current state is
+     * containment, and succession was never established. It is recorded as
+     * unresolved, with the reason in its note and a diagnostic counting it — the
+     * record-everything invariant applied to precisely the case the bound admits.
+     */
+    @Test
+    void aLoneNestedProductionIsDowngradedPerEdgeNotVetoed() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/retrystate"));
+        StateMachine m = named(r, "Frame");
+
+        assertEquals(Set.of("Plain", "Boxed", "Torn"), stateIds(m));
+        assertEquals(3, m.transitions().size());
+        assertEquals(1, m.unresolvedTransitionCount(), "exactly the composing edge");
+        assertTrue(hasResolved(m, "Boxed", "Torn"), "the other members are unaffected");
+        assertTrue(hasResolved(m, "Torn", "Torn"));
+
+        Transition composed = m.transitions().stream()
+                .filter(t -> !t.isResolved()).findFirst().orElseThrow();
+        assertEquals("Plain", composed.from(),
+                "the source state is known; it is the TARGET that is not a successor");
+        assertNotNull(composed.note());
+        assertTrue(composed.note().contains("composes a hierarchy value"),
+                "the note must say why, not merely that it is unresolved: " + composed.note());
+        assertTrue(r.diagnostics().stream().anyMatch(d -> d.where().equals("retrystate.Frame")
+                        && d.message().contains("NEST a hierarchy value")),
+                "a downgraded production is counted, not silently absorbed");
+    }
+
+    /**
+     * The corpus-scale control: bounding a precision guard may only ADD machines.
+     * The three fixtures the veto exists for are rejected by three different code
+     * paths — {@code treebuilder} by {@code composesItself} (and again by the
+     * switch form, via {@code CentralRewriter}), {@code nestedroots.Node} by the
+     * two-members threshold, {@code chaindispatch.Tree} by the chain form — so a
+     * bound applied in one place and not the others would show up here.
+     */
+    @Test
+    void boundingTheVetoDoesNotAcceptAnyKnownRecursiveDataType() {
+        assertTrue(new Analyzer().analyze(modelOf("examples/treebuilder")).isEmpty(),
+                "treebuilder: two self-composing productions, on the carrier path");
+
+        ExtractionResult nested = new Analyzer().analyze(modelOf("examples/nestedroots"));
+        assertTrue(nested.machines().stream().noneMatch(m -> m.name().equals("Node")));
+        assertTrue(nested.machines().stream().noneMatch(m -> m.name().equals("Branch")),
+                "a vetoed root must still release nothing");
+
+        ExtractionResult chain = new Analyzer().analyze(modelOf("examples/chaindispatch"));
+        assertTrue(chain.machines().stream().noneMatch(m -> m.name().equals("Tree")),
+                "the instanceof spelling of the same rewrite");
+        assertEquals(2, chain.machines().size(), "and the two real machines are untouched");
+    }
 }

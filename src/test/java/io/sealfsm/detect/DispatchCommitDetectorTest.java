@@ -227,6 +227,33 @@ class DispatchCommitDetectorTest {
                 "examples.cancellation.CancellationRequests$CancellationState"));
     }
 
+    // ---- F20: the nesting rejection is bounded ------------------------------
+
+    @Test
+    void armsThatCarryTheMatchedStateAreNotComposition() {
+        // `case Fresh f -> new Waiting(f, 1)` hands the successor the binding the
+        // arm just matched — the centralized spelling of `new Retrying(this, ...)`.
+        // `case Waiting w -> ... new Waiting(w, w.misses() + 1)` adds the receiver
+        // case: `w.misses()` is an int, and only the RECEIVER is a hierarchy value.
+        // Both read as composition before F20, and the whole producer was
+        // discarded over them.
+        List<Producer> ps = producers("examples/retrystate", "retrystate.Poll");
+        assertEquals(1, ps.size(), "the dispatch must survive the nesting check");
+        assertEquals(Set.of(CommitForm.FIELD_MUTATION), commits(ps));
+        assertEquals("handle", ps.get(0).host().getSimpleName());
+    }
+
+    @Test
+    void aFoldRebuildingTheArmItMatchedIsStillRejected() {
+        // The other half of the pair, and structurally the same switch: one arm per
+        // permitted subtype, each producing a hierarchy value, committed by return
+        // from a hierarchy-returning method. `case Neg n -> new Neg(fold(n.operand()))`
+        // differs from `case Fresh f -> new Waiting(f, 1)` in one respect — it
+        // descends into a PART of the matched value instead of carrying it whole —
+        // and that alone must decide rejection.
+        assertEquals(List.of(), producers("examples/treebuilder", "treebuilder.Expr"));
+    }
+
     @Test
     void aSwitchOverTheEventTypeIsNotAStateDispatch() {
         // `switch (event)` nested inside a state arm selects an input, not a

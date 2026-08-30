@@ -8,6 +8,7 @@ import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtType;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -124,7 +125,7 @@ class CarrierTransitionDetectorTest {
     }
 
     @Test
-    void oneNestedProductionVetoesTheWholeHierarchy() {
+    void aPeerShapedMemberDoesNotRescueACompositionalHierarchy() {
         // `Lit.simplify()` is peer-shaped in isolation (`Rewrite.unchanged(this)`),
         // so the veto must be a property of the hierarchy, not of each method:
         // otherwise a tree builder with one leaf case would be half-accepted.
@@ -135,6 +136,104 @@ class CarrierTransitionDetectorTest {
                 "a compositional hierarchy must be detected as such");
         assertFalse(CarrierTransitionDetector.qualifies(root),
                 "a recursive tree builder is not a state machine");
+    }
+
+    // ---- F20: the veto is bounded, and carrying the state is not nesting ----
+
+    @Test
+    void carryingTheCurrentStateIsNotComposition() {
+        // `new Retrying(this, 1)` and `new Exhausted(this)`: the successor is
+        // handed the state it replaces. Structural recursion descends into an
+        // argument's PARTS and so never passes the argument whole, so this is a
+        // predecessor pointer, not a tree. Every producer here was NESTED before
+        // F20 and the entire hierarchy was vetoed on it.
+        CtType<?> root = type(modelOf("examples/retrystate"), "retrystate.Attempt");
+
+        assertEquals(Shape.PEER, shapeOf(root, "retrystate.Ready", "on"));
+        assertEquals(Shape.PEER, shapeOf(root, "retrystate.Retrying", "on"));
+        assertEquals(Shape.PEER, shapeOf(root, "retrystate.Exhausted", "on"));
+        assertEquals(List.of(), CarrierTransitionDetector.nestedProductions(root),
+                "no production in a retry machine nests a hierarchy value");
+        assertFalse(CarrierTransitionDetector.composesItself(root));
+    }
+
+    @Test
+    void oneSelfComposingProductionVetoesOnItsOwn() {
+        // The bound's other direction, and the load-bearing control: `permits Base,
+        // Stack` is a tree with exactly ONE recursive member, so "two productions
+        // across two members" alone would accept it. `new Stack(under.flatten(),
+        // depth)` reads a PART of the current state and reassembles a node around
+        // it — structural recursion by definition, sufficient without corroboration.
+        CtType<?> root = type(modelOf("examples/retrystate"), "retrystate.Layer");
+
+        List<CarrierTransitionDetector.NestedProduction> nested =
+                CarrierTransitionDetector.nestedProductions(root);
+        assertEquals(1, nested.size(), "the count threshold alone would not fire here");
+        assertTrue(nested.get(0).selfComposing(),
+                "rebuilding a node out of its own parts is what makes one production enough");
+        assertTrue(CarrierTransitionDetector.composesItself(root));
+
+        // The control bites only if something WOULD otherwise accept it.
+        assertFalse(StateMachineClassifier.findDistributedTransitionMethods(root).isEmpty(),
+                "if no recognizer claimed Layer, this control would assert nothing");
+    }
+
+    @Test
+    void aLoneForeignNestedProductionIsEvidenceNotAVerdict() {
+        // `Plain.wrap(Frame other) -> new Boxed(other)`: nested, but `other` is
+        // neither the current state nor a part of it, so it is not structural
+        // recursion. One such production on one member is a fact about one
+        // expression; condemning the type on it is the unbounded veto. The edge is
+        // downgraded per-edge instead — asserted in the integration test.
+        CtType<?> root = type(modelOf("examples/retrystate"), "retrystate.Frame");
+
+        List<CarrierTransitionDetector.NestedProduction> nested =
+                CarrierTransitionDetector.nestedProductions(root);
+        assertEquals(1, nested.size());
+        assertFalse(nested.get(0).selfComposing(),
+                "a foreign hierarchy value is not a part of the current state");
+        assertFalse(CarrierTransitionDetector.composesItself(root),
+                "one non-self-composing production must not veto the hierarchy");
+    }
+
+    @Test
+    void theTwoVetoRulesStaySeparatelyAttributable() {
+        // `treebuilder` is caught by BOTH rules, and the redundancy is only useful
+        // if it stays visible: `Neg.simplify` rebuilds a Neg out of `this.operand`
+        // (self-composing, enough alone), while `Add.simplify` builds from LOCALS
+        // and is not. If Add ever became self-composing, or Neg stopped being so,
+        // the fixture would still pass while testing one rule twice.
+        CtType<?> root = type(modelOf("examples/treebuilder"), "treebuilder.Expr");
+
+        Map<String, Boolean> byMember = CarrierTransitionDetector.nestedProductions(root).stream()
+                .collect(java.util.stream.Collectors.toMap(
+                        CarrierTransitionDetector.NestedProduction::member,
+                        CarrierTransitionDetector.NestedProduction::selfComposing));
+        assertEquals(Boolean.TRUE, byMember.get("treebuilder.Neg"),
+                "`operand` is a field of Neg — a PART of the current state");
+        assertEquals(Boolean.FALSE, byMember.get("treebuilder.Add"),
+                "`l.result()`/`r.result()` come from locals, so only the count rule fires");
+    }
+
+    @Test
+    void twoForeignNestedProductionsAcrossTwoMembersStillVeto() {
+        // `nestedroots.Node` is the shape the threshold exists for: neither
+        // `Pair.replaceChild -> new Wrap(child)` nor `Wrap.replaceChild -> new
+        // Pair(child, child)` is self-composing on its own (each builds the OTHER
+        // member around a parameter), so only the corroboration rule can reject it.
+        // If this ever became self-composing the threshold would stop being tested.
+        CtType<?> root = type(modelOf("examples/nestedroots"), "nestedroots.Node");
+
+        List<CarrierTransitionDetector.NestedProduction> nested =
+                CarrierTransitionDetector.nestedProductions(root);
+        assertEquals(2, nested.size());
+        assertTrue(nested.stream().noneMatch(
+                        CarrierTransitionDetector.NestedProduction::selfComposing),
+                "this control tests the count, so nothing here may be self-composing");
+        assertEquals(2, nested.stream()
+                        .map(CarrierTransitionDetector.NestedProduction::member).distinct().count(),
+                "two members, which is what the threshold asks for");
+        assertTrue(CarrierTransitionDetector.composesItself(root));
     }
 
     @Test

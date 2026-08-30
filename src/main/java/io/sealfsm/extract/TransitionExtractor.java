@@ -145,6 +145,14 @@ public final class TransitionExtractor {
     // reported as a diagnostic rather than letting them vanish unremarked.
     private int nonReturningCalls = 0;
 
+    // F20: produced values that nest a hierarchy value inside another one. The
+    // hierarchy survived the (now bounded) compositional veto, so this expression
+    // is a local observation, not a verdict about the type — and a composed node
+    // is not a successor, so its target is not claimed. Recorded as an unresolved
+    // edge and counted, which is what keeps "bounded veto" from meaning "the
+    // remaining nesting is silently reported as a transition".
+    private int nestedProductions = 0;
+
     // F18: the `return` statements the inter-procedural fold currently in progress
     // has ACCOUNTED FOR — either walked through to a producer, or proven unable to
     // execute in the caller's context. Non-null only while a callee body is being
@@ -368,6 +376,12 @@ public final class TransitionExtractor {
             diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
                     + "(always throws or diverges) contributed no transition — the arms holding "
                     + "them are undefined inputs, not unresolved targets");
+        }
+        if (nestedProductions > 0) {
+            diagnostics.add(nestedProductions + " produced value(s) NEST a hierarchy value inside "
+                    + "another (composition, not succession); each is recorded as an unresolved "
+                    + "transition. Too few, and on too few members, to veto the hierarchy — "
+                    + "review whether this is a recursive data type");
         }
         Set<String> nameOnly = new LinkedHashSet<>(nameOnlyReassignmentChecks);
         nameOnly.addAll(resolver.nameOnlyReassignmentChecks());
@@ -2080,6 +2094,22 @@ public final class TransitionExtractor {
         // can, otherwise fall through and record it unresolved as before.
         if (value instanceof CtInvocation<?> inv
                 && resolveInterprocedural(inv, from, event, guard, out)) {
+            return;
+        }
+        // F20: this value COMPOSES a hierarchy value — it builds a node around
+        // another one rather than naming a peer of the current state. The
+        // compositional veto is bounded now, so such an expression can survive
+        // into an accepted machine; it must not then be published as a resolved
+        // successor, because the constructed node's relationship to the current
+        // state is containment, not succession. The alternative to recording it
+        // here is the old behaviour, where one such expression deleted the whole
+        // hierarchy. Carrying the current state is NOT this case: `new
+        // Retrying(this, n + 1)` is a successor that remembers its predecessor,
+        // and the predicate excludes it.
+        if (CarrierTransitionDetector.nestsHierarchyValue(value, hierarchyQualifiedNames)) {
+            nestedProductions++;
+            out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
+                    safeText(value) + " [composes a hierarchy value; not a successor]"), event));
             return;
         }
         for (TransitionResolver.Candidate cand : resolver.resolve(value, from)) {

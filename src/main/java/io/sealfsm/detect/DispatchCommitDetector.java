@@ -448,18 +448,21 @@ public final class DispatchCommitDetector {
      * by exactly the predicate that vetoes it written with {@code switch}.
      */
     private static boolean chainNestsHierarchyValue(TypeChain chain, Set<String> hierarchy) {
+        int nestedBranches = 0;
         for (CtStatement branch : chainBranches(chain)) {
+            boolean nested = false;
             for (CtReturn<?> r : branch.getElements(new TypeFilter<>(CtReturn.class))) {
-                if (producesNested(r.getReturnedExpression(), hierarchy)) return true;
+                if (composesFromOwnParts(r.getReturnedExpression(), hierarchy)) return true;
+                nested |= producesNested(r.getReturnedExpression(), hierarchy);
             }
             for (CtAssignment<?, ?> asg : branch.getElements(new TypeFilter<>(CtAssignment.class))) {
-                if (commitOfTarget(asg.getAssigned(), hierarchy) != null
-                        && producesNested(asg.getAssignment(), hierarchy)) {
-                    return true;
-                }
+                if (commitOfTarget(asg.getAssigned(), hierarchy) == null) continue;
+                if (composesFromOwnParts(asg.getAssignment(), hierarchy)) return true;
+                nested |= producesNested(asg.getAssignment(), hierarchy);
             }
+            if (nested) nestedBranches++;
         }
-        return false;
+        return nestedBranches >= 2;
     }
 
     /**
@@ -591,19 +594,34 @@ public final class DispatchCommitDetector {
     }
 
     /**
-     * Does any arm produce a hierarchy value <em>nested inside</em> another one?
+     * Does this dispatch build a recursive data type rather than succeed a state?
      * {@code case Add(var l, var r) -> new Add(simplify(l), simplify(r))} builds a
      * bigger H out of smaller ones — a tree rewrite whose "next" is a child, not a
      * successor. Only the arms' produced values are inspected, one level deep,
      * matching the carrier detector's bound exactly.
+     *
+     * <p>F20: the rejection is BOUNDED on the same terms as
+     * {@link CarrierTransitionDetector#composesItself}, and by the same predicates,
+     * so a rewrite is judged identically whichever idiom spells it. One
+     * <em>self-composing</em> arm — one that rebuilds a node out of the value it
+     * matched — is a fold on its own and sinks the dispatch; anything else needs
+     * two nested arms before the whole producer is discarded. Discarding a producer
+     * costs the hierarchy its only transition function, so a single nested
+     * expression must not be able to do it: the extractor downgrades that
+     * expression to one unresolved edge instead.
      */
     private static boolean nestsHierarchyValue(CtAbstractSwitch<?> sw, Set<String> hierarchy) {
+        int nestedArms = 0;
         for (CtCase<?> c : sw.getCases()) {
+            boolean nested = false;
             for (CtStatement st : c.getStatements()) {
-                if (producesNested(armValue(st), hierarchy)) return true;
+                CtExpression<?> v = armValue(st);
+                if (composesFromOwnParts(v, hierarchy)) return true;
+                nested |= producesNested(v, hierarchy);
             }
+            if (nested) nestedArms++;
         }
-        return false;
+        return nestedArms >= 2;
     }
 
     /** The value an arm produces: an arrow expression, or a {@code yield}/{@code return}. */
@@ -620,6 +638,16 @@ public final class DispatchCommitDetector {
                     || producesNested(cond.getElseExpression(), hierarchy);
         }
         return CarrierTransitionDetector.nestsHierarchyValue(value, hierarchy);
+    }
+
+    /** {@link CarrierTransitionDetector#composesFromOwnParts}, through a ternary. */
+    private static boolean composesFromOwnParts(CtExpression<?> value, Set<String> hierarchy) {
+        if (value == null) return false;
+        if (value instanceof CtConditional<?> cond) {
+            return composesFromOwnParts(cond.getThenExpression(), hierarchy)
+                    || composesFromOwnParts(cond.getElseExpression(), hierarchy);
+        }
+        return CarrierTransitionDetector.composesFromOwnParts(value, hierarchy);
     }
 
     /**
