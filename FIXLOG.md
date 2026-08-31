@@ -597,3 +597,73 @@ than done untested.
   (which recognizer produced its site), not by reading it off a report. Exposing
   the locus is a reporting change worth making if the validation chapter wants to
   stratify by it; the mapping already exists as `DispatchLocus.encoding()`.
+
+---
+
+## F24 — a correction to this branch's headline result
+
+**The 111/111 reported for `examples/lcp_automation_chatgpt` in the Stage 3a
+entry above was wrong. 109 of those 111 edges were fabricated.** The entry is
+left standing rather than rewritten, because the sequence is the finding.
+
+### How it surfaced
+
+Rendering the two LCP outputs side by side. `lcp_automation` draws a connected
+automaton; `lcp_automation_chatgpt` drew **ten isolated nodes**, each with a pile
+of self-loops and almost nothing joining them. A relation that is 109/111
+self-loops is not a state machine, and `Initial --UP--> Initial` contradicts RFC
+1661 §4.1 outright (Initial + Up = Closed). The score said 111/111; the picture
+said the score was meaningless.
+
+### Diagnosis, by ablation rather than by reading the fixture
+
+| ablation | `lcp_automation` | `lcp_automation_chatgpt` | conclusion |
+|---|---|---|---|
+| disable rule 4 entirely | — | 111/111 → **2/111** | all 109 rest on rule 4 |
+| unresolvable declaration no longer a selector | 113/113 | 111/111 | not a binding failure |
+| require a unique root-typed parameter | 113/113 | 111/111 | not the arity case |
+| suppress rule 4 inside any fold | **113/113** | **2/111** | the fold is where it fires — and `lcp_automation` does not need it there |
+| map arguments → parameters (the fix) | **113/113** | **2/111** | the callee parameter never received the matched state |
+
+The fourth and fifth rows together are what make this a fix rather than a trade:
+`lcp_automation` recovers the same RFC through the same fold and is
+**unaffected**, so the restriction removes fabrications without touching a
+legitimate folded self-loop.
+
+### The fix
+
+`TransitionExtractor.selectorParamsOf` maps the call's arguments onto the
+callee's parameters positionally and keeps those the caller demonstrably handed
+the current state, decided by **`CompositionVeto.isCurrentState`** — the shared
+predicate for the three ways a walk knows the from-state, asked rather than
+restated. `TransitionResolver.foldSelectors` carries that set for the duration of
+the fold; rule 4 applies to a callee **parameter** only when it is in the set. A
+pattern binding inside the callee is exempt — it is the discriminated value of
+the switch that bound it.
+
+### Measured
+
+Corpus: **one fixture changed**, `lcp_automation_chatgpt`, 111/111 → **2/111**.
+All 39 others byte-identical, including every fixture that folds
+(`lcp_automation` 113/113, `hiddenreturns` 8/9, `nonreturning` 4/6,
+`dhcp-client-*`, `http2-stream-*`). Two regression tests, deliberately a pair:
+one asserts no resolved self-loop survives in the chatgpt fixture, the other that
+`lcp_automation`'s real stay-put cells do — so the fix cannot decay into a
+blanket suppression.
+
+### What this changes about the Stage 3a claim
+
+3a's **recognition** gain stands: a hierarchy reported as "not a state machine"
+is now extracted, with 10 exact states and 111 recorded cells. Its **recall** is
+2/111, not 111/111. The corpus does **not** contain "one specification recovered
+twice under two commit forms"; it contains one specification whose two
+implementations recover at 113/113 and 2/111, and that gap is itself the result:
+a per-state helper handed the matched state folds completely, one reached with
+the state passed some other way does not.
+
+### The half still open
+
+At a **top-level dispatch** `isSelectorBinding` still accepts any root-typed
+parameter, so `H step(H current, H fallback, E e)` returning `fallback` remains a
+fabricated self-loop. Same shape of fix — compare against the selector the walk
+is holding — and no corpus fixture now exercises it.

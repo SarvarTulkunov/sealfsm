@@ -126,6 +126,69 @@ class ExtractionIntegrationTest {
         assertEquals(2, m.resolvedTransitionCount());
     }
 
+    // ---- F24: rule 4 may not fire on a folded callee's parameter -------------
+
+    /**
+     * A root-typed parameter inside a FOLDED callee is not provably the current
+     * state, and must not resolve as a self-loop.
+     *
+     * <p>Rule 4 in {@code TransitionResolver} reads "a root-typed selector means
+     * stay in the matched state", and its premise is that the variable IS the
+     * discriminated value. At a dispatch that is established. Inside a folded
+     * callee it is not, because nothing had ever mapped the call's arguments onto
+     * the callee's parameters — so a parameter holding a fallback, a default, or
+     * any other state the caller chose to pass was stamped "proven self-loop".
+     *
+     * <p>{@code examples/lcp_automation_chatgpt} is the two-root-typed-parameter
+     * fixture this codebase was missing, and it is emphatic: <b>109 of its 111
+     * edges</b> were fabricated self-loops, including {@code Initial --UP-->
+     * Initial} where RFC 1661 §4.1 says {@code Closed}. Every state looked
+     * isolated in the rendered diagram, because almost nothing connected them.
+     *
+     * <p>The two survivors are the real edges — the cells whose successor is
+     * written as a construction — and everything else is now an explicit
+     * unresolved edge. 2/111 is a poor recall figure and an honest one; 111/111
+     * was neither.
+     */
+    @Test
+    void aFoldedCalleesParameterIsNotAssumedToBeTheCurrentState() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/lcp_automation_chatgpt"));
+        StateMachine m = single(r);
+        assertEquals(10, m.allStates().size(), "state enumeration is exact regardless");
+        assertEquals(111, m.transitions().size(), "every cell is still RECORDED");
+        assertEquals(2, m.resolvedTransitionCount(),
+                "only the two constructed successors are proven; the rest are gaps");
+
+        assertTrue(hasEventEdge(m, "ReqSent", "TO_MINUS", "Stopped"));
+        assertTrue(hasEventEdge(m, "AckSent", "TO_MINUS", "Stopped"));
+
+        // The sharp assertion: no state may claim a RESOLVED self-loop here. Each
+        // one would be an edge the analysis cannot prove, and RFC 1661 contradicts
+        // them outright.
+        assertTrue(m.transitions().stream()
+                        .noneMatch(t -> t.isResolved() && t.from().equals(t.to())),
+                "a fabricated self-loop is the one failure mode the invariant forbids");
+    }
+
+    /**
+     * The control that keeps the fix from being a blanket suppression: the SAME
+     * RFC, recovered through the same inter-procedural fold, must be unaffected.
+     * Its folded helpers receive the matched state, so reading it back out is a
+     * genuine self-loop and rule 4 still applies.
+     */
+    @Test
+    void theSameRfcRecoveredThroughValueReturnIsUnaffected() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/lcp_automation"));
+        StateMachine m = single(r);
+        assertEquals(10, m.allStates().size());
+        assertEquals(113, m.transitions().size());
+        assertEquals(113, m.resolvedTransitionCount(),
+                "the parameter-mapping restriction costs this machine nothing");
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> t.isResolved() && t.from().equals(t.to())),
+                "its stay-put cells are real self-loops and must survive");
+    }
+
     private StateMachine single(ExtractionResult r) {
         assertEquals(1, r.machines().size(), "expected exactly one machine");
         return r.machines().get(0);

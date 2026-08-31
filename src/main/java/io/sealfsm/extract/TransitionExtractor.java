@@ -5,6 +5,7 @@ import io.sealfsm.detect.DispatchCommitDetector;
 import io.sealfsm.detect.dispatch.CasePatterns;
 import io.sealfsm.detect.dispatch.Commit;
 import io.sealfsm.detect.dispatch.CommitClassifier;
+import io.sealfsm.detect.dispatch.CompositionVeto;
 import io.sealfsm.detect.dispatch.MutatorRecognizer;
 import io.sealfsm.detect.dispatch.DispatchFinder;
 import io.sealfsm.detect.dispatch.DispatchLocus;
@@ -1819,7 +1820,13 @@ public final class TransitionExtractor {
             // ("the current state") becomes a self-loop to the caller's from-state
             // exactly as in a direct transition method, and a returned call
             // recurses under the depth budget.
-            walk(callee.getBody(), from, event, guard, out);
+            Set<CtVariable<?>> savedSelectors = resolver.foldSelectors();
+            resolver.setFoldSelectors(selectorParamsOf(inv, callee));
+            try {
+                walk(callee.getBody(), from, event, guard, out);
+            } finally {
+                resolver.setFoldSelectors(savedSelectors);
+            }
         } finally {
             interProcStack.pop();
             accountedReturns = enclosing;
@@ -1859,6 +1866,39 @@ public final class TransitionExtractor {
      * cannot be read the return is kept, so an unwalked one is reported rather
      * than assumed away.
      */
+    /**
+     * The callee parameters that provably received the CURRENT STATE at this call.
+     *
+     * <p>Positional, and matched with {@link CompositionVeto#isCurrentState} — the
+     * shared predicate for the three ways a walk knows the from-state: bare
+     * {@code this}, the dispatch selector, and the type-pattern binding of the arm
+     * or chain link that matched. Asking that predicate rather than restating it
+     * is the standing rule here; a second notion of "the current state" would
+     * disagree with the veto's, and the disagreement would be an edge.
+     *
+     * <p>What this buys is stated at {@link TransitionResolver#foldSelectors}: rule
+     * 4's premise holds for a callee parameter only when the caller actually
+     * handed it the matched state. {@code fromInitial(i, event)} passes the arm's
+     * binding, so reading that parameter back out IS a self-loop;
+     * {@code lookup(state, fallback, event)} passes something else as well, and
+     * reading THAT back out is not.
+     *
+     * <p>An identity set, for the F13 reason: Spoon gives {@code CtElement} deep
+     * structural equality, so two distinct helpers' identically-spelled parameters
+     * compare equal and one would stand in for the other.
+     */
+    private Set<CtVariable<?>> selectorParamsOf(CtInvocation<?> inv, CtMethod<?> callee) {
+        Set<CtVariable<?>> out = Collections.newSetFromMap(new IdentityHashMap<>());
+        List<CtExpression<?>> args = inv.getArguments();
+        List<CtParameter<?>> params = callee.getParameters();
+        for (int i = 0; i < Math.min(args.size(), params.size()); i++) {
+            if (CompositionVeto.isCurrentState(args.get(i))) {
+                out.add(params.get(i));
+            }
+        }
+        return out;
+    }
+
     private static List<CtReturn<?>> ownedReturns(CtMethod<?> callee) {
         List<CtReturn<?>> owned = new ArrayList<>();
         for (CtReturn<?> r : callee.getBody().getElements(new TypeFilter<>(CtReturn.class))) {

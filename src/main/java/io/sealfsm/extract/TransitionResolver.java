@@ -15,6 +15,7 @@ import spoon.reflect.declaration.CtElement;
 import spoon.reflect.declaration.CtEnum;
 import spoon.reflect.declaration.CtEnumValue;
 import spoon.reflect.declaration.CtField;
+import spoon.reflect.declaration.CtParameter;
 import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtVariable;
@@ -108,6 +109,51 @@ public final class TransitionResolver {
     /** Names whose reassignment status rested on a name match; see the field. */
     Set<String> nameOnlyReassignmentChecks() {
         return nameOnlyReassignmentChecks;
+    }
+
+    /**
+     * While walking a FOLDED callee body: the callee parameters that provably
+     * received the caller's current state. {@code null} outside any fold.
+     *
+     * <p>Rule 4 below reads "a root-typed selector means stay in the matched
+     * state", and its premise is that the variable IS the discriminated value. At
+     * a dispatch that is established — the parameter or binding is what the switch
+     * or chain tested. Inside a folded callee it is <em>not</em>: the analysis has
+     * never mapped the call's arguments onto the callee's parameters, so a
+     * root-typed parameter there might be the current state, a fallback, a default
+     * or anything else the caller chose to pass. Applying rule 4 to it stamps
+     * "proven self-loop" on a value nothing established, which is a fabricated
+     * RESOLVED edge — the one failure mode the soundness invariant forbids
+     * outright.
+     *
+     * <p>{@code examples/lcp_automation_chatgpt} is what found it, and it is the
+     * two-root-typed-parameter fixture this codebase had been missing: 109 of its
+     * 111 edges were self-loops resolved this way, including {@code Initial --UP-->
+     * Initial} where RFC 1661 §4.1 says {@code Closed}. Restricted to parameters:
+     * a pattern binding inside the callee IS the discriminated value of the switch
+     * that bound it, and needs no help from the caller.
+     */
+    private Set<CtVariable<?>> foldSelectors;
+
+    /** Set by the extractor around a folded callee body; {@code null} to clear. */
+    void setFoldSelectors(Set<CtVariable<?>> selectors) {
+        this.foldSelectors = selectors;
+    }
+
+    Set<CtVariable<?>> foldSelectors() {
+        return foldSelectors;
+    }
+
+    /**
+     * Is this declaration usable as "the current state" here? Always, outside a
+     * fold. Inside one, a PARAMETER must be one the caller demonstrably handed the
+     * current state to; anything else rule 4 already admits (a pattern binding) is
+     * discriminated within the callee itself.
+     */
+    private boolean selectorHoldsCurrentState(CtVariable<?> decl) {
+        if (foldSelectors == null) return true;
+        if (!(decl instanceof CtParameter<?>)) return true;
+        return foldSelectors.contains(decl);
     }
 
     public List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName) {
@@ -283,6 +329,7 @@ public final class TransitionResolver {
             // extractor's reaching-definitions pass.
             if (dq.equals(rootQualifiedName)
                     && fromSimpleName != null
+                    && selectorHoldsCurrentState(decl)
                     && isSelectorBinding(decl)
                     && !isReassigned(vref, nameOnlyReassignmentChecks::add)) {
                 return List.of(Candidate.of(fromSimpleName, guard, SuccessorForm.SELF));
