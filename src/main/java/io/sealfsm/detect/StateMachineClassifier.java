@@ -18,6 +18,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 /**
  * Decides whether a sealed root is a state machine and, if so, how its
@@ -87,10 +89,31 @@ public final class StateMachineClassifier {
     }
 
     public Classification classify(CtType<?> root, CtModel model) {
+        return classify(root, model, line -> { });
+    }
+
+    /**
+     * The same decision, with every predicate it evaluates reported to
+     * {@code trace} as it is evaluated ({@code --explain}).
+     *
+     * <p>A side channel on the real decision procedure, deliberately, rather than
+     * a second procedure that re-derives the same answers for display. This
+     * codebase refuses two notions of one thing everywhere else (one
+     * {@code chainOf}, one commit predicate, one naming) for the standing reason:
+     * the copy drifts, and a report that disagrees with the verdict it explains
+     * is worse than no report. Every line here is emitted from the branch that
+     * actually ran, so the trace cannot say a predicate passed where the
+     * classification says it did not.
+     */
+    public Classification classify(CtType<?> root, CtModel model, Consumer<String> trace) {
         if (hasMarkerAnnotation(root)) {
+            trace.accept("marker annotation (@Fsm/@FSM/@StateMachine): PRESENT "
+                    + "— decisive, accepted");
             return Classification.yes(detectEncoding(root, model),
                     "explicit @Fsm/@StateMachine marker");
         }
+        trace.accept("marker annotation (@Fsm/@FSM/@StateMachine): absent "
+                + "— continuing structurally");
 
         // Precision gate, ahead of every structural signal: a hierarchy whose
         // members are composed into one another is a recursive data type, and a
@@ -99,11 +122,15 @@ public final class StateMachineClassifier {
         // regardless of which recognizer would otherwise have claimed them — a
         // record component of the hierarchy type, for instance, gives such a type
         // an accessor that looks exactly like a per-state transition method.
+        List<CarrierTransitionDetector.NestedProduction> nested =
+                CarrierTransitionDetector.nestedProductions(root);
         if (CarrierTransitionDetector.composesItself(root)) {
+            trace.accept("compositional veto: FIRED — " + describeNesting(nested));
             return Classification.veto(
                     "hierarchy members are composed into one another (a hierarchy value is a "
                             + "construction argument of another) — a recursive data type, not a state machine");
         }
+        trace.accept("compositional veto: not fired — " + describeNesting(nested));
 
         List<CtMethod<?>> distributed = findDistributedTransitionMethods(root);
         List<CtMethod<?>> centralized = findCentralizedTransitionMethods(root, model);
@@ -117,6 +144,17 @@ public final class StateMachineClassifier {
         // widened centralized recognizer; the commit requirement is what keeps
         // exhaustive folds (switch-over-state producing a String) out.
         List<DispatchCommitDetector.Producer> producers = DispatchCommitDetector.find(root, model);
+
+        trace.accept("per-state transition method (declared on a member, returns the hierarchy "
+                + "type): " + verdict(distributed.size()) + describeMethods(distributed));
+        trace.accept("centralized transition function (produces a hierarchy value AND "
+                + "discriminates one): " + verdict(centralized.size())
+                + describeMethods(centralized));
+        trace.accept("functional transition callable (lambda / anonymous-class method with that "
+                + "signature): " + verdict(functional.size()));
+        trace.accept("dispatch with a hierarchy-typed commit (a switch or instanceof chain over "
+                + "the hierarchy whose result is installed as a hierarchy value): "
+                + verdict(producers.size()) + describeProducers(producers));
 
         boolean hasDist = !distributed.isEmpty();
         boolean hasCentral = !centralized.isEmpty() || !functional.isEmpty() || !producers.isEmpty();
@@ -142,15 +180,89 @@ public final class StateMachineClassifier {
         // The result is POLYMORPHIC, not an encoding of its own: dispatch lives in
         // a per-state method either way, and only the *spelling* of the successor
         // differs — which is the orthogonal SuccessorForm axis, recorded per edge.
+        List<CtMethod<?>> carriers = CarrierTransitionDetector.findCarrierTransitionMethods(root);
         if (CarrierTransitionDetector.qualifies(root)) {
+            trace.accept("carrier-based per-state transition (successor handed to a "
+                    + "non-hierarchy wrapper): " + verdict(carriers.size())
+                    + describeMethods(carriers));
             return Classification.yes(Encoding.POLYMORPHIC, carrierReason(root));
         }
+        trace.accept("carrier-based per-state transition (successor handed to a non-hierarchy "
+                + "wrapper): FAILED — " + describeCarrierGap(carriers));
+        trace.accept("no predicate above produced a transition producer: ABSTAINING. Not a "
+                + "verdict about the hierarchy — it may be the event alphabet, or its dispatch "
+                + "may sit somewhere no recognizer can see");
         // Abstention, stated as abstention. The old wording ("looks like a plain
         // sum type") asserted a positive classification the analysis had not made:
         // a sealed type reaches this line just as readily by being the event
         // alphabet Σ, or by being dispatched somewhere the recognizers cannot see.
         return Classification.no(
                 "no transition producer found (may be event/Σ type or unresolved dispatch)");
+    }
+
+    // ---- --explain rendering --------------------------------------------------
+    // Text only. Nothing below is consulted by a decision: each helper describes
+    // evidence a predicate above has already weighed, and none is called from
+    // anywhere but a trace line.
+
+    private static String verdict(int found) {
+        return found == 0 ? "FAILED — none found" : "passed — " + found + " found";
+    }
+
+    private static String describeMethods(List<CtMethod<?>> methods) {
+        if (methods.isEmpty()) return "";
+        String shown = methods.stream().limit(6)
+                .map(m -> (m.getDeclaringType() == null ? "?" : m.getDeclaringType().getSimpleName())
+                        + "#" + m.getSignature())
+                .collect(Collectors.joining(", "));
+        return " [" + shown
+                + (methods.size() > 6 ? ", … " + (methods.size() - 6) + " more]" : "]");
+    }
+
+    private static String describeProducers(List<DispatchCommitDetector.Producer> producers) {
+        if (producers.isEmpty()) return "";
+        Set<String> commits = new LinkedHashSet<>();
+        for (DispatchCommitDetector.Producer p : producers) commits.add(p.commit().name());
+        return " committing via " + String.join("/", commits);
+    }
+
+    private static String describeNesting(List<CarrierTransitionDetector.NestedProduction> nested) {
+        if (nested.isEmpty()) return "no production nests a hierarchy value inside another";
+        Set<String> members = new LinkedHashSet<>();
+        boolean self = false;
+        for (CarrierTransitionDetector.NestedProduction n : nested) {
+            members.add(n.member());
+            self |= n.selfComposing();
+        }
+        return nested.size() + " nested production(s) across " + members.size() + " member(s)"
+                + (self
+                        ? ", at least one SELF-COMPOSING (a part of the current state is rebuilt "
+                                + "into it), which is structural recursion and sufficient alone"
+                        : ", none self-composing; the bound is one self-composing production, or "
+                                + "≥2 nested productions across ≥2 distinct members");
+    }
+
+    /**
+     * Which of the carrier predicate's conjuncts failed. It is one boolean to the
+     * classifier and three questions to a reader, and "carrier methods on exactly
+     * one member" is the difference between "not this idiom at all" and "one
+     * member short of it".
+     */
+    private static String describeCarrierGap(List<CtMethod<?>> carriers) {
+        if (carriers.isEmpty()) {
+            return "no per-state method returns a wrapper carrying a hierarchy value";
+        }
+        Set<String> declaring = new LinkedHashSet<>();
+        for (CtMethod<?> m : carriers) {
+            if (m.getDeclaringType() != null) declaring.add(m.getDeclaringType().getSimpleName());
+        }
+        if (declaring.size() < 2) {
+            return carriers.size() + " carrier method(s), but on only " + declaring.size()
+                    + " permitted subtype " + declaring + " — a dispatch needs at least two";
+        }
+        return carriers.size() + " carrier method(s) on " + declaring + ", but none produces a "
+                + "state OTHER than its own declaring type — every production is a self-loop, "
+                + "which discriminates nothing";
     }
 
     /**

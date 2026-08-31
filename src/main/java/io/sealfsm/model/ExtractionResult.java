@@ -22,8 +22,19 @@ public final class ExtractionResult {
         }
     }
 
+    /**
+     * Why one sealed root was rejected, predicate by predicate ({@code --explain}).
+     *
+     * <p>Not a {@link Diagnostic}: a diagnostic reports something the analysis
+     * found, and is suppressed by {@code --quiet} on that basis. This is the
+     * decision procedure narrating itself on request, so it is carried on its own
+     * channel and printed whenever it was asked for.
+     */
+    public record Explanation(String where, List<String> predicates) { }
+
     private final List<StateMachine> machines = new ArrayList<>();
     private final List<Diagnostic> diagnostics = new ArrayList<>();
+    private final List<Explanation> explanations = new ArrayList<>();
 
     public void addMachine(StateMachine m) { machines.add(m); }
     public void info(String where, String message) {
@@ -33,8 +44,13 @@ public final class ExtractionResult {
         diagnostics.add(new Diagnostic(Severity.WARN, where, message));
     }
 
+    public void explain(String where, List<String> predicates) {
+        explanations.add(new Explanation(where, List.copyOf(predicates)));
+    }
+
     public List<StateMachine> machines()    { return Collections.unmodifiableList(machines); }
     public List<Diagnostic> diagnostics()   { return Collections.unmodifiableList(diagnostics); }
+    public List<Explanation> explanations() { return Collections.unmodifiableList(explanations); }
 
     public boolean isEmpty() { return machines.isEmpty(); }
 }

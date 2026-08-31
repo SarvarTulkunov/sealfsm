@@ -23,7 +23,8 @@ import java.util.stream.Collectors;
  *
  * <pre>
  *   java -jar sealfsm.jar --src path/to/src [--src more/src] \
- *        [--out out-dir] [--format dot|scxml|both] [--quiet]
+ *        [--out out-dir] [--format dot|scxml|both] [--classpath cp] \
+ *        [--quiet] [--explain]
  * </pre>
  */
 public final class Main {
@@ -32,16 +33,21 @@ public final class Main {
 
     public static void main(String[] args) {
         List<String> sources = new ArrayList<>();
+        List<String> classpath = new ArrayList<>();
         Path out = Path.of("out");
         Format format = Format.BOTH;
         boolean quiet = false;
+        boolean explain = false;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--src" -> sources.add(require(args, ++i, "--src"));
                 case "--out" -> out = Path.of(require(args, ++i, "--out"));
                 case "--format" -> format = Format.valueOf(require(args, ++i, "--format").toUpperCase());
+                case "--classpath", "--cp" ->
+                        classpath.addAll(splitClasspath(require(args, ++i, "--classpath")));
                 case "--quiet" -> quiet = true;
+                case "--explain" -> explain = true;
                 case "-h", "--help" -> { printUsage(); return; }
                 default -> { System.err.println("Unknown argument: " + args[i]); printUsage(); System.exit(2); }
             }
@@ -55,12 +61,20 @@ public final class Main {
         Launcher launcher = new Launcher();
         for (String s : sources) launcher.addInputResource(s);
         launcher.getEnvironment().setComplianceLevel(17);
-        launcher.getEnvironment().setNoClasspath(true);   // analyse source without full classpath
+        // noClasspath stays on even WITH --classpath. The two are not alternatives:
+        // it is what lets an incomplete classpath degrade into a guessed qualified
+        // name instead of aborting the build, and no realistic invocation supplies
+        // every transitive dependency. --classpath narrows the set of references
+        // that have to be guessed; the audit reports whatever is left.
+        launcher.getEnvironment().setNoClasspath(true);
+        if (!classpath.isEmpty()) {
+            launcher.getEnvironment().setSourceClasspath(classpath.toArray(new String[0]));
+        }
         launcher.getEnvironment().setCommentEnabled(false);
         launcher.buildModel();
         CtModel model = launcher.getModel();
 
-        ExtractionResult result = new Analyzer().analyze(model);
+        ExtractionResult result = new Analyzer().explaining(explain).analyze(model);
 
         try {
             Files.createDirectories(out);
@@ -110,11 +124,48 @@ public final class Main {
         }
         printUnreadDeclarationNote(result);
         printEncodingRollup(result);
+        printExplanations(result);
         if (!quiet && !result.diagnostics().isEmpty()) {
             System.out.println("-".repeat(72));
             System.out.println("Diagnostics:");
             result.diagnostics().forEach(d -> System.out.println("  " + d));
         }
+    }
+
+    /**
+     * The classifier's reasoning for every root it rejected ({@code --explain}).
+     *
+     * <p>Printed regardless of {@code --quiet} for the same reason the unread-
+     * declaration footnote is: {@code --quiet} suppresses findings ABOUT the run,
+     * and this was explicitly asked for. A rejection otherwise reports only the
+     * predicate that ran last, so a reader cannot tell a hierarchy that failed
+     * one conjunct of one predicate from one that matched no recognizer at all.
+     */
+    private static void printExplanations(ExtractionResult result) {
+        if (result.explanations().isEmpty()) return;
+        System.out.println();
+        System.out.println("-".repeat(112));
+        System.out.println("Why each rejected sealed root was rejected (--explain):");
+        for (ExtractionResult.Explanation e : result.explanations()) {
+            System.out.println();
+            System.out.println("  " + e.where());
+            for (String predicate : e.predicates()) {
+                System.out.println("      - " + predicate);
+            }
+        }
+    }
+
+    /**
+     * Split one {@code --classpath} value on the platform separator, so the flag
+     * takes the shape every other Java tool takes it in ({@code a.jar:b.jar}) and
+     * is also repeatable for callers that would rather pass entries one at a time.
+     */
+    private static List<String> splitClasspath(String value) {
+        List<String> out = new ArrayList<>();
+        for (String part : value.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
+            if (!part.isBlank()) out.add(part.trim());
+        }
+        return out;
     }
 
     /**
@@ -216,7 +267,14 @@ public final class Main {
               --src <path>      Source file or directory to analyse (repeatable, required)
               --out <dir>       Output directory (default: ./out)
               --format <fmt>    dot | scxml | both   (default: both)
+              --classpath <cp>  Classpath for types not in --src, separated by
+                                the platform path separator (repeatable). Fewer
+                                unresolved references means fewer
+                                under-reported edges; analysis stays
+                                noClasspath either way.
               --quiet           Suppress the diagnostics listing
+              --explain         For every REJECTED sealed root, print each
+                                classifier predicate and why it failed
               -h, --help        Show this help
             """);
     }

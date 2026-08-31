@@ -45,6 +45,23 @@ public final class Analyzer {
     private final StateMachineClassifier classifier = new StateMachineClassifier();
     private final StateExtractor stateExtractor = new StateExtractor();
 
+    /**
+     * When set, every REJECTED root carries the classifier's predicate-by-predicate
+     * trace into the result ({@code --explain}).
+     *
+     * <p>Only rejections. An acceptance already names the predicate that carried
+     * it, in the reason text printed for every machine; a rejection names only the
+     * one that ran last, and "no transition producer found" is the same sentence
+     * whether nine predicates were evaluated or one.
+     */
+    private boolean explain;
+
+    /** Fluent so a caller can write {@code new Analyzer().explaining(true)}. */
+    public Analyzer explaining(boolean on) {
+        this.explain = on;
+        return this;
+    }
+
     public ExtractionResult analyze(CtModel model) {
         ExtractionResult result = new ExtractionResult();
 
@@ -79,11 +96,15 @@ public final class Analyzer {
             CtType<?> root = pending.pollFirst();
             if (!claimed.add(root.getQualifiedName())) continue;
 
-            Classification c = classifier.classify(root, model);
+            List<String> trace = explain ? new java.util.ArrayList<>() : null;
+            Classification c = trace == null
+                    ? classifier.classify(root, model)
+                    : classifier.classify(root, model, trace::add);
             if (!c.isStateMachine()) {
                 result.info(root.getQualifiedName(),
                         "skipped — " + c.reason() + reoffer(root, c, pending, claimed));
                 reportResolution(root, result, resolution, true);
+                if (trace != null) result.explain(root.getQualifiedName(), trace);
                 continue;
             }
             reportResolution(root, result, resolution, false);
