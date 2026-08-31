@@ -2,6 +2,10 @@ package io.sealfsm.extract;
 
 import io.sealfsm.detect.CarrierTransitionDetector;
 import io.sealfsm.detect.DispatchCommitDetector;
+import io.sealfsm.detect.dispatch.CasePatterns;
+import io.sealfsm.detect.dispatch.DispatchFinder;
+import io.sealfsm.detect.dispatch.DispatchLocus;
+import io.sealfsm.detect.dispatch.DispatchSite;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.model.CommitForm;
@@ -123,7 +127,45 @@ public final class TransitionExtractor {
     // F2: mutation-encoding context, populated only while the GoF/mutation
     // fallback runs (a hierarchy with no return-based transition method). Left
     // empty for distributed/centralized extraction, so those paths are unchanged.
-    private boolean mutationMode = false;
+    /**
+     * The site the walker is currently inside, or {@code null} between sites.
+     *
+     * <p>This replaces the two hand-set booleans {@code carrierMode} and
+     * {@code mutationMode}. They were <em>modes on the walker</em>: a caller set
+     * one, walked, and cleared it in a {@code finally}, and every predicate that
+     * consulted them was really asking "which recognizer am I running for?".
+     * That question has an answer now — the site — and asking the site instead
+     * means the two can never be set for a body they do not describe, or left set
+     * across one.
+     */
+    private WalkSite walkSite;
+
+    /**
+     * What the walker is inside: which discovery route produced the site, where
+     * its dispatch lives, and how it installs a successor.
+     *
+     * <p>{@code route} is not redundant with {@code locus}. The F2 mutation
+     * fallback has no locus at all — it is not a discrimination but a scan of the
+     * methods that write the state field — and it is precisely the route, not the
+     * commit form, that licenses reading a state-field write as a produced
+     * successor. A {@code FIELD_MUTATION} commit found at a real dispatch is
+     * already claimed by that dispatch's own walk.
+     */
+    private record WalkSite(Route route, DispatchLocus locus, CommitForm commit) { }
+
+    /** How a walked body was discovered. */
+    private enum Route { OVERRIDE, CARRIER, CENTRALIZED_METHOD, COMMIT_DISPATCH, FUNCTIONAL,
+                         MUTATION_FALLBACK }
+
+    /** Is the walker inside a carrier-encoded body? The old {@code carrierMode}. */
+    private boolean inCarrier() {
+        return walkSite != null && walkSite.route() == Route.CARRIER;
+    }
+
+    /** Is the walker inside the F2 mutation fallback? The old {@code mutationMode}. */
+    private boolean inMutationFallback() {
+        return walkSite != null && walkSite.route() == Route.MUTATION_FALLBACK;
+    }
     private Set<String> stateFieldNames = Set.of();
     // F22: the recognised state mutators, keyed on `declaringType#signature` — the
     // same key hosts are deduped on elsewhere, so the recognizer and the call
@@ -227,7 +269,7 @@ public final class TransitionExtractor {
     // level into carrier call arguments and inter-procedural folding is disabled —
     // the carrier encoding is analysed strictly intra-procedurally, so a successor
     // computed by a helper is recorded unresolved rather than chased.
-    private boolean carrierMode = false;
+
 
     // True while the walk is inside an else / default / fall-through path. An edge
     // produced there with no event label is the state's default ("otherwise")
@@ -299,10 +341,17 @@ public final class TransitionExtractor {
 
     public List<Transition> extract(CtType<?> root, CtModel model) {
         Set<Transition> out = new LinkedHashSet<>();
-        List<CtMethod<?>> distributed = StateMachineClassifier.findDistributedTransitionMethods(root);
-        List<CtMethod<?>> centralized = StateMachineClassifier.findCentralizedTransitionMethods(root, model);
+
+        // ONE recognition call. Every body this method walks comes from a
+        // DispatchSite, and the site says which locus produced it; the extractor no
+        // longer re-runs four recognizers of its own and no longer has to keep its
+        // notion of "a transition method" in step with the classifier's.
+        DispatchFinder.Sites sites = DispatchFinder.find(root, model);
+        List<CtMethod<?>> distributed = methodHosts(sites.overrides());
+        List<CtMethod<?>> centralized = methodHosts(sites.centralized());
         // F7: transition callables expressed as lambdas / anonymous-class methods.
-        List<CtElement> functional = StateMachineClassifier.findFunctionalTransitionCallables(root, model);
+        List<CtElement> functional = new ArrayList<>();
+        for (DispatchSite site : sites.functional()) functional.add(site.host());
 
         // The concrete states the selector can be, used to seed the functional
         // walk's entry from-set (finding F7).
@@ -334,15 +383,19 @@ public final class TransitionExtractor {
         }
         this.functionalNamesDiscriminate = functionalNames.size() > 1;
 
-        for (CtMethod<?> m : distributed) {
-            if (!helperSignatures.contains(m.getSignature())) extractDistributed(m, out);
+        for (DispatchSite site : sites.overrides()) {
+            CtMethod<?> m = (CtMethod<?>) site.host();
+            if (!helperSignatures.contains(m.getSignature())) {
+                walkAt(site, Route.OVERRIDE, CommitForm.VALUE_RETURN, () -> extractDistributed(m, out));
+            }
         }
         List<DispatchCommitDetector.Producer> producers = DispatchCommitDetector.find(root, model);
         Set<String> producerHosts = new HashSet<>();
         for (DispatchCommitDetector.Producer p : producers) producerHosts.add(methodKey(p.host()));
 
         Set<String> walkedMethods = new HashSet<>();
-        for (CtMethod<?> m : centralized) {
+        for (DispatchSite site : sites.centralized()) {
+            CtMethod<?> m = (CtMethod<?>) site.host();
             if (helperSignatures.contains(m.getSignature())) continue;
             // Which walk owns this host is decided by whether the state is an
             // ARGUMENT of it. A method handed the state computes a successor from it
@@ -362,24 +415,33 @@ public final class TransitionExtractor {
                     && !StateMachineClassifier.takesHierarchyParameter(m, hierarchyQualifiedNames)) {
                 continue;
             }
-            extractCentralized(m, out);
+            walkAt(site, Route.CENTRALIZED_METHOD, CommitForm.VALUE_RETURN,
+                    () -> extractCentralized(m, out));
             walkedMethods.add(methodKey(m));
         }
-        for (CtElement callable : functional) {
-            extractFunctional(callable, out);
+        for (DispatchSite site : sites.functional()) {
+            walkAt(site, Route.FUNCTIONAL, CommitForm.VALUE_RETURN,
+                    () -> extractFunctional(site.host(), out));
         }
         // The widened centralized recognizer: a switch over the hierarchy whose
         // result is committed as a hierarchy value, wherever it is hosted. Hosts
         // the signature-based recognizer already walked are skipped so one body is
         // never walked twice (harmless for the edge set, which is a Set, but it
         // would double-count the inter-procedural fold statistic).
-        for (DispatchCommitDetector.Producer p : producers) {
+        List<DispatchSite> producerSites = sites.producers();
+        for (int i = 0; i < producers.size(); i++) {
+            DispatchCommitDetector.Producer p = producers.get(i);
             if (walkedMethods.contains(methodKey(p.host()))
                     || helperSignatures.contains(p.host().getSignature())) {
                 commitForms.add(p.commit());
                 continue;
             }
-            extractCommitDispatch(p, out);
+            // The site and the producer are the two halves of one dispatch: the
+            // site is the LOCUS, the producer carries the COMMIT the classifier
+            // recognised. They are built from the same scan in the same order, so
+            // index i pairs them; the site is what the walker is told it is inside.
+            DispatchSite site = i < producerSites.size() ? producerSites.get(i) : null;
+            walkAt(site, Route.COMMIT_DISPATCH, p.commit(), () -> extractCommitDispatch(p, out));
         }
         // F8: per-state methods that return a *carrier* wrapping the successor.
         // Run whenever such a method exists, not only when the lists above are
@@ -388,7 +450,10 @@ public final class TransitionExtractor {
         // plain distributed and silently lose every carrier edge. Methods that
         // return the hierarchy type directly are excluded here — the distributed
         // walker above already owns those — so the two paths never share a body.
-        extractPolymorphicCarrier(root, out);
+        for (DispatchSite site : sites.carriers()) {
+            CtMethod<?> m = (CtMethod<?>) site.host();
+            walkAt(site, Route.CARRIER, CommitForm.POLY_CARRIER, () -> extractCarrier(m, out));
+        }
 
         if (distributed.isEmpty() && centralized.isEmpty() && functional.isEmpty() && out.isEmpty()) {
             // F2: GoF / field-mutation encoding. Run only as a fallback when no
@@ -453,6 +518,35 @@ public final class TransitionExtractor {
                     + "on an unrelated local of the same name");
         }
         return new ArrayList<>(out);
+    }
+
+    /**
+     * Walk one site, with the walker told what it is inside for the duration.
+     *
+     * <p>This is where {@code carrierMode} and {@code mutationMode} used to be set
+     * by hand at four different call sites. The difference is not stylistic: a
+     * mode is a claim the caller makes about a body, and nothing checked that the
+     * claim matched the body or that it was cleared afterwards. A site is the body,
+     * so the two cannot come apart, and every predicate that used to ask "which
+     * recognizer am I running for?" now asks the site the same question.
+     */
+    private void walkAt(DispatchSite site, Route route, CommitForm commit, Runnable walk) {
+        WalkSite saved = this.walkSite;
+        this.walkSite = new WalkSite(route, site == null ? null : site.locus(), commit);
+        try {
+            walk.run();
+        } finally {
+            this.walkSite = saved;
+        }
+    }
+
+    /** The named-method hosts of a site list, in site order. */
+    private static List<CtMethod<?>> methodHosts(List<DispatchSite> sites) {
+        List<CtMethod<?>> out = new ArrayList<>();
+        for (DispatchSite site : sites) {
+            if (site.host() instanceof CtMethod<?> m) out.add(m);
+        }
+        return out;
     }
 
     /**
@@ -980,25 +1074,21 @@ public final class TransitionExtractor {
      * helper call is recorded unresolved rather than chased, so the carrier
      * encoding inherits the same soundness invariant as the rest of the tool.
      */
-    private void extractPolymorphicCarrier(CtType<?> root, Set<Transition> out) {
-        carrierMode = true;
+    private void extractCarrier(CtMethod<?> m, Set<Transition> out) {
+        CtType<?> declaring = m.getDeclaringType();
+        if (declaring == null) return;
+        CtTypeReference<?> ret = m.getType();
+        if (ret != null && hierarchyQualifiedNames.contains(ret.getQualifiedName())) {
+            return; // returns the hierarchy type — the distributed walker owns it
+        }
+        commitForms.add(CommitForm.POLY_CARRIER);
+        dispatchedStates.add(stateId(declaring));
+        // Σ and the event-parameter names are per-method, and drive the event
+        // attribution performed by splitEventCondition below.
+        enumerateEventAlphabet(m);
         try {
-            for (CtMethod<?> m : CarrierTransitionDetector.findCarrierTransitionMethods(root)) {
-                CtType<?> declaring = m.getDeclaringType();
-                if (declaring == null) continue;
-                CtTypeReference<?> ret = m.getType();
-                if (ret != null && hierarchyQualifiedNames.contains(ret.getQualifiedName())) {
-                    continue; // returns the hierarchy type — the distributed walker owns it
-                }
-                commitForms.add(CommitForm.POLY_CARRIER);
-                dispatchedStates.add(stateId(declaring));
-                // Σ and the event-parameter names are per-method, and drive the
-                // event attribution performed by splitEventCondition below.
-                enumerateEventAlphabet(m);
-                walkCarrier(m.getBody(), stateId(declaring), null, null, out);
-            }
+            walkCarrier(m.getBody(), stateId(declaring), null, null, out);
         } finally {
-            carrierMode = false;
             eventParamNames = new LinkedHashSet<>();
         }
     }
@@ -1343,8 +1433,9 @@ public final class TransitionExtractor {
                     + "found and one merely NAMED like one is not (F22)");
         }
 
-        mutationMode = true;
         commitForms.add(CommitForm.FIELD_MUTATION);
+        WalkSite saved = this.walkSite;
+        this.walkSite = new WalkSite(Route.MUTATION_FALLBACK, null, CommitForm.FIELD_MUTATION);
         try {
             for (CtMethod<?> m : findMutationMethods(model)) {
                 CtType<?> declaring = m.getDeclaringType();
@@ -1362,7 +1453,7 @@ public final class TransitionExtractor {
                 walk(m.getBody(), from, null, null, out);
             }
         } finally {
-            mutationMode = false;
+            this.walkSite = saved;
         }
     }
 
@@ -1609,7 +1700,7 @@ public final class TransitionExtractor {
      */
     private boolean resolveInterprocedural(CtInvocation<?> inv, String from, String event,
                                            String guard, Set<Transition> out) {
-        if (carrierMode) {
+        if (inCarrier()) {
             // F8 scope boundary: the carrier encoding is analysed strictly
             // intra-procedurally. A successor computed by a helper stays
             // UNRESOLVED — never followed, never guessed.
@@ -1936,13 +2027,13 @@ public final class TransitionExtractor {
             // read back later in the same body, and the reaching-definitions pass
             // (F1) resolves it there — honouring the write as well would report
             // that one successor twice.
-            if ((mutationMode && isStateFieldWrite(asg.getAssigned()))
+            if ((inMutationFallback() && isStateFieldWrite(asg.getAssigned()))
                     || (dispatchCommit == CommitForm.FIELD_MUTATION
                         && DispatchCommitDetector.isCommitTarget(asg.getAssigned(),
                                                                  hierarchyQualifiedNames))) {
                 handleValue(asg.getAssignment(), from, event, guard, out);
             }
-        } else if (node instanceof CtInvocation<?> inv && mutationMode && isMutatorCall(inv)) {
+        } else if (node instanceof CtInvocation<?> inv && inMutationFallback() && isMutatorCall(inv)) {
             // F2: ctx.setState(new Locked()) — the hierarchy-typed argument is the
             // next state (from-state is the enclosing arm / declaring state class).
             for (CtExpression<?> arg : inv.getArguments()) {
@@ -2903,43 +2994,27 @@ public final class TransitionExtractor {
      * this returns what was written, which is what lets a failure be attributed.
      */
     private static CtTypeReference<?> casePatternType(CtCase<?> c) {
-        try {
-            for (CtExpression<?> ce : c.getCaseExpressions()) {
-                CtTypeReference<?> t = patternType(ce);
-                if (t != null) return t;
-            }
-        } catch (Throwable ignored) {
-            // best effort: the caller falls back to the unattributed message
-        }
-        return null;
+        return CasePatterns.patternTypeOf(c);
     }
 
     /**
-     * Pull a type out of a case label that is a type pattern. Spoon represents
-     * these as {@code CtCasePattern} wrapping a {@code CtTypePattern}; the exact
-     * accessor names have shifted across versions, so this is fully reflective
-     * and best-effort.
+     * Pull a type out of a case label that is a type pattern.
+     *
+     * <p>The reflective reading itself lives in {@link CasePatterns}, shared with
+     * the dispatch finder: the recognizer that decides which state an arm matches
+     * and the walker that later attributes an edge to it must not be able to
+     * disagree about what a pattern label says.
      */
     private static CtTypeReference<?> patternType(Object caseExpr) {
-        try {
-            Object pattern = caseExpr;
-            // CtCasePattern -> getPattern()
-            var getPattern = tryMethod(pattern, "getPattern");
-            if (getPattern != null) pattern = getPattern;
-            // CtTypePattern -> getVariable().getType(), or getType()
-            Object variable = tryMethod(pattern, "getVariable");
-            if (variable != null) {
-                Object type = tryMethod(variable, "getType");
-                if (type instanceof CtTypeReference<?> ref) return ref;
-            }
-            Object directType = tryMethod(pattern, "getType");
-            if (directType instanceof CtTypeReference<?> ref) return ref;
-        } catch (Throwable ignored) {
-            // best effort
-        }
-        return null;
+        return CasePatterns.patternType(caseExpr);
     }
 
+    /**
+     * Best-effort reflective call, for the several other Spoon accessors whose
+     * names have shifted across versions. {@link CasePatterns} owns its own copy
+     * for the pattern-label reading it does; this one serves the loop, catch and
+     * resource accessors below.
+     */
     private static Object tryMethod(Object target, String name) {
         if (target == null) return null;
         try {

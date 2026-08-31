@@ -157,3 +157,80 @@ reproducible baseline rather than one of two possible orderings.
 
 `mvn test` — **167/167 green**. `diff -r target/golden-base target/golden-stage1`
 — **empty**.
+
+---
+
+## Stage 2 — the recognizers reimplemented over the new types
+
+`DispatchFinder` is now the **single recognition surface**. Five discovery
+routes, one return type, and not one of them asks what the branches commit:
+
+| route | locus | arms |
+|---|---|---|
+| `overrideSites` | `POLYMORPHIC_OVERRIDE` | one per permitted subtype declaring the method; from-state = the declaring subtype, **exact**, no data flow |
+| `carrierSites` | `POLYMORPHIC_OVERRIDE` | same, for a method returning a carrier — a different commit, not a different dispatch |
+| `centralizedMethodSites` | `CENTRALIZED_SWITCH` | the body as one unattributed arm (the discrimination may be a switch, a chain, or several) |
+| `producerSites` | `CENTRALIZED_SWITCH` / `INSTANCEOF_CHAIN` | one per `CtCase`, or one per chain link plus the residual |
+| `functionalSites` | `FUNCTIONAL_CALLABLE` | the callable body |
+
+`switchSites` is the locus-only half of what `DispatchCommitDetector.find`
+answers as a fused pair, and is what 3a and 3b compose against. Everything it
+excludes is a statement about the LOCUS and never about the commit: a
+discrimination inside a lambda belongs to `FUNCTIONAL_CALLABLE` (one body, one
+walker), one with no enclosing method is an initializer.
+
+**`InstanceofChainFinder` is not a stub, and must not be.** The stage plan has it
+returning empty until 3c, but F17 already landed on `master`: chains are
+recognised, walked, and pinned by `examples/chaindispatch`. Stubbing it would
+have deleted a working capability and four fixtures' worth of edges, which is a
+regression dressed as a refactor. It is `producerSites`, keyed on whether the
+dispatch node is a `CtIf`.
+
+`StateMachineClassifier.classify` and `detectEncoding` now decide over
+`DispatchFinder.Sites`. `centralizedReason` counts distinct `site.hostKey()`
+rather than re-deriving `declaringType#signature` locally.
+
+`TransitionExtractor.extract` obtains sites **once** and iterates them, routing
+each through `walkAt(site, route, commit, walk)`. Two consequences:
+
+* the extractor no longer runs four recognizers of its own, so its notion of "a
+  transition method" cannot drift from the classifier's — they now read the same
+  list;
+* **`carrierMode` and `mutationMode` are gone.** They were modes on the walker:
+  a caller set one, walked, and cleared it in a `finally`, and every predicate
+  reading them was really asking "which recognizer am I running for?". That is
+  now a `WalkSite(route, locus, commit)` set from the site being walked, so the
+  claim and the body cannot come apart and no mode can be left set across a site.
+  `inCarrier()` and `inMutationFallback()` replace the two reads.
+
+`route` is deliberately **not** redundant with `locus`. The F2 mutation fallback
+has no locus at all — it is not a discrimination but a scan of the methods that
+write the state field — and it is the route, not the commit form, that licenses
+reading a state-field write as a produced successor: a `FIELD_MUTATION` commit
+found at a real dispatch is already claimed by that dispatch's own walk.
+
+The reflective type-pattern reading moved to `CasePatterns`, shared by the finder
+and the walker. The recognizer that decides which state an arm matches and the
+walker that attributes an edge to it must not be able to disagree.
+
+### What was NOT done, and why
+
+The plan says "rewrite `TransitionExtractor` to a single entry point that
+iterates sites and arms". The entry point is single and site-driven; the
+**per-locus walk procedures were kept**, and I recommend keeping them.
+
+They are not four spellings of one walk. `walkCarrier` deliberately does *not*
+fold inter-procedurally — that is the carrier scope line, `carrierMode`'s real
+job — while `walk` does, under a depth budget. `walkTypeChain` must thread a
+residual across links because the `else` has to know which states are left;
+`walkSwitch` has no residual because its arms are disjoint by construction.
+`walkFunctional` carries a from-*set* rather than a from-state. Merging them
+yields one walker with four flags, which is the arrangement just removed, under a
+new name. The axes worth separating were *recognition* (locus) and *commit*, and
+those are separated; extraction procedure is a third thing, and the sites are
+what let each walker be selected by data instead of by a hard-coded pairing.
+
+### Acceptance
+
+`mvn test` — **167/167 green**. `diff -r target/golden-base target/golden-stage2`
+— **empty**. No re-baselining.

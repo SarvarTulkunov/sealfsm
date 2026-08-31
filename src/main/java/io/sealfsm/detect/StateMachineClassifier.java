@@ -1,5 +1,7 @@
 package io.sealfsm.detect;
 
+import io.sealfsm.detect.dispatch.DispatchFinder;
+import io.sealfsm.detect.dispatch.DispatchSite;
 import io.sealfsm.model.StateMachine.Encoding;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.CtLambda;
@@ -132,32 +134,25 @@ public final class StateMachineClassifier {
         }
         trace.accept("compositional veto: not fired — " + describeNesting(nested));
 
-        List<CtMethod<?>> distributed = findDistributedTransitionMethods(root);
-        List<CtMethod<?>> centralized = findCentralizedTransitionMethods(root, model);
-        // F7: a transition function need not be a named method — it may be a lambda
-        // or an anonymous-class functional method with the same hierarchy-in /
-        // hierarchy-out signature. These are centralized-style, so they count
-        // towards CENTRALIZED_DISPATCH classification exactly as a named function would.
-        List<CtElement> functional = findFunctionalTransitionCallables(root, model);
-        // A switch over the hierarchy whose result is committed as a hierarchy
-        // value, wherever it is hosted and however it is installed. This is the
-        // widened centralized recognizer; the commit requirement is what keeps
-        // exhaustive folds (switch-over-state producing a String) out.
-        List<DispatchCommitDetector.Producer> producers = DispatchCommitDetector.find(root, model);
+        // Every dispatch site for this root, by discovery route. One call, and the
+        // only place recognition happens: the classifier no longer knows how a
+        // locus is found, only that some site's arms commit a hierarchy value.
+        DispatchFinder.Sites sites = DispatchFinder.find(root, model);
 
         trace.accept("per-state transition method (declared on a member, returns the hierarchy "
-                + "type): " + verdict(distributed.size()) + describeMethods(distributed));
+                + "type): " + verdict(sites.overrides().size()) + describeHosts(sites.overrides()));
         trace.accept("centralized transition function (produces a hierarchy value AND "
-                + "discriminates one): " + verdict(centralized.size())
-                + describeMethods(centralized));
+                + "discriminates one): " + verdict(sites.centralized().size())
+                + describeHosts(sites.centralized()));
         trace.accept("functional transition callable (lambda / anonymous-class method with that "
-                + "signature): " + verdict(functional.size()));
+                + "signature): " + verdict(sites.functional().size()));
         trace.accept("dispatch with a hierarchy-typed commit (a switch or instanceof chain over "
                 + "the hierarchy whose result is installed as a hierarchy value): "
-                + verdict(producers.size()) + describeProducers(producers));
+                + verdict(sites.producers().size()) + describeCommits(root, model));
 
-        boolean hasDist = !distributed.isEmpty();
-        boolean hasCentral = !centralized.isEmpty() || !functional.isEmpty() || !producers.isEmpty();
+        boolean hasDist = !sites.overrides().isEmpty();
+        boolean hasCentral = !sites.centralized().isEmpty() || !sites.functional().isEmpty()
+                || !sites.producers().isEmpty();
 
         if (hasDist && hasCentral) {
             return Classification.yes(Encoding.MIXED,
@@ -165,11 +160,11 @@ public final class StateMachineClassifier {
         }
         if (hasCentral) {
             return Classification.yes(Encoding.CENTRALIZED_DISPATCH,
-                    centralizedReason(centralized, functional, producers));
+                    centralizedReason(sites, DispatchCommitDetector.find(root, model)));
         }
         if (hasDist) {
             return Classification.yes(Encoding.POLYMORPHIC,
-                    distributed.size() + " per-state transition method(s)");
+                    sites.overrides().size() + " per-state transition method(s)");
         }
         // F8: nothing returns the hierarchy type, but each permitted subtype may
         // still own its transition logic and hand the successor to a *carrier*
@@ -183,8 +178,8 @@ public final class StateMachineClassifier {
         List<CtMethod<?>> carriers = CarrierTransitionDetector.findCarrierTransitionMethods(root);
         if (CarrierTransitionDetector.qualifies(root)) {
             trace.accept("carrier-based per-state transition (successor handed to a "
-                    + "non-hierarchy wrapper): " + verdict(carriers.size())
-                    + describeMethods(carriers));
+                    + "non-hierarchy wrapper): " + verdict(sites.carriers().size())
+                    + describeHosts(sites.carriers()));
             return Classification.yes(Encoding.POLYMORPHIC, carrierReason(root));
         }
         trace.accept("carrier-based per-state transition (successor handed to a non-hierarchy "
@@ -207,6 +202,20 @@ public final class StateMachineClassifier {
 
     private static String verdict(int found) {
         return found == 0 ? "FAILED — none found" : "passed — " + found + " found";
+    }
+
+    /** {@link #describeMethods} for a site list, naming each site's host. */
+    private static String describeHosts(List<DispatchSite> sites) {
+        if (sites.isEmpty()) return "";
+        String shown = sites.stream().limit(6)
+                .map(site -> site.hostKey() == null ? String.valueOf(site.locus()) : site.hostKey())
+                .collect(Collectors.joining(", "));
+        return " [" + shown + (sites.size() > 6 ? ", … " + (sites.size() - 6) + " more]" : "]");
+    }
+
+    /** The commit forms the producer sites install through, for the trace. */
+    private static String describeCommits(CtType<?> root, CtModel model) {
+        return describeProducers(DispatchCommitDetector.find(root, model));
     }
 
     private static String describeMethods(List<CtMethod<?>> methods) {
@@ -279,18 +288,21 @@ public final class StateMachineClassifier {
      * deduped on {@code declaringType#signature}, and this uses the same key so
      * the reported number and the walked set cannot drift apart.
      */
-    private static String centralizedReason(List<CtMethod<?>> centralized,
-                                            List<CtElement> functional,
+    private static String centralizedReason(DispatchFinder.Sites sites,
                                             List<DispatchCommitDetector.Producer> producers) {
         Set<String> hosts = new LinkedHashSet<>();
-        for (CtMethod<?> m : centralized) hosts.add(methodKey(m));
-        // A functional producer (a lambda, a method reference) has no CtMethod to
+        for (DispatchSite site : sites.centralized()) hosts.add(site.hostKey());
+        // A functional site (a lambda, an anonymous-class SAM) has no CtMethod to
         // key on, so each counts as its own host.
-        int functionalCount = functional.size();
+        int functionalCount = sites.functional().size();
 
         if (producers.isEmpty()) {
             return (hosts.size() + functionalCount) + " centralized transition function(s)";
         }
+        // The commit forms come from the producers rather than from the sites,
+        // because a site is the LOCUS half by construction and does not carry a
+        // commit; asking CommitClassifier again here would be a second evaluation
+        // of a question already answered, and the two could disagree.
         Set<String> commits = new LinkedHashSet<>();
         for (DispatchCommitDetector.Producer p : producers) {
             commits.add(p.commit().name());
@@ -316,10 +328,10 @@ public final class StateMachineClassifier {
     }
 
     private Encoding detectEncoding(CtType<?> root, CtModel model) {
-        boolean dist = !findDistributedTransitionMethods(root).isEmpty();
-        boolean central = !findCentralizedTransitionMethods(root, model).isEmpty()
-                || !findFunctionalTransitionCallables(root, model).isEmpty()
-                || !DispatchCommitDetector.find(root, model).isEmpty();
+        DispatchFinder.Sites sites = DispatchFinder.find(root, model);
+        boolean dist = !sites.overrides().isEmpty();
+        boolean central = !sites.centralized().isEmpty() || !sites.functional().isEmpty()
+                || !sites.producers().isEmpty();
         if (dist && central) return Encoding.MIXED;
         if (central) return Encoding.CENTRALIZED_DISPATCH;
         if (dist) return Encoding.POLYMORPHIC;
