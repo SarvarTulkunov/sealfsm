@@ -421,11 +421,22 @@ public final class DispatchCommitDetector {
                                                 Set<String> hierarchy) {
         CtTypeReference<?> ret = host.getType();
         boolean hostReturnsHierarchy = ret != null && hierarchy.contains(ret.getQualifiedName());
+        // The chain form of the carrier codomain: the host returns some type
+        // outside H that has exactly one hierarchy-typed slot. Asked here as well
+        // as at the switch, because "at every locus" has to mean every locus — a
+        // chain is the pre-pattern-matching spelling of the same discrimination,
+        // and a rule that holds for one spelling and not the other puts the
+        // difference between two idioms into the model.
+        boolean hostReturnsCarrier = !hostReturnsHierarchy && ret != null
+                && CommitClassifier.carrierComponentOf(ret, hierarchy) != null;
         CommitForm found = null;
         for (CtStatement branch : chainBranches(chain)) {
-            if (hostReturnsHierarchy) {
+            if (hostReturnsHierarchy || hostReturnsCarrier) {
                 for (CtReturn<?> r : branch.getElements(new TypeFilter<>(CtReturn.class))) {
-                    if (r.getReturnedExpression() != null) return CommitForm.VALUE_RETURN;
+                    if (r.getReturnedExpression() != null) {
+                        return hostReturnsHierarchy
+                                ? CommitForm.VALUE_RETURN : CommitForm.CARRIER_RETURN;
+                    }
                 }
             }
             for (CtAssignment<?, ?> asg : branch.getElements(new TypeFilter<>(CtAssignment.class))) {

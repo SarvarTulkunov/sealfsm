@@ -128,6 +128,25 @@ class DispatchCommitDetectorTest {
                 "which of two hierarchy-typed slots is the successor is undecidable");
     }
 
+    /**
+     * The same carrier commit at the OTHER centralized locus: an {@code instanceof}
+     * chain rather than a pattern switch.
+     *
+     * <p>A chain is the spelling most Java written before pattern-matching switch
+     * uses, so a commit rule that held at the switch and not here would put the
+     * difference between two idioms into the model rather than into the source —
+     * which is precisely what separating the locus and commit axes is for.
+     */
+    @Test
+    void anInstanceofChainReturningACarrierIsAlsoAProducer() {
+        List<Producer> ps = producers("src/test/resources/carrierdispatch",
+                "carrierdispatch.Latch");
+        assertEquals(1, ps.size());
+        assertEquals(Set.of(CommitForm.CARRIER_RETURN), commits(ps));
+        assertInstanceOf(CtIf.class, ps.get(0).dispatch(),
+                "the discrimination is the chain head, not a switch");
+    }
+
     // ---- 3b: the mutator commit, as a dispatch rather than a fallback -------
 
     /**

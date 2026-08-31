@@ -63,17 +63,67 @@ class ExtractionIntegrationTest {
     @Test
     void centralizedSwitchReturningACarrierIsExtracted() {
         ExtractionResult r = new Analyzer().analyze(modelOf("src/test/resources/carrierdispatch"));
-        StateMachine m = single(r);
+        StateMachine m = r.machines().stream().filter(x -> x.name().equals("Signal"))
+                .findFirst().orElseThrow();
         assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertTrue(m.commitForms().contains(CommitForm.CARRIER_RETURN),
                 "the successor is installed through a wrapper, at a centralized locus");
         assertEquals(3, m.allStates().size());
         assertEquals(3, m.transitions().size(),
                 "one edge per arm of the ONE committing switch; the two controls add none");
+        assertEquals(3, m.resolvedTransitionCount());
         assertEquals(3, m.resolvedTransitionCount(), "every successor is unwrapped from the carrier");
         assertTrue(hasResolved(m, "Idle", "Live"));
         assertTrue(hasResolved(m, "Live", "Done"));
         assertTrue(hasResolved(m, "Done", "Done"));
+
+        // The same commit at the other centralized locus, in the same package: an
+        // instanceof chain. Held beside the switch so no difference of file or
+        // context can stand in for the spelling of the discrimination.
+        StateMachine chain = r.machines().stream().filter(x -> x.name().equals("Latch"))
+                .findFirst().orElseThrow();
+        assertTrue(chain.commitForms().contains(CommitForm.CARRIER_RETURN));
+        assertTrue(hasResolved(chain, "Open", "Shut"));
+        assertTrue(hasResolved(chain, "Shut", "Open"));
+    }
+
+    // ---- 4a: F9 at the carrier commit, at a CENTRALIZED locus ---------------
+
+    /**
+     * A helper that always throws is not a producer — asked at the locus 3a
+     * opened, not only on the bare-H path where the rule started.
+     *
+     * <p>{@code Undefined.illegal(b, event)} is syntactically INDISTINGUISHABLE
+     * from a carrier factory: a call whose own type is outside the hierarchy,
+     * carrying a hierarchy-typed argument. Nothing in the expression separates
+     * them; only the callee's body does, and JLS §8.4.7 makes "no {@code return}
+     * anywhere in a non-void method" a proof rather than a guess. Its argument is
+     * the current state, which is how such a helper is nearly always called, so
+     * the fabrication would be a SELF-LOOP — one per specification-undefined cell,
+     * and a real transition table has many.
+     *
+     * <p>The negative control is the sharp half, and it is why the rule may not be
+     * "contains a throw": {@code recover} throws on one path and returns on
+     * another, so it CAN produce a successor and its edge must survive — with the
+     * rejection branch's negated test as its guard, which is F14 doing its job at
+     * the same site.
+     */
+    @Test
+    void anAlwaysThrowingCarrierHelperContributesNoEdgeWhileAReturningOneKeepsIts() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("src/test/resources/carrierreject"));
+        StateMachine m = single(r);
+        assertEquals(3, m.allStates().size());
+        assertTrue(m.commitForms().contains(CommitForm.CARRIER_RETURN));
+
+        assertTrue(hasResolved(m, "Ready", "Busy"), "an ordinary carrier arm resolves");
+        assertTrue(hasResolved(m, "Spent", "Ready"),
+                "the helper that CAN return keeps its edge — the rule is a proof, not "
+                        + "'this method mentions throw'");
+        assertTrue(m.transitions().stream().noneMatch(t -> "Busy".equals(t.from())),
+                "the always-throwing arm is an undefined input: no edge at all, not even "
+                        + "an unresolved one, and above all not a fabricated self-loop");
+        assertEquals(2, m.transitions().size());
+        assertEquals(2, m.resolvedTransitionCount());
     }
 
     private StateMachine single(ExtractionResult r) {

@@ -438,3 +438,162 @@ than measured.
 
 `mvn test` — **174/174 green** (3 new). Five goldens changed; every relation is
 identical and only the axis labels moved, except `lcp_automation_chatgpt` from 3a.
+
+---
+
+## Stage 4 — precision, applied once at the commit
+
+Both items are on `master` already, each as a numbered finding with its own
+fixture. As before, they were verified in place rather than rewritten — and 4a
+was additionally **re-asserted at the locus 3a opened**, which is where the plan
+says the fabrication would appear.
+
+| item | already at HEAD as | where |
+|---|---|---|
+| 4a `neverReturnsNormally` at the commit, every locus | **F21** | `callsNonReturningHelper` at `handleCarrierValue`'s entry, and `neverReturnsNormally` in the fold; fixture `examples/throwcarrier` |
+| 4b bound the compositional veto | **F20** | `CompositionVeto` + `CarrierTransitionDetector.composesItself`; fixture `examples/retrystate` |
+
+### 4a, re-asserted at the new cell
+
+`src/test/resources/carrierreject/` is a centralized table committing through a
+carrier — the cell 3a opened — with the F9 question asked there. Three arms,
+differing only in what the helper's body can do:
+
+* `case Ready r -> new Move(new Busy(), "start")` — an ordinary carrier arm,
+  resolves.
+* `case Busy b -> Undefined.illegal(b, event)` — **no edge at all**, not even an
+  unresolved one. `illegal` is syntactically indistinguishable from a carrier
+  factory: a call whose own type is outside the hierarchy carrying a
+  hierarchy-typed argument. Nothing in the expression separates them; only the
+  body does, and JLS §8.4.7 makes "no `return` anywhere in a non-void method" a
+  proof. Its argument is the *current state*, which is how such a helper is
+  nearly always called, so the fabrication would be a **self-loop — one per
+  specification-undefined cell**, and a real transition table has many.
+* `case Spent s -> Undefined.recover(s, event)` — the **negative control**, and
+  the sharp half. `recover` throws on one path and returns on another, so it CAN
+  produce a successor and its edge must survive. A "contains a `throw`" rule
+  would delete a real transition with no unresolved marker. It survives, and it
+  arrives carrying `[!(event < 0)]` — F14 attaching the rejection branch's
+  negated test at the same site.
+
+Reported: 3 states, 2/2, plus the diagnostic "1 call(s) to a helper that cannot
+return normally … contributed no transition — the arms holding them are undefined
+inputs, not unresolved targets". Suppression is *reclassification*, never a silent
+drop.
+
+### 4b
+
+Unchanged and re-verified: `examples/treebuilder` is still REJECTED on both
+acceptance paths, and `examples/retrystate`'s four hierarchies still separate the
+veto's bound from its trigger (one self-composing production is sufficient alone;
+anything else needs ≥2 nested productions across ≥2 distinct members, and a lone
+non-self-composing production is downgraded to a per-edge unresolved rather than a
+verdict about the type).
+
+### Acceptance
+
+`mvn test` — **175/175 green**. The tree-builder negative fixture is still
+rejected; its golden is byte-identical.
+
+---
+
+## Stage 5 — re-baseline
+
+`target/golden-base` (HEAD + the `findMutators` determinism fix) was compared
+against the final tree. **Six goldens changed across the whole refactor, on five
+fixtures**, and every one is accounted for:
+
+| golden | stage | what changed | which (locus, commit) is now reachable |
+|---|---|---|---|
+| `lcp_automation_chatgpt/` (new `.dot`, `.scxml`, summary) | **3a** | rejected as "no transition producer found" → CENTRALIZED_DISPATCH, 10 states, **111/111** | `(CENTRALIZED_SWITCH, CARRIER_RETURN)` — previously unreachable: the carrier recognizer required a per-subtype override, the switch recognizer required an H-typed commit |
+| `plumbing-mutation/Hopper.*`, summary | **3b** | MIXED / FIELD_MUTATION → CENTRALIZED_DISPATCH / MUTATOR_ARGUMENT; **relation identical, 6/6** | `(CENTRALIZED_SWITCH, MUTATOR_ARGUMENT)` — previously reachable only through the whole-hierarchy F2 fallback, i.e. only when nothing else was found |
+| `nestedroots/Body.*`, summary | **3b** | same relabelling; **relation identical, 3/3** | same |
+| `mutatorshape/Bolt.*`, `Vent.*`, summary | **3b** | same relabelling; **relations identical, 3/3 and 1/2**. `Vent` reports FIELD_MUTATION **and** MUTATOR_ARGUMENT, which is correct — `restart` writes the field, `assume` is a mutator | same |
+| `gofcontext/summary.txt` | **3b** | FIELD_MUTATION → MUTATOR_ARGUMENT; **relation identical, 5/5** | the commit axis now reports what it observed rather than the only label that existed before the split |
+
+No golden lost an edge, and no golden's transition relation changed at all —
+verified edge by edge, not by count. The only new machine is
+`lcp_automation_chatgpt`, and it was previously reported as not a state machine.
+
+`MIXED` → `CENTRALIZED_DISPATCH` on four machines is the item CLAUDE.md's own
+"what to work on next" list asks for: they sat in a bucket labelled "undetermined"
+only because no recognizer saw their dispatch.
+
+---
+
+## The deliverable — every (DispatchLocus × CommitForm) pair
+
+`R` reachable and exercised · `r` reachable, no fixture exercises it ·
+`—` not reachable · `n/a` not a meaningful combination.
+**Bold** marks a cell this work opened.
+
+| | VALUE_RETURN | FIELD_MUTATION | LOCAL_ACCUMULATOR | POLY_CARRIER | CARRIER_RETURN | MUTATOR_ARGUMENT |
+|---|---|---|---|---|---|---|
+| **CENTRALIZED_SWITCH** | R | R | R | n/a | **R** | **R** |
+| **INSTANCEOF_CHAIN** | R | R | r | n/a | **R** | **R** |
+| **POLYMORPHIC_OVERRIDE** | R | R* | n/a | R | n/a | R* |
+| **FUNCTIONAL_CALLABLE** | R | — | — | — | — | — |
+
+### Cell by cell
+
+**CENTRALIZED_SWITCH** — `VALUE_RETURN` `examples/door`, `http2-stream-claude`,
+`lcp_automation` (113/113). `FIELD_MUTATION` `http2-stream-gemini`, `barefield`.
+`LOCAL_ACCUMULATOR` `examples/accumulator`. **`CARRIER_RETURN`** newly reachable —
+`examples/lcp_automation_chatgpt` (10 states, 111/111, previously rejected
+outright) and `src/test/resources/carrierdispatch`. **`MUTATOR_ARGUMENT`** newly
+reachable as a *dispatch* — `plumbing-mutation`, `mutatorshape`,
+`nestedroots.Body`; previously reachable only through the whole-hierarchy F2
+fallback, i.e. only when nothing else was found.
+
+**INSTANCEOF_CHAIN** — `VALUE_RETURN` and `FIELD_MUTATION` from F17
+(`examples/chaindispatch`). `LOCAL_ACCUMULATOR` is reachable — `commitFormOfChain`
+asks `CommitClassifier.ofTarget`, which answers `LOCAL_ACCUMULATOR` for an H-typed
+local — but **no fixture writes a chain that accumulates into a local**, so it is
+untested. **`CARRIER_RETURN`** newly reachable
+(`carrierdispatch.ChainRouter.flip`, 2/2); it was still missing after 3a, because
+`commitFormOfChain` asked only whether the host returns H, and closing it is what
+makes "at every locus" true rather than "at three of them".
+**`MUTATOR_ARGUMENT`** newly reachable — `mutatorCommitIn` is asked of a chain's
+branches on the same terms as a switch's arms.
+
+**POLYMORPHIC_OVERRIDE** — `VALUE_RETURN` `examples/traffic`. `POLY_CARRIER`
+`examples/tcp` (44/44), `throwcarrier`, `valueforms`.
+`CARRIER_RETURN` is `n/a` here **only because `POLY_CARRIER` already is it**: the
+two are one commit mechanism at two loci, kept as separate enum values purely for
+continuity with the thesis's published table. Collapsing them is a one-line change
+plus a re-baseline and is the author's call.
+`LOCAL_ACCUMULATOR` is `n/a`: at an override the method's *return* is the commit,
+so a local inside it is an intermediate, not an installation.
+`FIELD_MUTATION` and `MUTATOR_ARGUMENT` are marked **R\*** — reachable, and
+exercised by `gofcontext.Portal` (5/5) and `examples/nondeterministic`, but
+through the **F2 mutation fallback, which has no locus at all**. It is not a
+discrimination; it is a scan of the methods that write the state field, and it is
+modelled as `Route.MUTATION_FALLBACK` with a null locus for exactly that reason.
+Reading those cells as "the override locus commits by mutation" would be
+generous: what is really true is that a per-state callback mutating a context is
+recovered, and no dispatch was involved.
+
+**FUNCTIONAL_CALLABLE × everything but VALUE_RETURN — the one axis pair still
+fused, and it is fused in the extractor rather than in the recognizer.**
+`DispatchFinder.functionalSites` finds the locus independently of any commit, and
+`CommitClassifier` would answer for it; but `TransitionExtractor.extractFunctional`
+hard-codes `commitForms.add(VALUE_RETURN)`, and `walkFunctional` — which carries a
+from-*set* rather than a from-state — only ever treats a returned value as a
+production. A lambda that commits by assigning a field or by calling a mutator
+therefore contributes nothing. Closing it means teaching `walkFunctional` the
+commit branches `walk` already has, over a from-set instead of a from-state; it is
+a contained change and no corpus fixture demands it, so it is left named rather
+than done untested.
+
+### Two honest caveats on the table
+
+* Reachability is a property of the code, established here by reading the
+  composition (`DispatchFinder` → `CommitClassifier`/`MutatorRecognizer` →
+  `TransitionExtractor`) and confirmed by fixtures wherever an `R` appears. The
+  single `r` is argued, not measured.
+* The locus axis is **not** in the tool's output — the summary table reports
+  `StateMachine.Encoding`, which has two positions, and four loci map onto those
+  two. So the corpus evidence above pairs a fixture with a locus by construction
+  (which recognizer produced its site), not by reading it off a report. Exposing
+  the locus is a reporting change worth making if the validation chapter wants to
+  stratify by it; the mapping already exists as `DispatchLocus.encoding()`.
