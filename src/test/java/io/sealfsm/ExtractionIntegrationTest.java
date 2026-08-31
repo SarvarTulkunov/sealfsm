@@ -1936,9 +1936,15 @@ class ExtractionIntegrationTest {
         // rejected outright ("no transition producer found") until it existed.
         Set<CommitForm> commits = r.machines().stream()
                 .flatMap(m -> m.commitForms().stream()).collect(Collectors.toSet());
+        // MUTATOR_ARGUMENT joined it in the same refactor. It was previously pooled
+        // into FIELD_MUTATION, which reported an observation and an inference under
+        // one label: a field write is a commit the analysis SEES, while a mutator
+        // argument additionally rests on a structural reading of the callee's body.
+        // Pooling them made a gap in the inference unattributable, which is the
+        // exact failure the stratified table exists to prevent.
         assertEquals(Set.of(CommitForm.VALUE_RETURN, CommitForm.FIELD_MUTATION,
                         CommitForm.LOCAL_ACCUMULATOR, CommitForm.POLY_CARRIER,
-                        CommitForm.CARRIER_RETURN), commits,
+                        CommitForm.CARRIER_RETURN, CommitForm.MUTATOR_ARGUMENT), commits,
                 "the corpus must exercise every commit form");
     }
 

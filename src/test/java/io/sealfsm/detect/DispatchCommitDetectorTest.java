@@ -128,6 +128,65 @@ class DispatchCommitDetectorTest {
                 "which of two hierarchy-typed slots is the successor is undecidable");
     }
 
+    // ---- 3b: the mutator commit, as a dispatch rather than a fallback -------
+
+    /**
+     * A switch over the hierarchy whose arms commit through {@code ctx.setState(...)}
+     * is a recognised dispatch, committing by {@code MUTATOR_ARGUMENT}.
+     *
+     * <p>It was not one before: the commit is per-arm and one call deep, so the
+     * parent-context test that answers for every other form answers null, and the
+     * hierarchy was rescued only by the whole-hierarchy mutation fallback — which
+     * runs only when nothing else found anything. CLAUDE.md recorded exactly this
+     * as a scope line.
+     */
+    @Test
+    void switchCommittingThroughAMutatorIsAProducer() {
+        List<Producer> ps = producers("examples/plumbing-mutation", "plumbingmutation.Hopper");
+        assertTrue(ps.stream().anyMatch(p -> p.commit() == CommitForm.MUTATOR_ARGUMENT),
+                "ctx.setState(new Filling()) installs the successor one call away");
+    }
+
+    /**
+     * The narrowing that keeps a CHILD machine's mutator from making its PARENT
+     * look like a machine.
+     *
+     * <p>A permitted subtype may itself be sealed, and then H(child) is a subset
+     * of H(parent) — so {@code void setState(Body next)} has a parameter inside
+     * {@code Message}'s hierarchy too. Reading it as a commit for {@code Message}
+     * published a sum type that merely CONTAINS a machine as a five-state
+     * automaton, and {@code Body} was then never classified at all. Requiring the
+     * mutator's parameter to be the ROOT costs nothing real: a mutator installs
+     * the machine's state, so its parameter is the type the state field is
+     * declared with.
+     */
+    @Test
+    void aChildHierarchysMutatorIsNotAProducerForItsParent() {
+        assertTrue(producers("examples/nestedroots", "nestedroots.Message").isEmpty(),
+                "Message must keep abstaining, so Body is re-offered as a root of its own");
+        assertTrue(producers("examples/nestedroots", "nestedroots.Body").stream()
+                        .anyMatch(p -> p.commit() == CommitForm.MUTATOR_ARGUMENT),
+                "and Body itself must still be recognised");
+    }
+
+    /**
+     * The F22 control, at the new locus. {@code become} is an audit hook with a
+     * conventional mutator NAME that commits nothing, called from the same arm as
+     * a real commit so no difference of file or context can stand in for the body.
+     * Admitting it would publish {@code become(current)} as a resolved self-loop.
+     */
+    @Test
+    void aMutatorNamedLikeOneButCommittingNothingIsNotAProducer() {
+        List<Producer> ps = producers("examples/mutatorshape", "mutatorshape.Bolt");
+        assertTrue(ps.stream().anyMatch(p -> p.commit() == CommitForm.MUTATOR_ARGUMENT),
+                "the real commit is still found, by shape");
+        // The audit hook contributes no edge: the fixture's relation is exactly 3
+        // and is asserted whole in ExtractionIntegrationTest. Here it is enough
+        // that recognition rests on a body, since `become` and `assume` differ in
+        // nothing else.
+        assertTrue(ps.stream().allMatch(p -> p.host() != null));
+    }
+
     // ---- accepted commits ---------------------------------------------------
 
     @Test

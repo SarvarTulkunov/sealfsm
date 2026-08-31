@@ -3,7 +3,9 @@ package io.sealfsm.extract;
 import io.sealfsm.detect.CarrierTransitionDetector;
 import io.sealfsm.detect.DispatchCommitDetector;
 import io.sealfsm.detect.dispatch.CasePatterns;
+import io.sealfsm.detect.dispatch.Commit;
 import io.sealfsm.detect.dispatch.CommitClassifier;
+import io.sealfsm.detect.dispatch.MutatorRecognizer;
 import io.sealfsm.detect.dispatch.DispatchFinder;
 import io.sealfsm.detect.dispatch.DispatchLocus;
 import io.sealfsm.detect.dispatch.DispatchSite;
@@ -406,6 +408,10 @@ public final class TransitionExtractor {
         Set<String> producerHosts = new HashSet<>();
         for (DispatchCommitDetector.Producer p : producers) producerHosts.add(methodKey(p.host()));
 
+        // Every host a dispatch walk owned, so the mutation fallback below does not
+        // walk one of them a second time and report its successors twice — once
+        // attributed to the arm that matched, once to nothing.
+        Set<String> walkedHosts = new LinkedHashSet<>();
         Set<String> walkedMethods = new HashSet<>();
         for (DispatchSite site : sites.centralized()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
@@ -431,6 +437,7 @@ public final class TransitionExtractor {
             walkAt(site, Route.CENTRALIZED_METHOD, CommitForm.VALUE_RETURN,
                     () -> extractCentralized(m, out));
             walkedMethods.add(methodKey(m));
+            walkedHosts.add(methodKey(m));
         }
         for (DispatchSite site : sites.functional()) {
             walkAt(site, Route.FUNCTIONAL, CommitForm.VALUE_RETURN,
@@ -454,6 +461,7 @@ public final class TransitionExtractor {
             // recognised. They are built from the same scan in the same order, so
             // index i pairs them; the site is what the walker is told it is inside.
             DispatchSite site = i < producerSites.size() ? producerSites.get(i) : null;
+            walkedHosts.add(methodKey(p.host()));
             walkAt(site, Route.COMMIT_DISPATCH, p.commit(), () -> extractCommitDispatch(p, out));
         }
         // F8: per-state methods that return a *carrier* wrapping the successor.
@@ -468,12 +476,26 @@ public final class TransitionExtractor {
             walkAt(site, Route.CARRIER, CommitForm.POLY_CARRIER, () -> extractCarrier(m, out));
         }
 
-        if (distributed.isEmpty() && centralized.isEmpty() && functional.isEmpty() && out.isEmpty()) {
-            // F2: GoF / field-mutation encoding. Run only as a fallback when no
-            // return-based transition method exists, so a hierarchy that already
-            // exposes a functional transition is left untouched — a context that
-            // merely stores a functional result is not re-mined as a transition here.
-            extractMutationEncoding(root, model, out);
+        // F2: GoF / field-mutation encoding. A fallback, so it runs only when no
+        // RETURN-based transition method exists: a hierarchy that already exposes a
+        // functional transition is left untouched, and a context that merely stores
+        // a functional result is not re-mined as a transition here.
+        //
+        // The second disjunct is what keeps MUTATOR_ARGUMENT from silently costing
+        // a recorded gap. A mutator-committing dispatch is now a producer, so `out`
+        // is no longer empty and the plain guard would skip this — yet this pass is
+        // the ONLY thing that records a mutation commit no dispatch claimed. On
+        // examples/mutatorshape that is `restart`, whose commit is real and whose
+        // source state is unknowable, and skipping it took Vent from an honest 1/2
+        // to a clean-looking 1/1 with the gap deleted: a transition dropped with no
+        // unresolved marker, which is the one outcome the record-everything
+        // invariant forbids by name. Hosts a dispatch already walked are skipped
+        // below, so nothing is counted twice.
+        boolean onlyMutatorProducers = !producers.isEmpty()
+                && producers.stream().allMatch(p -> p.commit() == CommitForm.MUTATOR_ARGUMENT);
+        if (distributed.isEmpty() && centralized.isEmpty() && functional.isEmpty()
+                && (out.isEmpty() || onlyMutatorProducers)) {
+            extractMutationEncoding(root, model, walkedHosts, out);
         }
         if (interProcResolvedEdges > 0) {
             diagnostics.add(interProcResolvedEdges + " transition target(s) resolved via bounded "
@@ -1427,7 +1449,8 @@ public final class TransitionExtractor {
      * field, otherwise the declaring state class (GoF callbacks); the to-state is
      * the assigned value / mutator argument, resolved like any produced value.
      */
-    private void extractMutationEncoding(CtType<?> root, CtModel model, Set<Transition> out) {
+    private void extractMutationEncoding(CtType<?> root, CtModel model, Set<String> walkedHosts,
+                                         Set<Transition> out) {
         stateFieldNames = findStateFieldNames(model);
         Set<String> keys = new LinkedHashSet<>();
         Set<String> names = new LinkedHashSet<>();
@@ -1446,11 +1469,19 @@ public final class TransitionExtractor {
                     + "found and one merely NAMED like one is not (F22)");
         }
 
-        commitForms.add(CommitForm.FIELD_MUTATION);
+        // The commit form is recorded where a commit is actually WALKED, not here.
+        // Adding FIELD_MUTATION up front predates MUTATOR_ARGUMENT existing: it was
+        // the only label available, so it stood for both "writes the state field"
+        // and "hands the state to a mutator". Now that the two are separate
+        // positions of the axis, announcing one before either is observed reports a
+        // machine committing through `ctx.setState(...)` and nothing else under the
+        // form it does not use — and the axis exists to make a recall gap
+        // attributable to the idiom that caused it.
         WalkSite saved = this.walkSite;
         this.walkSite = new WalkSite(Route.MUTATION_FALLBACK, null, CommitForm.FIELD_MUTATION);
         try {
             for (CtMethod<?> m : findMutationMethods(model)) {
+                if (walkedHosts.contains(methodKey(m))) continue; // a dispatch owns it
                 CtType<?> declaring = m.getDeclaringType();
                 // GoF callback (`class Closed { void onLock(ctx){ ctx.setState(...); } }`):
                 // the from-state is the declaring state class. A method that
@@ -2061,19 +2092,34 @@ public final class TransitionExtractor {
             // read back later in the same body, and the reaching-definitions pass
             // (F1) resolves it there — honouring the write as well would report
             // that one successor twice.
-            if ((inMutationFallback() && isStateFieldWrite(asg.getAssigned()))
-                    || (dispatchCommit == CommitForm.FIELD_MUTATION
-                        && DispatchCommitDetector.isCommitTarget(asg.getAssigned(),
-                                                                 hierarchyQualifiedNames))) {
+            if (inMutationFallback() && isStateFieldWrite(asg.getAssigned())) {
+                commitForms.add(CommitForm.FIELD_MUTATION);
+                handleValue(asg.getAssignment(), from, event, guard, out);
+            } else if (dispatchCommit == CommitForm.FIELD_MUTATION
+                    && DispatchCommitDetector.isCommitTarget(asg.getAssigned(),
+                                                             hierarchyQualifiedNames)) {
                 handleValue(asg.getAssignment(), from, event, guard, out);
             }
         } else if (node instanceof CtInvocation<?> inv && inMutationFallback() && isMutatorCall(inv)) {
             // F2: ctx.setState(new Locked()) — the hierarchy-typed argument is the
             // next state (from-state is the enclosing arm / declaring state class).
+            commitForms.add(CommitForm.MUTATOR_ARGUMENT);
             for (CtExpression<?> arg : inv.getArguments()) {
                 if (isHierarchyTyped(arg) || inv.getArguments().size() == 1) {
                     handleValue(arg, from, event, guard, out);
                 }
+            }
+        } else if (node instanceof CtInvocation<?> inv
+                && walkSite != null && walkSite.commit() == CommitForm.MUTATOR_ARGUMENT) {
+            // The same commit, reached at a DISPATCH rather than through the
+            // whole-hierarchy fallback. Asked of MutatorRecognizer directly rather
+            // than of the fallback's precomputed key set: that set is built only
+            // when the fallback runs, and this walk happens precisely when it does
+            // not. One rule, two callers — the recognizer is the rule.
+            Commit commit = MutatorRecognizer.commitOfCall(inv, hierarchyQualifiedNames,
+                    rootQualifiedName);
+            if (commit != null) {
+                handleValue(commit.value(), from, event, guard, out);
             }
         } else if (node instanceof CtTry tryStmt) {
             // F6: descend exceptional flow. The try body runs under the normal

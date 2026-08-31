@@ -3,6 +3,7 @@ package io.sealfsm.detect;
 import io.sealfsm.detect.dispatch.Commit;
 import io.sealfsm.detect.dispatch.CommitClassifier;
 import io.sealfsm.detect.dispatch.CompositionVeto;
+import io.sealfsm.detect.dispatch.MutatorRecognizer;
 
 import io.sealfsm.model.CommitForm;
 import spoon.reflect.CtModel;
@@ -14,6 +15,7 @@ import spoon.reflect.code.CtBlock;
 import spoon.reflect.code.CtCase;
 import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtIf;
+import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtLambda;
 import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtStatement;
@@ -191,10 +193,10 @@ public final class DispatchCommitDetector {
         String rootQn = root.getQualifiedName();
         List<Producer> out = new ArrayList<>();
         for (CtSwitchExpression<?, ?> sw : model.getElements(new TypeFilter<>(CtSwitchExpression.class))) {
-            addIfProducer(sw, hierarchy, out);
+            addIfProducer(sw, hierarchy, rootQn, out);
         }
         for (CtSwitch<?> sw : model.getElements(new TypeFilter<>(CtSwitch.class))) {
-            addIfProducer(sw, hierarchy, out);
+            addIfProducer(sw, hierarchy, rootQn, out);
         }
         for (CtIf ctIf : model.getElements(new TypeFilter<>(CtIf.class))) {
             addChainProducer(ctIf, hierarchy, rootQn, out);
@@ -202,9 +204,11 @@ public final class DispatchCommitDetector {
         return out;
     }
 
-    private static void addIfProducer(CtAbstractSwitch<?> sw, Set<String> hierarchy, List<Producer> out) {
+    private static void addIfProducer(CtAbstractSwitch<?> sw, Set<String> hierarchy,
+                                      String rootQn, List<Producer> out) {
         if (!dispatchesOnHierarchy(sw, hierarchy)) return;
         CommitForm commit = commitFormOf(sw, hierarchy);
+        if (commit == null) commit = mutatorCommitIn(sw.getCases(), hierarchy, rootQn);
         if (commit == null) return;                       // foreign codomain — an exhaustive fold
         if (nestsHierarchyValue(sw, hierarchy)) return;   // composition, not succession
         CtMethod<?> host = enclosingMethod(sw);
@@ -228,6 +232,7 @@ public final class DispatchCommitDetector {
         CtMethod<?> host = enclosingMethod(head);
         if (host == null) return;                         // an initializer, not a transition function
         CommitForm commit = commitFormOfChain(chain, host, hierarchy);
+        if (commit == null) commit = mutatorCommitIn(chainBranches(chain), hierarchy, rootQn);
         if (commit == null) return;                       // foreign codomain — an exhaustive fold
         if (chainNestsHierarchyValue(chain, hierarchy)) return;    // composition, not succession
         out.add(new Producer(host, head, commit, chain.selector()));
@@ -429,6 +434,33 @@ public final class DispatchCommitDetector {
             }
         }
         return found;
+    }
+
+    /**
+     * Does any of these branches commit by handing a hierarchy value to a mutator?
+     *
+     * <p>Asked only after the syntactic forms have declined, so a dispatch that
+     * commits by return or by assignment keeps that classification and this can
+     * only ADD machines, never re-attribute one.
+     *
+     * <p>A switch statement whose arms each call {@code ctx.setState(...)} has no
+     * single result expression to inspect — the commit is per-arm and one call
+     * deep — which is why the parent-context test that answers for every other
+     * form answers null here. CLAUDE.md recorded exactly this as a scope line:
+     * such a dispatch was not a producer, and the F2 fallback did not rescue it
+     * either whenever any other producer existed in the same hierarchy.
+     */
+    private static CommitForm mutatorCommitIn(List<? extends CtElement> branches,
+                                              Set<String> hierarchy, String rootQn) {
+        for (CtElement branch : branches) {
+            if (branch == null) continue;
+            for (CtInvocation<?> inv : branch.getElements(new TypeFilter<>(CtInvocation.class))) {
+                if (MutatorRecognizer.commitOfCall(inv, hierarchy, rootQn) != null) {
+                    return CommitForm.MUTATOR_ARGUMENT;
+                }
+            }
+        }
+        return null;
     }
 
     /** Every statement the chain owns: each link's branch, plus the final else. */

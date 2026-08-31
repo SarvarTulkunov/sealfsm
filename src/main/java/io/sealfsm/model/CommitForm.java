@@ -94,5 +94,28 @@ public enum CommitForm {
      * successor, so the commit is declined rather than guessed — the same rule
      * {@code soleEnumComponent} applies to &Sigma;.
      */
-    CARRIER_RETURN
+    CARRIER_RETURN,
+
+    /**
+     * The successor is <em>handed to a mutator</em>, which installs it:
+     * {@code ctx.setState(new Filling());}. The commit is one call away, and what
+     * makes the call's argument the successor is that the callee commits
+     * <em>what it was handed</em> — not that it is named like a setter.
+     *
+     * <p>Split out of {@link #FIELD_MUTATION}, which used to absorb it. They are
+     * not the same claim: a field mutation is a write the analysis can SEE, an
+     * exact observation of the immediate syntactic context; a mutator argument
+     * rests additionally on a structural reading of the callee's body
+     * ({@link io.sealfsm.detect.dispatch.MutatorRecognizer}). Pooling the two
+     * reported an inference and an observation under one label, so a recall or
+     * precision gap in the inference was unattributable — which is the exact
+     * failure the stratified table exists to prevent.
+     *
+     * <p>Reachable at every locus, which is the gain. Before the axes were split
+     * a dispatch committing this way was not a recognised dispatch at all: it was
+     * rescued only by the whole-hierarchy mutation fallback, and that runs
+     * <em>only when nothing else found anything</em>, so a hierarchy with one
+     * value-returning producer alongside lost every mutator commit it had.
+     */
+    MUTATOR_ARGUMENT
 }

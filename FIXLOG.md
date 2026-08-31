@@ -338,3 +338,103 @@ carrier also holds actions or output symbols, since that is why the idiom exists
 
 `mvn test` — **171/171 green** (4 new). One golden changed, and it is a
 capability gain: a hierarchy that was rejected is now extracted.
+
+### 3b — `CommitForm.MUTATOR_ARGUMENT`, at every locus  (implemented)
+
+`MutatorRecognizer.commitsItsArgument(callee, H, rootQn)` — structural end to
+end, and nothing in it keys on a name. Exactly one parameter, typed with the
+hierarchy **root**, and a body that assigns a hierarchy-typed field an expression
+in which *that parameter is the only hierarchy value*. The field is identified by
+its declared type through the same `CommitClassifier.ofTarget` rule every other
+commit uses; two machines in one model routinely both call their field `state`.
+
+The second clause is the half a plain structural rule misses.
+`void restart(Vent previous) { audit(previous); this.state = new Sealed(); }` has
+one hierarchy-typed parameter and does write the state field — so "one H-typed
+parameter whose body writes an H-typed field" admits it exactly as the F22 word
+list did — yet its parameter is the state being *left* and the successor is
+chosen by the callee. What licenses reading a call's argument as the target is
+that the mutator commits **what it was handed**.
+
+`DispatchCommitDetector` asks it after the syntactic forms decline, so a dispatch
+that commits by return or by assignment keeps its classification and this can
+only add machines, never re-attribute one.
+
+#### The root-typed narrowing, found by a fixture
+
+First cut required only that the parameter be *in* H. That regressed
+`examples/nestedroots`, and the failure is instructive: a permitted subtype may
+itself be sealed, so H(child) ⊆ H(parent), and `void setState(Body next)` has a
+parameter inside `Message`'s hierarchy too. `Message` went from correctly
+abstaining — and re-offering `Body` as a root in its own right — to being
+published as a **five-state automaton**, with `Body` then never classified at
+all. A sum type that merely *contains* a machine, reported as one.
+
+Requiring the parameter to be the **root** costs nothing real: a mutator installs
+the machine's state, so its parameter is the type the state field is declared
+with, and a concrete-state parameter could not accept the other states. It is a
+type test, not a name test. The same parent/child leak exists in principle for
+the other commit forms and no fixture exposes it, precisely because
+`nestedroots.Body` is built on the mutation encoding — the one encoding no
+producer recognised. Closing it generally means judging a child against its
+widest enclosing hierarchy, which is a change to the ownership rule, not to this
+recognizer.
+
+#### The dropped gap, also found by a fixture
+
+Making a mutator dispatch a producer means `out` is no longer empty, so the F2
+mutation fallback — guarded on "nothing else found anything" — stopped running.
+That fallback is the **only** thing that records a mutation commit no dispatch
+claimed. On `examples/mutatorshape` that is `restart`, whose commit is real and
+whose source state is unknowable, and skipping it took `Vent` from an honest
+**1/2** to a clean-looking **1/1** with the gap deleted: a transition dropped
+with no unresolved marker, which is the one outcome the record-everything
+invariant forbids by name.
+
+The fallback now also runs when every producer found was a `MUTATOR_ARGUMENT`
+one, and skips hosts a dispatch already walked (`walkedHosts`), so nothing is
+counted twice. `Vent` is back to 1/2 with `restart`'s gap and its diagnostic.
+
+#### The commit axis now reports what it observed
+
+`extractMutationEncoding` announced `FIELD_MUTATION` before walking anything.
+That predates `MUTATOR_ARGUMENT` existing — it was the only label available, so
+it stood for both "writes the state field" and "hands the state to a mutator".
+The form is now recorded at the point a commit is actually walked, so a machine
+committing only through `ctx.setState(...)` is no longer filed under a form it
+does not use.
+
+#### Measured
+
+**Every transition relation in the corpus is unchanged** — verified edge by edge,
+not just by count. Four machines' axis labels became accurate, and one machine is
+new:
+
+| fixture | before | after |
+|---|---|---|
+| `gofcontext.Portal` | MIXED / FIELD_MUTATION, 5/5 | MIXED / **MUTATOR_ARGUMENT**, 5/5 |
+| `plumbing-mutation.Hopper` | MIXED / FIELD_MUTATION, 6/6 | **CENTRALIZED_DISPATCH** / **MUTATOR_ARGUMENT**, 6/6 |
+| `nestedroots.Body` | MIXED / FIELD_MUTATION, 3/3 | **CENTRALIZED_DISPATCH** / **MUTATOR_ARGUMENT**, 3/3 |
+| `mutatorshape.Bolt` | MIXED / FIELD_MUTATION, 3/3 | **CENTRALIZED_DISPATCH** / **MUTATOR_ARGUMENT**, 3/3 |
+| `mutatorshape.Vent` | MIXED / FIELD_MUTATION, 1/2 | **CENTRALIZED_DISPATCH** / **FIELD_MUTATION,MUTATOR_ARGUMENT**, 1/2 |
+
+`Vent` reporting both forms is correct and is the sharpest confirmation the split
+is real: `restart` writes the field directly, `assume` is a mutator, and the
+machine genuinely uses both.
+
+`MIXED` → `CENTRALIZED_DISPATCH` on four of them is the improvement CLAUDE.md's
+own "what to work on next" list asks for ("Reconsider MIXED for Portal / Vend.
+Both are `@Fsm`-marked mutation machines that predate the commit axis"). They sat
+in a bucket labelled "undetermined" only because no recognizer saw their
+dispatch; now one does.
+
+**Second fixture still needed.** Requested: a real-world sealed hierarchy using
+the GoF Context idiom where the driver ALSO has a value-returning transition
+method — the shape whose mutator commits are lost today because the fallback
+never runs. No corpus fixture has it, so that gain is currently argued rather
+than measured.
+
+### Acceptance
+
+`mvn test` — **174/174 green** (3 new). Five goldens changed; every relation is
+identical and only the axis labels moved, except `lcp_automation_chatgpt` from 3a.
