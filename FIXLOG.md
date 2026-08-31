@@ -92,3 +92,68 @@ and it is a one-line change.
 
 `mvn test` — **167/167 green**. `diff -r target/golden-base target/golden-stage0`
 — **empty**, all 40 fixtures, `.dot`, `.scxml` and `summary.txt` alike.
+
+---
+
+## Stage 1 — introduce the types, change no behaviour
+
+New package `io.sealfsm.detect.dispatch`:
+
+* **`DispatchLocus`** — `CENTRALIZED_SWITCH`, `INSTANCEOF_CHAIN`,
+  `POLYMORPHIC_OVERRIDE`, `FUNCTIONAL_CALLABLE`, with `encoding()` mapping the
+  four onto the two-position `StateMachine.Encoding`. The mapping is
+  many-to-one on purpose: a switch and an `instanceof` chain are one dispatch
+  written two ways, and reporting four positions where the thesis claims two
+  would put the spelling of a construct into the axis that says where dispatch
+  lives.
+* **`DispatchArm`** — `(fromSimpleName, body, guard, eventLabel)`. `null`
+  from-state means "reached in more than one state, or in one the analysis could
+  not determine" — never a stand-in for the first state we thought of. The
+  javadoc pins F17 in the type: a type test that SELECTS the state belongs in
+  `fromSimpleName`, never in `guard`.
+* **`DispatchSite`** — `(locus, host, node, arms)`. `node` is the discrimination
+  itself, not the host body, because walking a field-mutation host whole reads
+  its trailing `return this.state;` as a producer with no attributable source.
+  `hostKey()` is `declaringType#signature`, the key hosts are deduped on
+  everywhere else in the codebase.
+* **`Commit`** — `(form, value, at)`. `value` may be null: a chain commits inside
+  each branch, so the classifier can answer "this dispatch commits by field
+  mutation" before any particular branch is walked.
+
+Two verbatim moves, with the old names kept as delegations so no call site
+outside the package changed:
+
+* `DispatchCommitDetector.commitFormOf` → **`CommitClassifier.classify`**, plus
+  `commitOfTarget` → `CommitClassifier.ofTarget`, which `commitFormOf` calls and
+  which the chain path and the extractor also ask. Splitting them would have left
+  two definitions of "what counts as a commit".
+* `CarrierTransitionDetector.nestsHierarchyValue` and `composesFromOwnParts` →
+  **`CompositionVeto`**, together with the F20 helper family they are written in
+  terms of (`isCurrentState`, `containsHierarchyValue`, `buildsFromHierarchy`,
+  `readsCurrentState`, `bindsPatternVariable`, `discriminates`, `sameVariable`,
+  `isHierarchyValue`, `argumentsOf`, `isReceiver`). Moving the entry points
+  without the helpers would have left the rule split across two files with the
+  interesting half still owned by one locus's detector.
+  `DispatchCommitDetector`'s two ternary-aware wrappers became
+  `CompositionVeto.nestsThroughTernary` / `composesThroughTernary`.
+
+### One behaviour change, and it is a defect fix, not part of the refactor
+
+`TransitionExtractor.findMutators` returned
+`Collections.newSetFromMap(new IdentityHashMap<>())`. Identity is the right
+*equality* there — Spoon gives `CtElement` deep structural equality, so two
+distinct mutators with identical bodies would dedupe into one — but
+`IdentityHashMap` iterates in identity-hash order, which varies between JVM runs.
+Those names reach a diagnostic, so **the same jar over the same sources printed
+`[engage, assume]` on one run and `[assume, engage]` on the next**. Found by the
+golden capture, which is what it is for.
+
+Now a `List` in `getElements` (source) order; each method appears once, so there
+was nothing to dedupe. `target/golden-base` was re-captured from HEAD **with only
+this fix applied**, so the byte-identity gate for the stages ahead is against a
+reproducible baseline rather than one of two possible orderings.
+
+### Acceptance
+
+`mvn test` — **167/167 green**. `diff -r target/golden-base target/golden-stage1`
+— **empty**.

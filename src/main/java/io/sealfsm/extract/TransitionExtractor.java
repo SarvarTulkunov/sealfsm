@@ -1413,8 +1413,19 @@ public final class TransitionExtractor {
      * really installs is recorded — unattributably, hence unresolved — instead of
      * being replaced by a fiction.
      */
-    private Set<CtMethod<?>> findMutators(CtModel model) {
-        Set<CtMethod<?>> found = Collections.newSetFromMap(new IdentityHashMap<>());
+    private List<CtMethod<?>> findMutators(CtModel model) {
+        // A List in model order, not an identity-hashed Set. Identity is the right
+        // EQUALITY here (Spoon gives CtElement deep structural equality, so two
+        // distinct mutators with identical bodies would dedupe into one), but
+        // IdentityHashMap's iteration order follows identity hash codes, which vary
+        // between JVM runs. Those names reach a diagnostic, so the tool's output
+        // text was not reproducible: the same jar over the same sources printed
+        // "[engage, assume]" one run and "[assume, engage]" the next. A result a
+        // reader cannot diff against yesterday's is a research instrument with a
+        // hole in it, and it also defeats any golden-file check. getElements walks
+        // the model in source order, and each method appears once, so there is
+        // nothing to dedupe and the order is the source's.
+        List<CtMethod<?>> found = new ArrayList<>();
         for (CtMethod<?> m : model.getElements(new TypeFilter<>(CtMethod.class))) {
             if (m.getBody() == null) continue;
             List<CtParameter<?>> ps = m.getParameters();

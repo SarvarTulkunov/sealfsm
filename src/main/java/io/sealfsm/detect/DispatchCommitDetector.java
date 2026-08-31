@@ -1,5 +1,9 @@
 package io.sealfsm.detect;
 
+import io.sealfsm.detect.dispatch.Commit;
+import io.sealfsm.detect.dispatch.CommitClassifier;
+import io.sealfsm.detect.dispatch.CompositionVeto;
+
 import io.sealfsm.model.CommitForm;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.BinaryOperatorKind;
@@ -8,17 +12,13 @@ import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtBinaryOperator;
 import spoon.reflect.code.CtBlock;
 import spoon.reflect.code.CtCase;
-import spoon.reflect.code.CtConditional;
-import spoon.reflect.code.CtConstructorCall;
 import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtIf;
 import spoon.reflect.code.CtLambda;
-import spoon.reflect.code.CtLocalVariable;
 import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtStatement;
 import spoon.reflect.code.CtSwitch;
 import spoon.reflect.code.CtSwitchExpression;
-import spoon.reflect.code.CtThisAccess;
 import spoon.reflect.code.CtTypeAccess;
 import spoon.reflect.code.CtTypePattern;
 import spoon.reflect.code.CtVariableAccess;
@@ -539,31 +539,8 @@ public final class DispatchCommitDetector {
      * a commit we must not claim.
      */
     private static CommitForm commitFormOf(CtAbstractSwitch<?> sw, Set<String> hierarchy) {
-        CtElement parent = parentOf(sw);
-        if (parent == null) return null;
-
-        // (a) return switch (sel) { ... };  — H only if the METHOD returns H, which
-        // is what rejects `String describe() { return switch (state) {...}; }`.
-        if (parent instanceof CtReturn<?> || parent instanceof CtYieldStatement) {
-            CtMethod<?> host = enclosingMethod(sw);
-            CtTypeReference<?> ret = host == null ? null : host.getType();
-            return ret != null && hierarchy.contains(ret.getQualifiedName())
-                    ? CommitForm.VALUE_RETURN : null;
-        }
-
-        // (b)/(c) this.field = switch (sel) { ... };  /  field = switch (sel) { ... };
-        // (d) local = switch (sel) { ... };
-        if (parent instanceof CtAssignment<?, ?> asg) {
-            return commitOfTarget(asg.getAssigned(), hierarchy);
-        }
-
-        // (d) H next = switch (sel) { ... };  — declaration-site accumulator.
-        if (parent instanceof CtLocalVariable<?> lv) {
-            CtTypeReference<?> t = lv.getType();
-            return t != null && hierarchy.contains(t.getQualifiedName())
-                    ? CommitForm.LOCAL_ACCUMULATOR : null;
-        }
-        return null;
+        Commit commit = CommitClassifier.classify(sw, hierarchy);
+        return commit == null ? null : commit.form();
     }
 
     /**
@@ -575,7 +552,7 @@ public final class DispatchCommitDetector {
      * commit" a single definition.
      */
     public static boolean isCommitTarget(CtExpression<?> target, Set<String> hierarchy) {
-        return commitOfTarget(target, hierarchy) != null;
+        return CommitClassifier.isCommitTarget(target, hierarchy);
     }
 
     /**
@@ -585,12 +562,7 @@ public final class DispatchCommitDetector {
      * routinely both call their field {@code state}.
      */
     private static CommitForm commitOfTarget(CtExpression<?> target, Set<String> hierarchy) {
-        if (!(target instanceof CtVariableAccess<?> va) || va.getVariable() == null) return null;
-        CtVariableReference<?> vref = va.getVariable();
-        CtTypeReference<?> declared = vref.getType();
-        if (declared == null || !hierarchy.contains(declared.getQualifiedName())) return null;
-        return vref.getDeclaration() instanceof CtLocalVariable<?>
-                ? CommitForm.LOCAL_ACCUMULATOR : CommitForm.FIELD_MUTATION;
+        return CommitClassifier.ofTarget(target, hierarchy);
     }
 
     /**
@@ -632,22 +604,12 @@ public final class DispatchCommitDetector {
     }
 
     private static boolean producesNested(CtExpression<?> value, Set<String> hierarchy) {
-        if (value == null) return false;
-        if (value instanceof CtConditional<?> cond) {
-            return producesNested(cond.getThenExpression(), hierarchy)
-                    || producesNested(cond.getElseExpression(), hierarchy);
-        }
-        return CarrierTransitionDetector.nestsHierarchyValue(value, hierarchy);
+        return CompositionVeto.nestsThroughTernary(value, hierarchy);
     }
 
-    /** {@link CarrierTransitionDetector#composesFromOwnParts}, through a ternary. */
+    /** {@link CompositionVeto#composesFromOwnParts}, through a ternary. */
     private static boolean composesFromOwnParts(CtExpression<?> value, Set<String> hierarchy) {
-        if (value == null) return false;
-        if (value instanceof CtConditional<?> cond) {
-            return composesFromOwnParts(cond.getThenExpression(), hierarchy)
-                    || composesFromOwnParts(cond.getElseExpression(), hierarchy);
-        }
-        return CarrierTransitionDetector.composesFromOwnParts(value, hierarchy);
+        return CompositionVeto.composesThroughTernary(value, hierarchy);
     }
 
     /**
@@ -655,14 +617,7 @@ public final class DispatchCommitDetector {
      * two recognizers cannot disagree about what an H value is.
      */
     static boolean isHierarchyValue(CtExpression<?> e, Set<String> hierarchy) {
-        if (e == null) return false;
-        if (e instanceof CtThisAccess<?>) return true;
-        if (e instanceof CtConstructorCall<?> cc) {
-            CtTypeReference<?> t = cc.getType();
-            return t != null && hierarchy.contains(t.getQualifiedName());
-        }
-        CtTypeReference<?> t = e.getType();
-        return t != null && hierarchy.contains(t.getQualifiedName());
+        return CompositionVeto.isHierarchyValue(e, hierarchy);
     }
 
     private static CtElement parentOf(CtElement e) {
