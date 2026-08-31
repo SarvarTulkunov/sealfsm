@@ -9,6 +9,9 @@ import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtVariableAccess;
 import spoon.reflect.code.CtYieldStatement;
 import spoon.reflect.declaration.CtElement;
+import spoon.reflect.declaration.CtField;
+import spoon.reflect.declaration.CtType;
+import spoon.reflect.declaration.ModifierKind;
 import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.reference.CtVariableReference;
@@ -62,8 +65,19 @@ public final class CommitClassifier {
         if (parent instanceof CtReturn<?> || parent instanceof CtYieldStatement) {
             CtMethod<?> host = enclosingMethod(sw);
             CtTypeReference<?> ret = host == null ? null : host.getType();
-            return ret != null && hierarchy.contains(ret.getQualifiedName())
-                    ? new Commit(CommitForm.VALUE_RETURN, valueOf(sw), parent) : null;
+            if (ret == null) return null;
+            if (hierarchy.contains(ret.getQualifiedName())) {
+                return new Commit(CommitForm.VALUE_RETURN, valueOf(sw), parent);
+            }
+            // The codomain is outside H, but it may still CARRY a state. A wrapper
+            // with exactly one hierarchy-typed component is transparent: the
+            // successor is in there and the analysis can name which slot. This is
+            // the combination no recognizer could reach while the axes were fused —
+            // the carrier detector demanded a per-subtype override and the switch
+            // detector demanded an H-typed commit, so a centralized transition
+            // table returning a carrier matched neither.
+            return carrierComponentOf(ret, hierarchy) != null
+                    ? new Commit(CommitForm.CARRIER_RETURN, valueOf(sw), parent) : null;
         }
 
         // (b)/(c) this.field = switch (sel) { ... };  /  field = switch (sel) { ... };
@@ -103,6 +117,57 @@ public final class CommitClassifier {
     /** Is writing to {@code target} how a successor gets installed? */
     public static boolean isCommitTarget(CtExpression<?> target, Set<String> hierarchy) {
         return ofTarget(target, hierarchy) != null;
+    }
+
+    /**
+     * The single hierarchy-typed component of a carrier type, or {@code null}.
+     *
+     * <p>A "component" is a non-static field: for a {@code record} Spoon models the
+     * components as fields, so this covers both spellings without depending on the
+     * record API, which has moved across Spoon versions.
+     *
+     * <p>Three answers, and each {@code null} is a deliberate refusal:
+     * <ul>
+     *   <li>R is itself in H — then it is not a carrier, it is the state, and the
+     *       caller has already handled that as {@code VALUE_RETURN};</li>
+     *   <li>R's declaration was never read — under {@code noClasspath} an
+     *       unresolvable type has no fields to inspect, and an empty field list is
+     *       then evidence of nothing (the F11 rule: a body the analysis did not
+     *       read may not be reasoned from);</li>
+     *   <li>R has several hierarchy-typed components — which one is the successor
+     *       is genuinely ambiguous, so the commit is declined rather than guessed.
+     *       Same rule {@code soleEnumComponent} applies to &Sigma;.</li>
+     * </ul>
+     *
+     * <p><b>Nothing here keys on a name.</b> Not the type's, not the field's. A
+     * carrier is recognised by having a slot of the right type, which is what
+     * makes {@code record Step(TcpState next, Action a)} and
+     * {@code record Outcome(Action a, TcpState s)} the same shape.
+     */
+    public static CtTypeReference<?> carrierComponentOf(CtTypeReference<?> r,
+                                                        Set<String> hierarchy) {
+        if (r == null) return null;
+        if (hierarchy.contains(r.getQualifiedName())) return null;
+        CtType<?> decl;
+        try {
+            decl = r.getTypeDeclaration();
+        } catch (Throwable t) {
+            return null;
+        }
+        if (decl == null) return null;
+        CtTypeReference<?> only = null;
+        try {
+            for (CtField<?> f : decl.getFields()) {
+                if (f.hasModifier(ModifierKind.STATIC)) continue;
+                CtTypeReference<?> ft = f.getType();
+                if (ft == null || !hierarchy.contains(ft.getQualifiedName())) continue;
+                if (only != null) return null;   // ambiguous: decline, never guess
+                only = ft;
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        return only;
     }
 
     private static CtExpression<?> valueOf(CtAbstractSwitch<?> sw) {

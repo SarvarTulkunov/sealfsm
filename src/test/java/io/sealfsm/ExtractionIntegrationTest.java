@@ -47,6 +47,35 @@ class ExtractionIntegrationTest {
         return launcher.getModel();
     }
 
+    // ---- 3a: (CENTRALIZED_SWITCH, CARRIER_RETURN) ---------------------------
+
+    /**
+     * The cell that was unreachable while dispatch and commit were fused: a
+     * centralized transition table whose arms hand the successor to a wrapper.
+     *
+     * <p>Three switches over one hierarchy on one class, differing only in what
+     * they fold into, so the codomain is the only thing the recognizer can be
+     * reacting to. Exactly one is a machine, and the two controls — a fold into a
+     * record with no hierarchy-typed slot, and one into a record with two — must
+     * contribute nothing. Accepting either would report an exhaustive fold as an
+     * automaton, or resolve a successor by field order.
+     */
+    @Test
+    void centralizedSwitchReturningACarrierIsExtracted() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("src/test/resources/carrierdispatch"));
+        StateMachine m = single(r);
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
+        assertTrue(m.commitForms().contains(CommitForm.CARRIER_RETURN),
+                "the successor is installed through a wrapper, at a centralized locus");
+        assertEquals(3, m.allStates().size());
+        assertEquals(3, m.transitions().size(),
+                "one edge per arm of the ONE committing switch; the two controls add none");
+        assertEquals(3, m.resolvedTransitionCount(), "every successor is unwrapped from the carrier");
+        assertTrue(hasResolved(m, "Idle", "Live"));
+        assertTrue(hasResolved(m, "Live", "Done"));
+        assertTrue(hasResolved(m, "Done", "Done"));
+    }
+
     private StateMachine single(ExtractionResult r) {
         assertEquals(1, r.machines().size(), "expected exactly one machine");
         return r.machines().get(0);
@@ -1897,12 +1926,19 @@ class ExtractionIntegrationTest {
         assertTrue(forms.contains(SuccessorForm.ENUM_CONSTANT));
 
         // ...and the commit axis is what separates the idioms that share an
-        // encoding. All four positions are exercised, which is the whole point of
+        // encoding. Every position is exercised, which is the whole point of
         // reporting it: recall stratified by idiom rather than pooled per encoding.
+        //
+        // CARRIER_RETURN joined the set when the dispatch and commit axes were
+        // separated. It is the carrier commit at a CENTRALIZED locus, which no
+        // recognizer could reach while each hard-coded a locus and a commit as one
+        // pair, and examples/lcp_automation_chatgpt is the corpus member that was
+        // rejected outright ("no transition producer found") until it existed.
         Set<CommitForm> commits = r.machines().stream()
                 .flatMap(m -> m.commitForms().stream()).collect(Collectors.toSet());
         assertEquals(Set.of(CommitForm.VALUE_RETURN, CommitForm.FIELD_MUTATION,
-                        CommitForm.LOCAL_ACCUMULATOR, CommitForm.POLY_CARRIER), commits,
+                        CommitForm.LOCAL_ACCUMULATOR, CommitForm.POLY_CARRIER,
+                        CommitForm.CARRIER_RETURN), commits,
                 "the corpus must exercise every commit form");
     }
 

@@ -55,6 +55,44 @@ public enum CommitForm {
      * The successor is an argument to a shallow, non-hierarchy carrier object
      * returned by a per-state method:
      * {@code return Transition.to(new LastAck(), Action.SND_FIN);}.
+     *
+     * <p>This is {@link #CARRIER_RETURN} observed at the
+     * {@code POLYMORPHIC_OVERRIDE} locus. The two are one commit mechanism, and
+     * the only reason they are separate values is continuity: the thesis's
+     * stratified recall table is keyed on this enum and already names
+     * {@code POLY_CARRIER}. Collapsing them is a one-line change plus a golden
+     * re-baseline, and it is the thesis author's call, not the refactor's.
      */
-    POLY_CARRIER
+    POLY_CARRIER,
+
+    /**
+     * The successor is carried out of the dispatch inside a wrapper the analysis
+     * can see through: the method returns some type R outside the hierarchy, and R
+     * has exactly one hierarchy-typed component.
+     *
+     * <pre>{@code
+     *   record Step(TcpState next, Action action) { }
+     *
+     *   static Step next(TcpState s, Event e) {
+     *       return switch (s) {                       // CENTRALIZED_SWITCH
+     *           case Listen l -> new Step(new SynReceived(), Action.SND_SYN_ACK);
+     *           ...
+     *       };
+     *   }
+     * }</pre>
+     *
+     * <p>Reachable at <em>every</em> locus, which is the point. Before the axes
+     * were split this combination existed in no recognizer: the carrier detector
+     * required a per-subtype override, and the switch detector required the commit
+     * to be a hierarchy value, so a centralized transition table whose arms return
+     * a carrier matched neither and the whole hierarchy was lost.
+     *
+     * <p>The single-component requirement is what keeps the exhaustive-fold guard
+     * intact. {@code String describe(State s) { return switch (s) {...}; }} folds
+     * into a type with no hierarchy-typed component and is rejected exactly as
+     * before; several such components are ambiguous about which one is the
+     * successor, so the commit is declined rather than guessed — the same rule
+     * {@code soleEnumComponent} applies to &Sigma;.
+     */
+    CARRIER_RETURN
 }

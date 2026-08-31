@@ -76,6 +76,58 @@ class DispatchCommitDetectorTest {
         return ps.stream().map(Producer::commit).collect(Collectors.toSet());
     }
 
+    // ---- 3a: the carrier commit, at a CENTRALIZED locus ---------------------
+
+    /**
+     * The combination that was unreachable while the two axes were fused.
+     *
+     * <p>{@code static Step route(Signal, int)} is a centralized transition table
+     * whose arms hand the successor to a wrapper. It satisfies both halves of a
+     * valid pair — a discrimination over H, and a commit that installs a state —
+     * and matched no recognizer: the carrier detector required a per-subtype
+     * override, the switch detector required the commit to BE a hierarchy value.
+     */
+    @Test
+    void switchFoldingIntoACarrierWithOneHierarchyComponentIsAProducer() {
+        List<Producer> ps = producers("src/test/resources/carrierdispatch",
+                "carrierdispatch.Signal");
+        assertEquals(1, ps.size(),
+                "exactly one of the three switches commits; the other two are controls");
+        assertEquals(Set.of(CommitForm.CARRIER_RETURN), commits(ps));
+        assertEquals("route", ps.get(0).host().getSimpleName());
+    }
+
+    /**
+     * The negative control, and the one that matters: the exhaustive-fold guard
+     * must survive the widening. {@code describe} is the SAME discrimination over
+     * the SAME hierarchy, on the same class, folding into a record with no
+     * hierarchy-typed component — so only the codomain separates it from
+     * {@code route}, which is exactly the separation the commit requirement
+     * exists to make.
+     */
+    @Test
+    void switchFoldingIntoATypeWithNoHierarchyComponentStaysRejected() {
+        List<Producer> ps = producers("src/test/resources/carrierdispatch",
+                "carrierdispatch.Signal");
+        assertTrue(ps.stream().noneMatch(p -> "describe".equals(p.host().getSimpleName())),
+                "a fold into a carrier-shaped type with no hierarchy slot is still a fold");
+    }
+
+    /**
+     * The ambiguity control. {@code fork} folds into a record with TWO
+     * hierarchy-typed components, so no slot is <em>the</em> successor. Resolving
+     * it by field order would publish a resolved edge to a state chosen by
+     * declaration order — a fabrication, and the one failure mode the soundness
+     * invariant forbids outright. Declining is the answer.
+     */
+    @Test
+    void carrierWithTwoHierarchyComponentsIsDeclinedRatherThanGuessed() {
+        List<Producer> ps = producers("src/test/resources/carrierdispatch",
+                "carrierdispatch.Signal");
+        assertTrue(ps.stream().noneMatch(p -> "fork".equals(p.host().getSimpleName())),
+                "which of two hierarchy-typed slots is the successor is undecidable");
+    }
+
     // ---- accepted commits ---------------------------------------------------
 
     @Test

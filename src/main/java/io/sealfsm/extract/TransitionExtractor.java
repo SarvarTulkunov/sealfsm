@@ -3,6 +3,7 @@ package io.sealfsm.extract;
 import io.sealfsm.detect.CarrierTransitionDetector;
 import io.sealfsm.detect.DispatchCommitDetector;
 import io.sealfsm.detect.dispatch.CasePatterns;
+import io.sealfsm.detect.dispatch.CommitClassifier;
 import io.sealfsm.detect.dispatch.DispatchFinder;
 import io.sealfsm.detect.dispatch.DispatchLocus;
 import io.sealfsm.detect.dispatch.DispatchSite;
@@ -157,9 +158,21 @@ public final class TransitionExtractor {
     private enum Route { OVERRIDE, CARRIER, CENTRALIZED_METHOD, COMMIT_DISPATCH, FUNCTIONAL,
                          MUTATION_FALLBACK }
 
-    /** Is the walker inside a carrier-encoded body? The old {@code carrierMode}. */
-    private boolean inCarrier() {
-        return walkSite != null && walkSite.route() == Route.CARRIER;
+    /**
+     * Does the site being walked install its successor through a <em>carrier</em>?
+     * The old {@code carrierMode}, asked of the commit rather than of the caller —
+     * which is what makes it true at every locus instead of only at
+     * {@code POLYMORPHIC_OVERRIDE}.
+     *
+     * <p>Both carrier commits answer yes, and the scope line they share is the
+     * reason they must: a successor COMPUTED inside a helper stays unresolved
+     * rather than being chased, whether the wrapper was returned by a per-state
+     * override or by a centralized switch. Reading that bound off the route would
+     * have made it an accident of which recognizer ran.
+     */
+    private boolean commitsThroughCarrier() {
+        return walkSite != null && (walkSite.commit() == CommitForm.POLY_CARRIER
+                || walkSite.commit() == CommitForm.CARRIER_RETURN);
     }
 
     /** Is the walker inside the F2 mutation fallback? The old {@code mutationMode}. */
@@ -1700,16 +1713,37 @@ public final class TransitionExtractor {
      */
     private boolean resolveInterprocedural(CtInvocation<?> inv, String from, String event,
                                            String guard, Set<Transition> out) {
-        if (inCarrier()) {
-            // F8 scope boundary: the carrier encoding is analysed strictly
-            // intra-procedurally. A successor computed by a helper stays
-            // UNRESOLVED — never followed, never guessed.
+        if (walkSite != null && walkSite.commit() == CommitForm.POLY_CARRIER) {
+            // F8 scope boundary: the POLYMORPHIC_OVERRIDE carrier encoding is
+            // analysed strictly intra-procedurally. A successor computed by a
+            // helper stays UNRESOLVED — never followed, never guessed. CLAUDE.md
+            // lists this as a v1 scope line, so it is left exactly where it was.
+            //
+            // It is keyed on POLY_CARRIER and not on "any carrier" deliberately.
+            // The bound was a statement about that PATH — walkCarrier never had a
+            // fold to disable — and reading it as a statement about carriers in
+            // general would export it to a locus that has no reason for it: at a
+            // centralized switch, `case Initial i -> handleInitial(i, e)` is the
+            // ordinary factoring of a large table, and F3/F18 already fold exactly
+            // that shape when the helper returns H. Declining only because the
+            // helper returns a WRAPPER would mean the same source, refactored in
+            // nothing but its return type, loses its entire relation — which is
+            // the idiom-sensitivity the locus/commit split exists to remove.
             return false;
         }
         CtExecutableReference<?> exe = inv.getExecutable();
         if (exe == null) return false;
         CtTypeReference<?> ret = exe.getType();
-        if (ret == null || !hierarchyQualifiedNames.contains(ret.getQualifiedName())) {
+        if (ret == null) return false;
+        boolean producesState = hierarchyQualifiedNames.contains(ret.getQualifiedName());
+        // A helper that returns the same CARRIER this dispatch commits through is
+        // producing a state too — one slot further in. Its returns are unwrapped by
+        // handleValue on the way back out, by the same one-level rule, so nothing
+        // about the approximation's depth changes; only the shape of what the
+        // budget is spent on does.
+        boolean producesCarrier = !producesState && commitsThroughCarrier()
+                && CommitClassifier.carrierComponentOf(ret, hierarchyQualifiedNames) != null;
+        if (!producesState && !producesCarrier) {
             return false; // not a state-producing call
         }
         if (!(exe.getExecutableDeclaration() instanceof CtMethod<?> callee) || callee.getBody() == null) {
@@ -2464,6 +2498,28 @@ public final class TransitionExtractor {
         // can, otherwise fall through and record it unresolved as before.
         if (value instanceof CtInvocation<?> inv
                 && resolveInterprocedural(inv, from, event, guard, out)) {
+            return;
+        }
+        // CARRIER_RETURN: this dispatch's arms hand the successor to a wrapper, so
+        // the produced value IS the wrapper and must be unwrapped before it can be
+        // resolved. The unwrapping is handleCarrierValue's, unchanged and shared —
+        // one level into the arguments, F9 applied at the call, a recorded gap when
+        // the successor is computed elsewhere. Sharing it rather than restating it
+        // is what makes this a new (locus, commit) cell rather than a second
+        // carrier implementation free to drift from the first.
+        //
+        // BELOW the fold attempt, and the order is load-bearing. `case Initial i ->
+        // fromInitial(event)` is a call whose type is the carrier, so unwrapping
+        // first finds no hierarchy-typed argument in `(event)` and records a gap —
+        // for every arm, on a machine whose relation is entirely in its helpers.
+        // Folding first lets the helper's own returns arrive here as the carrier
+        // constructions they are, and they unwrap.
+        //
+        // Inert on the POLYMORPHIC_OVERRIDE carrier path: there handleCarrierValue
+        // is already the walker and only calls back here with a value it has
+        // ALREADY unwrapped, which isCarrierStateValue answers true for.
+        if (commitsThroughCarrier() && !isCarrierStateValue(value)) {
+            handleCarrierValue(value, from, event, guard, out);
             return;
         }
         // F20: this value COMPOSES a hierarchy value — it builds a node around

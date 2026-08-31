@@ -234,3 +234,107 @@ what let each walker be selected by data instead of by a hard-coded pairing.
 
 `mvn test` — **167/167 green**. `diff -r target/golden-base target/golden-stage2`
 — **empty**. No re-baselining.
+
+---
+
+## Stage 3 — widening, one commit per axis value
+
+### Already present at HEAD (verified, not re-implemented)
+
+Four of the six stage-3 items are on `master`, each with its own fixture and
+tests. As in stage 0, they were verified in place:
+
+| item | already at HEAD as | where |
+|---|---|---|
+| 3c `InstanceofChainFinder` for named methods | **F17** | `DispatchCommitDetector.chainOf` / `addChainProducer`, `TransitionExtractor.walkTypeChain`, fixture `examples/chaindispatch` |
+| 3d delete the H-typed-parameter requirement | **F19** | `findCentralizedTransitionMethods` now asks `discriminatesState`, fixture `examples/statefuldriver` |
+| 3e re-offer nested sealed subtypes of a rejected root | present | `SealedHierarchyDetector.permittedSealedSubtypes` + the `Analyzer` worklist, fixture `examples/nestedroots` |
+| 3f summarise a helper whose returns live in a `CtSwitch` | **F18** | `collectReturnsInto` is gone; the fold reuses `walk`, fixture `examples/hiddenreturns` |
+
+Three carry a refinement the stage-3 wording does not, and each is load-bearing:
+
+* **3c** — a chain additionally needs **two discriminated branches** and one
+  selector throughout. An `if` is a far weaker signal than a `switch` over a
+  sealed type: one type test is a *check*, not a dispatch, and a method testing
+  two unrelated H values is not one chain. `chaindispatch.RelayBoard.reset()`
+  pins the price — a single committing type test contributes no edge.
+* **3d** — dropping the parameter requirement with nothing in its place admits
+  every factory and accessor in the model. `discriminatesState` carries the input
+  load, the commit check carries the codomain load, and the parameter keeps a
+  *scope* job: a host handed the state has its whole body walked, one that only
+  returns H has only its discrimination walked.
+* **3e** — only an **ABSTENTION** releases the nested subtypes. The compositional
+  veto is a verdict about the data type, and a member of a recursive data type is
+  still one. `nestedroots.Node` is the control.
+
+### 3a — `CommitForm.CARRIER_RETURN`, at every locus  (implemented)
+
+`CommitClassifier.carrierComponentOf(R, H)` returns the single hierarchy-typed
+component of `R`, else `null`. A "component" is a non-static field — Spoon models
+a record's components as fields, so both spellings are covered without depending
+on the record API, which has moved across versions. Three `null` answers, each a
+deliberate refusal: R is itself in H (that is `VALUE_RETURN`, already handled); R
+was never read (F11 — an empty field list on an unread declaration is evidence of
+nothing); R has **several** hierarchy-typed components (which slot is the
+successor is undecidable, and picking one by field order fabricates a resolved
+edge). Nothing keys on a name — not the type's, not the field's.
+
+In `CommitClassifier.classify`, a returned value whose host return type is
+outside H but has a carrier component is `CARRIER_RETURN`. **The exhaustive-fold
+guard survives intact**: a fold into a type with no hierarchy-typed slot is
+rejected by exactly the codomain test that rejected it before.
+
+`TransitionExtractor` unwraps such a value through `handleCarrierValue` — the
+same one-level rule, shared rather than restated, so this is a new
+`(locus, commit)` cell and not a second carrier implementation free to drift.
+
+**The ordering of the unwrap is load-bearing, and getting it wrong scored 0/10.**
+Placed *above* the inter-procedural fold, `case Initial i -> fromInitial(event)`
+is a call whose type is the carrier: unwrapping first finds no hierarchy-typed
+argument in `(event)` and records a gap — for every arm, on a machine whose whole
+relation lives in its helpers. Placed *below* it, the helper's own returns arrive
+as the carrier constructions they are and unwrap.
+
+The fold's guard was widened to match: a helper returning the same carrier the
+dispatch commits through is producing a state too, one slot further in. The
+POLY_CARRIER scope line is **untouched**, and is now keyed on `POLY_CARRIER`
+explicitly rather than on "any carrier" — it was a statement about the
+`walkCarrier` path, which never had a fold to disable, and exporting it to a
+centralized locus would mean the same source, refactored in nothing but its
+return type, loses its entire relation.
+
+**Measured.** Unit tests: `src/test/resources/carrierdispatch/` holds three
+switches over one hierarchy on one class, differing only in what they fold into —
+the case, a fold into a record with **no** hierarchy slot (the exhaustive-fold
+control), and a fold into one with **two** (the ambiguity control). Only the
+first is a producer; 3/3 edges resolved end to end.
+
+Corpus: **exactly one fixture changed**, and it changed from lost to recovered.
+
+| fixture | before | after |
+|---|---|---|
+| `examples/lcp_automation_chatgpt` | rejected — "no transition producer found", 0 machines | CENTRALIZED_DISPATCH / CARRIER_RETURN, 10 states, **111/111 resolved** |
+
+That is a 10-state RFC 1661 LCP machine the tool previously reported as *not a
+state machine at all*. It is also the corpus's strongest new validation point:
+`examples/lcp_automation` is the same RFC recovered at 113/113 through
+VALUE_RETURN delegation, so the corpus now holds one specification implemented
+twice, independently, under two different commit forms, and recovers essentially
+the same relation from both.
+
+The other 39 fixtures are **byte-identical**. `allExamplesTogether`'s
+commit-form completeness assertion gained `CARRIER_RETURN` — its purpose is that
+the corpus exercises every position of the axis, and it now does.
+
+**Second fixture still needed.** Per the working agreement, the independently
+sourced fixture that exercises this same generality is to be supplied rather than
+invented. `examples/lcp_automation_chatgpt` arrived as the corpus fixture by
+accident of the widening, and `src/test/resources/carrierdispatch/` is a unit-test
+resource I wrote, not independent evidence. **Requested: a real-world sealed
+hierarchy whose centralized dispatch returns a carrier** — ideally one where the
+carrier also holds actions or output symbols, since that is why the idiom exists.
+
+### Acceptance
+
+`mvn test` — **171/171 green** (4 new). One golden changed, and it is a
+capability gain: a hierarchy that was rejected is now extracted.
