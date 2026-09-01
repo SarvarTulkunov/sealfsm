@@ -30,8 +30,11 @@ The tool is built around that asymmetry. Anything it cannot resolve on the trans
  │              │                                      │
  │              ▼                                      │
  │  StateMachineClassifier                             │
- │    └─ FSM or plain sum type? ──────▶ rejected       │
- │              │                       (e.g. Shape)   │
+ │    ├─ dispatch? commit? ───────────▶ rejected       │
+ │    │                                 (e.g. Shape)   │
+ │    ├─ dispatch, no commit ─────────▶ CANDIDATE      │
+ │    │                                 (states only)  │
+ │              │                                      │
  │              ▼                                      │
  │     ┌────────┴────────┐                             │
  │     ▼                 ▼                             │
@@ -236,13 +239,29 @@ The `--returns` flag is especially useful: it shows the exact `CtExpression` sub
 | `examples/gofcontext` | mutation / GoF | 3 states; transitions via `ctx.setState(...)` field mutation; recovers the **same edge set** as `examples/door` (finding F2) |
 | `examples/factory` | centralized | 3 states; arms **delegate to helper/factory methods**; resolved via bounded inter-procedural summaries, out-of-budget target stays unresolved (finding F3) |
 | `examples/eventalphabet` | centralized | 3 states; nested `switch (event)` — recovers Σ = {Play, Pause, Stop, Skip} from the sealed event type and labels each edge with its event (finding F4) |
-| `examples/shape` | — (negative) | **rejected** as a plain sum type |
+| `examples/shape` | — (negative) | **rejected** as a plain sum type; nothing discriminates it, so not even a candidate |
+| `examples/voidcommit` | centralized | 4 states; the arms are bare calls and the commit is an H-typed field write **inside the callee** — recovered by the k = 1 commit-existence probe, 0/4 resolved by design (Tier 2, finding F26) |
+| `examples/voidfold` | — (negative) | **rejected**; indistinguishable from `voidcommit` at the call site, differing only in that its callee writes a `String`. Reported as a **candidate** with all 4 states |
 
 The `examples/door` case deliberately exercises the hardest patterns: type-pattern `from`-states, constructor-call targets, a guarded ternary transition, and a `return current;` self-loop.
 
 The `examples/turnstile` case targets the control-flow walker directly: each switch arm contains an imperative `if (event instanceof …) yield new X();` followed by a fall-through `yield` of the current state. It verifies that values produced *inside* an `if` are recovered with the condition as guard, and that the guardless fall-through is guarded by the negated condition.
 
 The `examples/gofcontext` case is the GoF State pattern: the `PortalContext` holds a state field and each state's `handle(ctx, event)` method transitions by calling `ctx.setState(new …())`. It proves the mutation encoding converges on the same FSM as the return-based `examples/door`. (It carries an `@Fsm` marker because a hierarchy whose transitions are pure field mutations is not recognised by the structural classifier — detecting that family automatically is future work.)
+
+### Three outcomes, not two
+
+State enumeration is exact by construction and does **not** depend on transition
+recovery, so the classifier has three positions rather than two:
+
+| tier | dispatch | commit | successors | reported as |
+|---|---|---|---|---|
+| **1** | present | proven | ≥ 1 resolved | a machine, with a transition relation |
+| **2** | present | proven | none resolved | a machine; complete states, one unresolved edge per dispatched arm, each with a known source |
+| **3** | present | **not** proven | — | a **candidate** on `ExtractionResult.candidates()`: complete states, dispatch sites named, no relation claimed, no `.dot`/`.scxml` |
+
+A candidate is never counted as a machine. The line between tiers 2 and 3 is the
+commit requirement, which is the tool's whole precision guard — see `SCOPE.md`.
 
 `sample-output/` contains the reference DOT/SCXML that the tool should produce. After building, `diff` your output against these to verify correctness.
 

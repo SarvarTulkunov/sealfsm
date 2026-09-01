@@ -900,3 +900,247 @@ specification, so agreement is evidence about the extractor, not a ground truth.
 The 49 cells `lcp_automation_chatgpt` leaves undefined (F9-suppressed) against
 `lcp_automation`'s 31 `throw`s is a real difference between the two sources, not
 a recall gap in either.
+
+---
+
+## F26 — states were only enumerated on the accepted path, and a commit one call away was invisible
+
+Two independent defects, of different kinds, established by Step 0 of
+`PROMPT_decouple_states_from_transitions.md` before either was touched. The full
+investigation, with verbatim probe output and file:line references, is
+`INVESTIGATION.md`; this entry records the finding as that investigation
+established it, not the symptom as it was reported.
+
+### The finding
+
+**(i) Structural coupling.** The tool makes two claims of different strength and
+their independence is its central contribution: states come from a
+compiler-checked `permits` clause and are **exact**; transitions are recovered by
+intra-procedural data flow and are **approximate**. `Analyzer.analyze` derived the
+state set only on the accepted path — `StateExtractor` is invoked once, at
+`Analyzer.java:121`, *after* the `continue` at `Analyzer.java:108` — so a
+hierarchy whose transition producer no recognizer matched reported **zero
+states**. Claim 1 had quietly become "states are exact *when transitions
+resolve*", which is a materially weaker claim and one the tool does not need to
+make. `DebugHarness` confirms it independently: STAGE 4 is never reached for a
+rejected root. The states were not extracted and discarded; they were never
+extracted.
+
+**(ii) Missing capability.** `CommitClassifier` reads the commit from the
+dispatch's *immediate syntactic context*, which is right and is the precision
+guard. But a `switch` **statement** whose arms are bare calls has no such
+context — Java discards an expression statement's value (JLS §14.8), so there is
+no codomain to read, no assignment, no local declaration — and the commit is a
+side effect inside the callee. Such a dispatch was not a recognised dispatch at
+all.
+
+**(i) is not caused by (ii)**, which is why they are recorded as two findings.
+Closing (ii) alone moves one shape and leaves every *other* unrecognised idiom,
+plus every genuine non-machine, reporting zero states.
+
+**A third, smaller finding** is (i)'s diagnostic counterpart: `--explain` printed
+`FAILED — none found` both for "nothing discriminates this hierarchy" and for
+"three dispatches discriminate it and not one commits", because the count it
+rendered was the *composed* one (`DispatchFinder.producerSites`, i.e. locus and
+commit and veto). The channel could not express the distinction that Tier 3 *is*.
+
+### Step 0, and the branch it selected
+
+Three throwaway probes, same hierarchy and same exhaustive dispatch, varying only
+the callee: `returnh` (H-returning helper), `voidh` (void helper writing an
+H-typed field), `voidforeign` (void helper writing a `String` field).
+
+| probe | at HEAD | branch it rules out |
+|---|---|---|
+| `returnh` | **accepted**; 3 states, 0/3, one unresolved edge per arm | **A** — the codomain proof is already held and used. No recognition bug at this cell, and nothing was reimplemented behind a probe |
+| `voidh` | abstains, **0 states** | — the genuine gap |
+| `voidforeign` | abstains, **0 states**, trace line-for-line identical to `voidh` | **C** — nothing is over-admitted |
+
+`returnh` already produced the Tier 2 contract in full, which is why no part of
+Branch A was implemented: a smaller true finding is worth more than a large
+speculative one. Branch **B**.
+
+### The fix
+
+Three pieces, and only the third is a widening.
+
+1. **`ExtractionResult.candidates()` and `model/Candidate`** — the decoupling.
+   A rejected root that *is* discriminated now has its complete `permits` closure
+   enumerated by the same `StateExtractor` call the machine path makes, nesting
+   and all, and is reported as **Tier 3**: not a machine, no `.dot`, no `.scxml`,
+   no transition relation claimed, and its states named exactly. Two conditions,
+   both load-bearing: only an **ABSTENTION** (a veto is a positive verdict about
+   the data type and binds on its members — the same distinction that governs the
+   re-offer worklist), and only where a **dispatch was actually found** (dropping
+   that half makes every sealed type a candidate, at which point the channel
+   distinguishes nothing). `examples/shape` is the control for the second.
+2. **`--explain` separates locus from commit.** `DispatchFinder.locusSites`
+   answers the locus half alone, `DispatchCommitDetector.chainHeads` is its chain
+   component and is consumed by `find` rather than duplicated, and the trace now
+   ends by naming the tier.
+3. **`CommitProbe` — the k = 1 commit-existence probe.** For an arm whose
+   statement is a bare call, open the callee's body *once* and ask only *does this
+   install a hierarchy value?*, never *which one*. Asked strictly **after** every
+   direct rule has declined, so it can only add machines and never re-attribute
+   one; `CompositionVeto` still runs after it.
+
+`CalleeBody` was extracted so F9 (`neverReturnsNormally`) and F11 (`isShadow`)
+have **one** implementation, called by both `TransitionExtractor` and the probe.
+That is the standing rule in this codebase, and here the drift would have been a
+body one caller suppresses an edge for and another admits one from.
+
+### What the probe may count as evidence — one clause, and why the other three collapse
+
+The prompt scoped the probe to four questions (return with codomain in H, assign
+an H-typed field, assign an H-typed local subsequently committed, hand a value to
+a recognised mutator). Three of them are **inert by construction**, and saying so
+is more useful than implementing them:
+
+* a **`return`** inside the callee installs nothing, because *this* caller
+  discards the value (JLS §14.8). Counting it would admit `describe(state);`
+  called for its ignored result;
+* an **H-typed local** dies with the frame; and if it is "subsequently committed",
+  the committing act is itself a field write in the same body — already seen. A
+  second rule for it would be a second notion of one thing;
+* a **mutator call** inside the callee needs the *mutator's* body read, which is a
+  second hop. The probe's depth is exactly 1 and is independent of the k = 2
+  resolution budget. The one-hop spelling (an arm calling the mutator directly) is
+  already `MUTATOR_ARGUMENT` and is asked before this.
+
+Also forced: the probe never applies to an arm whose produced **value** is a call.
+If that value is committed, the commit is already `DIRECT`; if it is not, the
+caller either discards it or routes it outside H, and no callee body can license
+either. So the probe's whole added reach is the bare-call-statement shape.
+
+**One narrowing was found by a fixture, not by inspection.** The written field's
+declared type must be the hierarchy **ROOT**, not merely a member — the identical
+clause `MutatorRecognizer.soleRootParameter` makes, caught by the identical
+fixture. A permitted subtype may itself be sealed, so H(child) is a subset of
+H(parent), and `BodyContext.setState` writing a `Body`-typed field proved a commit
+for `Message`: `examples/nestedroots` published the containing sum type as a
+five-state automaton and, because an accepted parent claims its members, **lost
+`Body`** — the real machine — altogether. It appeared as a corpus diff on the
+first build and is now pinned by `everyExistingGoldenIsUnchanged`.
+
+### The IR
+
+`CommitEvidence` (`DIRECT` / `VIA_CALLEE` / `UNPROVEN`), per machine, weakest-wins
+across the sites walked. It is **not a fourth axis**: the three axes classify how
+a machine is *written*, this records how much the analysis had to open to see it,
+which is a property of the analysis — the same reason `State.isDeclarationUnread`
+is not one either. Pooling it with `CommitForm` would let a gap in the inference
+hide behind the observation, which is the argument that split `MUTATOR_ARGUMENT`
+out of `FIELD_MUTATION`.
+
+`StateMachine.isDetectedEmpty()` is derived (`resolvedTransitionCount() == 0 &&
+!transitions().isEmpty()`), so it cannot drift from the edges it describes.
+
+Surfaced as a DOT graph-level comment and an SCXML comment **only when it is not
+`DIRECT`**, and Main's Tier 2 footnote likewise. That is the rule the
+unread-declaration reporting already follows: on well-formed input every commit is
+direct, so an unconditional line would print `DIRECT` on every diagram in the
+corpus and say nothing. A line that appears is a line that carries information —
+and it is also what keeps every existing `.dot` and `.scxml` byte-identical.
+
+### Which (DispatchLocus x CommitForm) cells this reaches
+
+**None that were unreachable.** This is the honest answer and it is worth stating
+plainly, because the shape of the gain is different from every stage above it.
+The probe establishes `FIELD_MUTATION` at `CENTRALIZED_SWITCH` and at
+`INSTANCEOF_CHAIN`, and both pairs were already reachable — via
+`this.state = switch (state)` and via F17's chain respectively. What is new is a
+**third value orthogonal to the product**, so the table is multiplied rather than
+filled in:
+
+| | CENTRALIZED_SWITCH | INSTANCEOF_CHAIN | POLYMORPHIC_OVERRIDE | FUNCTIONAL_CALLABLE |
+|---|---|---|---|---|
+| `DIRECT` | R | R | R | R |
+| `VIA_CALLEE` | **R** (`examples/voidcommit`) | **r** — reachable, untested | — | — |
+
+`INSTANCEOF_CHAIN` x `VIA_CALLEE` is reachable — `addChainProducer` asks the probe
+of `chainBranches(chain)` on exactly the switch's terms — but **no fixture writes
+a chain whose branches are bare calls committing inside a callee**, so it is
+argued rather than measured. It joins `INSTANCEOF_CHAIN` x `LOCAL_ACCUMULATOR` as
+the second cell in that state.
+
+`POLYMORPHIC_OVERRIDE` x `VIA_CALLEE` and `FUNCTIONAL_CALLABLE` x `VIA_CALLEE` are
+**not reachable, deliberately**. An override's commit *is* its codomain and a
+functional callable's likewise, so at those loci there is no bare-call arm for the
+probe to be asked about. Reaching them would mean reading a per-state method's
+body for a side effect, which is the F2 mutation fallback's job and is a different
+question.
+
+### Fixtures
+
+Six, each in its own package, each compiled by `javac` as part of being a
+fixture. `src/test/resources/probe/` is deleted — fixtures 1–3 are the promoted
+probes, so nothing is written twice.
+
+| fixture | tier | pins |
+|---|---|---|
+| `examples/opaquesuccessor` | 2 | 4 states exact, `DIRECT`, 0/4, one unresolved edge per arm with a known source. Successors put out of reach by a `return` inside `synchronized` — the **standing probe**: teach the walker that construct and this must fail loudly, and a new one is chosen |
+| `examples/voidcommit` | 2 | the cell the probe opens. 4 states exact, **`VIA_CALLEE`**, `FIELD_MUTATION`, 0/4. At `master`: 0 machines, **0 states** |
+| `examples/voidfold` | 3 | **the load-bearing negative control.** Indistinguishable from `voidcommit` at the call site — same hierarchy, driver, method name, arity and argument — differing only in that the callee writes a `String` field. `foreignfold` one indirection deeper. Must never be a machine |
+| `examples/unreadablecallee` | 3 | **the F11 control.** An interface method with no implementation in the source set: an unread body is not evidence of a commit. Here the F11 mistake *fabricates* a machine rather than deleting an edge, which is the worse direction |
+| `examples/opaquepolymorphic` | 2 | **the second, independently-sourced generality fixture.** The same property at `POLYMORPHIC_OVERRIDE`, with three *different* mechanisms putting the successors out of reach (map lookup, arithmetic index, supplier). Not derived from fixture 1 by copy-editing. Here the source state is exact by construction — the declaring class — so every edge's source is known and no edge's target is: the cleanest statement that the two claims are independent |
+| `examples/emptycandidate` | 3 | a candidate whose `permits` clause names a **nested sealed type** and a **permitted enum**, so the channel reports 7 states and not 3. Proves the candidate's state set is the set the machine path would have produced, nesting preserved, rather than a flattened approximation |
+
+Nothing in `examples/` was shaped around the implementation. The one place the
+implementation was shaped around a fixture is recorded above: the root-typed
+narrowing, which `examples/nestedroots` forced.
+
+### Measured
+
+Corpus, all 40 pre-existing fixture directories:
+
+* **every `.dot` and `.scxml` byte-identical** to `master`. Verified by running
+  the CLI over each directory into its own tree before and after and diffing.
+* totals unchanged: **46 machines, 599 transitions, 591 resolved**.
+* **+12 candidates newly reported**, on hierarchies that were previously rejected
+  with no state set: eight event alphabets that are switched over
+  (`lcp.LcpEvent`, `http2.StreamEvent`, `dhcpclaude.DhcpEvent`,
+  `websocket.WebSocketEvent`, `guardforms.Trigger`, `examples.gofcontext.Event`,
+  `examples.eventalphabet.Event`, `ffmpeg...FfmpegEvent`), three documented
+  negative controls that genuinely *are* discriminated
+  (`examples.foreignfold.Mode`, `chaindispatch.Glyph`, `chaindispatch.Tree`), and
+  `nestedroots.Message`. That event alphabets land here is not noise but the
+  thesis's own point restated: at the discrimination, a transition switch and a
+  fold are identical, and only the commit separates them. `examples/shape`,
+  `treebuilder`, `retrystate.Layer`, `nestedroots.Node`, `door.Event` and
+  `tcp.Event` correctly yield **no** candidate — the first three because nothing
+  discriminates them or they are vetoed, the last two because nothing in their
+  model switches on them.
+* with the six new fixtures: **49 machines, 610 transitions, 591 resolved,
+  15 candidates**. The resolved count is flat by construction — every new machine
+  is Tier 2.
+* exactly **one** machine in the whole corpus reports `VIA_CALLEE`
+  (`voidcommit.Hopper`), asserted directly so the probe cannot start taking credit
+  for machines the direct path finds.
+* **194 tests green** (183 before, +11), with the pre-existing 183 unchanged.
+
+### The scope boundary, stated as a positive predicate
+
+For a dispatch over a sealed hierarchy H, the tool proves:
+
+* **Commit existence** — that the chosen branch *installs* a value of H — from the
+  declared type of the installation site: the host's codomain, the assignment
+  target's declared type, a carrier's single H-typed component, a mutator's
+  parameter, or (k = 1) a root-typed field write inside one callee body the
+  analysis read. This is a **type-level** judgement and it is decided without
+  evaluating any expression.
+* **Successor identity** — *which* member of H is installed — by intra-procedural
+  data flow with an inter-procedural fold bounded at k = 2. This is a
+  **value-level** judgement.
+
+The two limits are independent because they read different things. Existence
+reads codomains and declared types, which are present whether or not the value
+can be traced; identity reads expressions, which can be arbitrarily opaque (a map
+lookup, an arithmetic index, a supplier) while the type of the slot they land in
+stays perfectly legible. So a machine can be recovered with a proven commit and no
+resolved successor at all — Tier 2, which is a positive result and not a failure —
+and no relaxation of one limit implies anything about the other.
+
+State enumeration is on neither axis. It is exact by construction, from the
+`permits` clause the compiler checks, and it is now reported for every hierarchy
+the tool examines: as a machine's state set at Tier 1 and 2, and as a candidate's
+at Tier 3.
