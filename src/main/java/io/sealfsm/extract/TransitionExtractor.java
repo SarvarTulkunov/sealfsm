@@ -2,9 +2,11 @@ package io.sealfsm.extract;
 
 import io.sealfsm.detect.CarrierTransitionDetector;
 import io.sealfsm.detect.DispatchCommitDetector;
+import io.sealfsm.detect.dispatch.CalleeBody;
 import io.sealfsm.detect.dispatch.CasePatterns;
 import io.sealfsm.detect.dispatch.Commit;
 import io.sealfsm.detect.dispatch.CommitClassifier;
+import io.sealfsm.detect.dispatch.CommitProbe;
 import io.sealfsm.detect.dispatch.CompositionVeto;
 import io.sealfsm.detect.dispatch.MutatorRecognizer;
 import io.sealfsm.detect.dispatch.DispatchFinder;
@@ -12,6 +14,7 @@ import io.sealfsm.detect.dispatch.DispatchLocus;
 import io.sealfsm.detect.dispatch.DispatchSite;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
+import io.sealfsm.model.CommitEvidence;
 import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.StateNaming;
@@ -155,7 +158,8 @@ public final class TransitionExtractor {
      * successor. A {@code FIELD_MUTATION} commit found at a real dispatch is
      * already claimed by that dispatch's own walk.
      */
-    private record WalkSite(Route route, DispatchLocus locus, CommitForm commit) { }
+    private record WalkSite(Route route, DispatchLocus locus, CommitForm commit,
+                           CommitEvidence evidence) { }
 
     /** How a walked body was discovered. */
     private enum Route { OVERRIDE, CARRIER, CENTRALIZED_METHOD, COMMIT_DISPATCH, FUNCTIONAL,
@@ -181,6 +185,23 @@ public final class TransitionExtractor {
     /** Is the walker inside the F2 mutation fallback? The old {@code mutationMode}. */
     private boolean inMutationFallback() {
         return walkSite != null && walkSite.route() == Route.MUTATION_FALLBACK;
+    }
+
+    /**
+     * Is the walker inside a dispatch whose commit was established by the k = 1
+     * commit-existence probe rather than observed in the dispatch's own context?
+     *
+     * <p>It changes exactly one thing about the walk, and it has to. Such a
+     * dispatch's arms are bare call statements, which F10 rightly ignores — a value
+     * Java discards (JLS §14.8) is not a committed successor. But here the commit
+     * is real and was proven; it simply happens inside the callee. Ignoring the arm
+     * would leave a dispatched arm with a KNOWN from-state contributing no edge at
+     * all, which is a transition dropped with no unresolved marker — the one
+     * outcome the record-everything invariant forbids by name. So the arm is
+     * recorded as an explicitly unresolved edge instead.
+     */
+    private boolean inProbedCommit() {
+        return walkSite != null && walkSite.evidence() == CommitEvidence.VIA_CALLEE;
     }
     private Set<String> stateFieldNames = Set.of();
     // F22: the recognised state mutators, keyed on `declaringType#signature` — the
@@ -300,6 +321,18 @@ public final class TransitionExtractor {
     // a state no arm matched has no outbound edges merely because none were
     // recovered, and calling that terminal would dress a recall gap as a result.
     private final Set<CommitForm> commitForms = new LinkedHashSet<>();
+    // On what evidence each walked site's commit rested. A SET while walking, and
+    // reduced to the WEAKEST member on the way out: a machine whose commits were
+    // all observed directly reports DIRECT, and one where any commit rested on
+    // opening a callee reports VIA_CALLEE. Reducing to the weakest rather than the
+    // commonest is the reporting direction that cannot overstate — the point of
+    // recording it at all is that a gap in an inference must not hide behind an
+    // observation made elsewhere in the same machine.
+    private final Set<CommitEvidence> commitEvidence = new LinkedHashSet<>();
+    // How many arms were recorded as unresolved because their commit lives inside
+    // a callee the probe opened. Reported, so a Tier 2 relation reads as a stated
+    // scope boundary rather than as an unexplained row of question marks.
+    private int probedCommitEdges;
     private final Set<String> dispatchedStates = new LinkedHashSet<>();
     private final StateNaming naming;
 
@@ -344,6 +377,19 @@ public final class TransitionExtractor {
     /** How this machine's dispatch committed its successors — the third axis. */
     public Set<CommitForm> commitForms() {
         return commitForms;
+    }
+
+    /**
+     * On what evidence this machine's commit rests — see {@link CommitEvidence}.
+     *
+     * <p>The weakest evidence any walked site rested on. {@code DIRECT} unless the
+     * k = 1 commit-existence probe was the thing that proved a commit, which keeps
+     * the probe from quietly taking credit for machines the direct rules already
+     * found.
+     */
+    public CommitEvidence commitEvidence() {
+        return commitEvidence.contains(CommitEvidence.VIA_CALLEE)
+                ? CommitEvidence.VIA_CALLEE : CommitEvidence.DIRECT;
     }
 
     /**
@@ -455,6 +501,7 @@ public final class TransitionExtractor {
             if (walkedMethods.contains(methodKey(p.host()))
                     || helperSignatures.contains(p.host().getSignature())) {
                 commitForms.add(p.commit());
+                commitEvidence.add(p.evidence());
                 continue;
             }
             // The site and the producer are the two halves of one dispatch: the
@@ -463,7 +510,8 @@ public final class TransitionExtractor {
             // index i pairs them; the site is what the walker is told it is inside.
             DispatchSite site = i < producerSites.size() ? producerSites.get(i) : null;
             walkedHosts.add(methodKey(p.host()));
-            walkAt(site, Route.COMMIT_DISPATCH, p.commit(), () -> extractCommitDispatch(p, out));
+            walkAt(site, Route.COMMIT_DISPATCH, p.commit(), p.evidence(),
+                    () -> extractCommitDispatch(p, out));
         }
         // F8: per-state methods that return a *carrier* wrapping the successor.
         // Run whenever such a method exists, not only when the lists above are
@@ -507,6 +555,13 @@ public final class TransitionExtractor {
             diagnostics.add(unreadableReturns + " return(s) of an in-model helper could not be "
                     + "reached by the walk (a construct outside its modelled subset encloses "
                     + "them); each is recorded as an unresolved transition, never dropped");
+        }
+        if (probedCommitEdges > 0) {
+            diagnostics.add(probedCommitEdges + " dispatched arm(s) commit inside a callee the "
+                    + "k = 1 probe opened: the commit is PROVEN (an H-typed field write in a body "
+                    + "the analysis read), the successor deliberately not chased. Each is recorded "
+                    + "as an unresolved transition with a known source state — this is a Tier 2 "
+                    + "machine, complete in its states and empty in its relation");
         }
         if (nonReturningCalls > 0) {
             diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
@@ -567,8 +622,21 @@ public final class TransitionExtractor {
      * recognizer am I running for?" now asks the site the same question.
      */
     private void walkAt(DispatchSite site, Route route, CommitForm commit, Runnable walk) {
+        walkAt(site, route, commit, CommitEvidence.DIRECT, walk);
+    }
+
+    /**
+     * The same, told on what evidence the commit rests. Only a
+     * {@code DispatchCommitDetector.Producer} can carry anything but
+     * {@link CommitEvidence#DIRECT}, which is why every other caller uses the
+     * four-argument form: an override, a carrier, a functional callable and the F2
+     * fallback all observe their commit in the body they are about to walk.
+     */
+    private void walkAt(DispatchSite site, Route route, CommitForm commit,
+                        CommitEvidence evidence, Runnable walk) {
         WalkSite saved = this.walkSite;
-        this.walkSite = new WalkSite(route, site == null ? null : site.locus(), commit);
+        this.walkSite = new WalkSite(route, site == null ? null : site.locus(), commit, evidence);
+        this.commitEvidence.add(evidence);
         try {
             walk.run();
         } finally {
@@ -1479,7 +1547,8 @@ public final class TransitionExtractor {
         // form it does not use — and the axis exists to make a recall gap
         // attributable to the idiom that caused it.
         WalkSite saved = this.walkSite;
-        this.walkSite = new WalkSite(Route.MUTATION_FALLBACK, null, CommitForm.FIELD_MUTATION);
+        this.walkSite = new WalkSite(Route.MUTATION_FALLBACK, null, CommitForm.FIELD_MUTATION,
+                CommitEvidence.DIRECT);
         try {
             for (CtMethod<?> m : findMutationMethods(model)) {
                 if (walkedHosts.contains(methodKey(m))) continue; // a dispatch owns it
@@ -2011,13 +2080,15 @@ public final class TransitionExtractor {
      * "unresolved transitions are never dropped" invariant forbids. The whole
      * licence for F9 to suppress is that JLS §8.4.7 makes the conclusion exact;
      * on a body that was never read there is no such licence.
+     *
+     * <p>The rule itself now lives in {@link CalleeBody}, because the k = 1
+     * commit-existence probe asks the identical question at recognition time. Two
+     * implementations of "can this body return?" would eventually disagree, and
+     * the disagreement would be a body one caller suppresses an edge for and
+     * another admits one from.
      */
     private static boolean neverReturnsNormally(CtMethod<?> callee) {
-        CtBlock<?> body = callee.getBody();
-        if (body == null) return false;      // no body visible: never claim anything
-        if (isShadow(callee)) return false;  // F11: a stub body is not an empty body
-        if (isVoid(callee.getType())) return false;  // no JLS §8.4.7 licence to suppress
-        return body.getElements(new TypeFilter<>(CtReturn.class)).isEmpty();
+        return CalleeBody.neverReturnsNormally(callee);
     }
 
     /**
@@ -2064,11 +2135,7 @@ public final class TransitionExtractor {
 
     /** Best-effort {@code void} test; answers "void" when the type is unreadable. */
     private static boolean isVoid(CtTypeReference<?> type) {
-        try {
-            return type == null || "void".equals(type.getQualifiedName());
-        } catch (Throwable t) {
-            return true;
-        }
+        return CalleeBody.isVoid(type);
     }
 
     /**
@@ -2082,13 +2149,7 @@ public final class TransitionExtractor {
      * is the direction that cannot drop a transition.
      */
     private static boolean isShadow(CtElement element) {
-        try {
-            if (element instanceof CtShadowable s && s.isShadow()) return true;
-            SourcePosition pos = element.getPosition();
-            return pos == null || !pos.isValidPosition();
-        } catch (Throwable t) {
-            return true;
-        }
+        return CalleeBody.isShadow(element);
     }
 
     private static CtMethod<?> calleeMethod(CtInvocation<?> inv) {
@@ -2190,6 +2251,19 @@ public final class TransitionExtractor {
             if (commit != null) {
                 handleValue(commit.value(), from, event, guard, out);
             }
+        } else if (node instanceof CtInvocation<?> inv && inProbedCommit()
+                && CommitProbe.probe(List.of(inv), hierarchyQualifiedNames, rootQualifiedName) != null) {
+            // The commit for this dispatch was established by opening the callee
+            // (k = 1), so this arm DOES install a successor — the analysis simply
+            // declined to ask which one, because commit existence and successor
+            // identity are separate questions with separate budgets. The from-state
+            // is known (it is the arm), so recording nothing here would drop a
+            // transition whose source is not in doubt, behind a clean-looking n/n.
+            // Recorded unresolved, with the reason in the note.
+            probedCommitEdges++;
+            out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
+                    safeText(inv) + " — commit proven inside the callee (k = 1 probe); the "
+                            + "successor it installs was not resolved"), event));
         } else if (node instanceof CtTry tryStmt) {
             // F6: descend exceptional flow. The try body runs under the normal
             // guard; each catch under a synthetic "exception" guard (carrying the

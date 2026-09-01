@@ -107,6 +107,27 @@ public final class State {
         children.add(Objects.requireNonNull(child));
     }
 
+    /**
+     * Depth-first flattening of a top-level state list: every state, then its
+     * children, recursively.
+     *
+     * <p>One implementation, because two things need it — {@link StateMachine} and
+     * {@link Candidate} — and a machine's state set and a candidate's are compared
+     * against each other by the completeness test. Two spellings of "flatten"
+     * would make that comparison a comparison of two traversals rather than of two
+     * state sets.
+     */
+    public static List<State> flatten(List<State> topLevel) {
+        List<State> out = new ArrayList<>();
+        for (State s : topLevel) collectInto(s, out);
+        return out;
+    }
+
+    private static void collectInto(State s, List<State> out) {
+        out.add(s);
+        for (State c : s.children()) collectInto(c, out);
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;

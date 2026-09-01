@@ -2,6 +2,10 @@ package io.sealfsm;
 
 import io.sealfsm.analyze.GuardAnalysis;
 import io.sealfsm.detect.SealedHierarchyDetector;
+import io.sealfsm.detect.dispatch.CommitProbe;
+import io.sealfsm.detect.dispatch.DispatchArm;
+import io.sealfsm.detect.dispatch.DispatchFinder;
+import io.sealfsm.detect.dispatch.DispatchSite;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.detect.StateMachineClassifier.Classification;
@@ -9,6 +13,7 @@ import io.sealfsm.detect.StateMachineClassifier.Rejection;
 import io.sealfsm.detect.TypeResolutionAudit;
 import io.sealfsm.extract.StateExtractor;
 import io.sealfsm.extract.TransitionExtractor;
+import io.sealfsm.model.Candidate;
 import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.ExtractionResult;
 import io.sealfsm.model.State;
@@ -25,6 +30,7 @@ import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -105,6 +111,17 @@ public final class Analyzer {
                         "skipped — " + c.reason() + reoffer(root, c, pending, claimed));
                 reportResolution(root, result, resolution, true);
                 if (trace != null) result.explain(root.getQualifiedName(), trace);
+                // The two claims are of different strength and must not be coupled.
+                // States come from `permits`, which is compiler-checked, so they are
+                // exact whether or not any transition producer was recognised — yet
+                // this `continue` used to be the only path a rejected root took, and
+                // StateExtractor was never reached for one. The tool therefore
+                // reported ZERO states for a hierarchy whose states were never in
+                // doubt, silently downgrading "states are exact" to "states are
+                // exact when transitions resolve". A rejected root that IS
+                // discriminated is now reported as a Tier 3 candidate, states and
+                // all, and still not as a machine.
+                recordCandidate(root, model, c, result);
                 continue;
             }
             reportResolution(root, result, resolution, false);
@@ -157,6 +174,11 @@ public final class Analyzer {
             for (CommitForm cf : te.commitForms()) {
                 machine.addCommitForm(cf);
             }
+            // Which mechanism installed the successor, and on what evidence we know
+            // it did, are two questions answered by two pieces of code. Pooling
+            // them would let a gap in the inference hide behind the observation —
+            // the same argument that split MUTATOR_ARGUMENT out of FIELD_MUTATION.
+            machine.setCommitEvidence(te.commitEvidence());
             // A member whose declaration was never read contributes the edges that
             // MENTION it (the permits clause names it) but not the ones it
             // produces. That asymmetry is recorded here, never left to read as an
@@ -201,6 +223,19 @@ public final class Analyzer {
             // it separates two strengths of evidence that must not be pooled: an
             // edge matched against a declaration, and one matched through a name
             // Spoon guessed for a declaration nobody read.
+            // Tier 2 is a machine like any other and is reported as one; what the
+            // line adds is that it says so. A machine with a proven commit and no
+            // resolved successor at all is a different claim from a machine with a
+            // recovered relation, and the two are indistinguishable from the counts
+            // alone — 0/n reads as a failure rather than as a stated boundary.
+            if (machine.isDetectedEmpty()) {
+                result.info(root.getQualifiedName(),
+                        "TIER 2 (dispatch present, commit proven via "
+                                + machine.commitEvidence() + ", no successor resolved) — the "
+                                + machine.allStates().size() + " states are exact regardless; "
+                                + "every dispatched arm is recorded as an unresolved edge with a "
+                                + "known source state, never as an empty relation");
+            }
             long viaUnread = machine.transitionsViaUnreadDeclaration();
             result.info(root.getQualifiedName(),
                     "extracted — " + c.reason() + "; "
@@ -446,6 +481,93 @@ public final class Analyzer {
         return "; re-offering nested sealed " + (one ? "hierarchy " : "hierarchies ")
                 + new TreeSet<>(nested.stream().map(CtType::getQualifiedName).toList())
                 + (one ? " as a root in its own right" : " as roots in their own right");
+    }
+
+    /**
+     * Tier 3 — record a rejected root as a <em>candidate</em>: not a machine, and
+     * its complete state set reported anyway.
+     *
+     * <p>This is where the tool's two claims stop being coupled. State enumeration
+     * is exact by construction ({@code permits} is compiler-checked); the
+     * transition relation is approximate. Until this method existed the analyzer
+     * derived states only on the accepted path, so a hierarchy whose producer no
+     * recognizer matched reported <b>zero states</b> — and "states are exact" had
+     * quietly become "states are exact when transitions resolve", which is a
+     * materially weaker claim and one the tool does not need to make.
+     *
+     * <p>Two conditions, both load-bearing.
+     *
+     * <p><b>Only an ABSTENTION.</b> A veto is a positive verdict about the data
+     * type — its members are composed into one another, so it is a tree and its
+     * "next" is a child — and that verdict binds on the members. Offering a
+     * recursive data type as a candidate would say the tool is undecided about
+     * something it decided, and it is the same distinction that already governs
+     * whether a rejected root re-offers its nested hierarchies ({@link #reoffer}).
+     *
+     * <p><b>Only where a dispatch was actually found.</b> "Dispatch present, commit
+     * not proven" is the definition of the tier, and dropping the first half would
+     * make every sealed type in the model a candidate — at which point the channel
+     * says nothing, because it no longer distinguishes anything. {@code examples/shape}
+     * is the control: a plain sum type nothing switches over stays a plain
+     * rejection with no candidate.
+     *
+     * <p>The state set is produced by the SAME {@link StateExtractor} call the
+     * machine path makes, nesting and all, so a candidate's states are the states
+     * the machine would have had — composites hold their children, a permitted enum
+     * holds its constants — rather than a flattened approximation. That equality is
+     * what the completeness test asserts.
+     */
+    private void recordCandidate(CtType<?> root, CtModel model, Classification c,
+                                 ExtractionResult result) {
+        if (c.rejection() != Rejection.ABSTAINED) return;
+        List<DispatchSite> loci = DispatchFinder.locusSites(root, model);
+        if (loci.isEmpty()) return;
+
+        StateExtractor.Result states = stateExtractor.extract(root);
+        List<String> sites = new ArrayList<>();
+        for (DispatchSite site : loci) {
+            sites.add(site.locus() + " @ " + (site.hostKey() == null
+                    ? String.valueOf(site.host()) : site.hostKey()));
+        }
+        // F11 — a callee whose declaration was never read is a DIFFERENT report
+        // from one that was read and commits nothing: the first is a fact about
+        // this invocation (the source set was incomplete), the second a fact about
+        // the program. Only the first is something a user can act on, so it is
+        // named rather than folded into the reason.
+        Set<String> unreadable = new LinkedHashSet<>();
+        for (DispatchSite site : loci) {
+            unreadable.addAll(CommitProbe.of(armBodies(site),
+                    StateMachineClassifier.hierarchyQualifiedNames(root),
+                    root.getQualifiedName()).unreadable());
+        }
+        String reason = "the state is discriminated at " + loci.size()
+                + " site(s), but no branch installs a hierarchy value, so no commit is proven "
+                + "(the exhaustive-fold guard: a transition switch and a fold are identical AT "
+                + "the discrimination, and only the codomain separates them)"
+                + (unreadable.isEmpty() ? ""
+                        : "; additionally, the callee(s) " + unreadable + " could not be read, "
+                                + "and an unread body is not evidence of a commit (F11)");
+
+        Candidate candidate = new Candidate(root.getSimpleName(), root.getQualifiedName(),
+                states.topLevelStates(), sites, reason);
+        result.addCandidate(candidate);
+        result.info(root.getQualifiedName(),
+                "CANDIDATE (Tier 3), not a machine — " + candidate.allStates().size()
+                        + " state(s) enumerated from permits " + stateIds(candidate)
+                        + ": " + reason);
+    }
+
+    /** The arm bodies of a site, which is what the commit probe is asked about. */
+    private static List<CtElement> armBodies(DispatchSite site) {
+        List<CtElement> out = new ArrayList<>();
+        for (DispatchArm arm : site.arms()) {
+            if (arm.body() != null) out.add(arm.body());
+        }
+        return out;
+    }
+
+    private static List<String> stateIds(Candidate c) {
+        return c.allStates().stream().map(State::id).toList();
     }
 
     /**

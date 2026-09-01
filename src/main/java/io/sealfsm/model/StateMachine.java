@@ -72,6 +72,7 @@ public final class StateMachine {
     private final Set<String> alphabet = new LinkedHashSet<>(); // event labels
     private final Set<SuccessorForm> successorForms = new LinkedHashSet<>();
     private final Set<CommitForm> commitForms = new LinkedHashSet<>();
+    private CommitEvidence commitEvidence = CommitEvidence.DIRECT;
     private String initialState;          // state id; may be null if undetected
 
     public StateMachine(String name, String qualifiedName, Encoding encoding) {
@@ -147,6 +148,43 @@ public final class StateMachine {
     }
 
     /**
+     * On what evidence this machine's commit was established — see
+     * {@link CommitEvidence}. {@link CommitEvidence#DIRECT} for every machine whose
+     * dispatch commits in its own syntactic context, which is every machine in the
+     * corpus; {@link CommitEvidence#VIA_CALLEE} only where the k = 1
+     * commit-existence probe was the thing that proved it.
+     *
+     * <p>Kept apart from {@link #commitForms()} deliberately: the form says which
+     * mechanism the source uses, this says how much the analysis had to open in
+     * order to see it. Pooling them would let a gap in the inference hide behind
+     * the observation, which is the exact failure the stratified table exists to
+     * prevent.
+     */
+    public CommitEvidence commitEvidence() {
+        return commitEvidence;
+    }
+
+    public void setCommitEvidence(CommitEvidence evidence) {
+        if (evidence != null) this.commitEvidence = evidence;
+    }
+
+    /**
+     * Tier 2: a machine whose dispatch and commit are both established and
+     * <em>none</em> of whose successors could be resolved.
+     *
+     * <p>Derived rather than stored, so it cannot drift from the edges it
+     * describes. The distinction matters to a consumer because the two tiers make
+     * different claims with the same shape of output: a Tier 1 machine reports a
+     * transition relation, a Tier 2 machine reports that it has one and that every
+     * target is unknown. An empty transition list is neither — under the
+     * record-everything invariant a dispatched arm always yields an edge, so a
+     * machine with no transitions at all is a bug rather than a tier.
+     */
+    public boolean isDetectedEmpty() {
+        return resolvedTransitionCount() == 0 && !transitions.isEmpty();
+    }
+
+    /**
      * Mark the states with no outgoing transition at all as <em>terminal</em>.
      *
      * <p>Only states the dispatch actually <em>matched</em> are eligible: a state
@@ -184,14 +222,7 @@ public final class StateMachine {
 
     /** Depth-first flattening of the state hierarchy. */
     public List<State> allStates() {
-        List<State> out = new ArrayList<>();
-        for (State s : topLevelStates) collect(s, out);
-        return out;
-    }
-
-    private static void collect(State s, List<State> out) {
-        out.add(s);
-        for (State c : s.children()) collect(c, out);
+        return State.flatten(topLevelStates);
     }
 
     /**

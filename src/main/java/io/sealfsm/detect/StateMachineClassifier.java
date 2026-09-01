@@ -146,9 +146,20 @@ public final class StateMachineClassifier {
                 + describeHosts(sites.centralized()));
         trace.accept("functional transition callable (lambda / anonymous-class method with that "
                 + "signature): " + verdict(sites.functional().size()));
+        // The LOCUS half, reported on its own. Without this line the reader cannot
+        // tell which conjunct of the next one failed, and the two zeros are
+        // different findings: a hierarchy nothing discriminates is a plain sum
+        // type as far as this tool can see, while one that IS discriminated and
+        // commits nothing provable is a Tier 3 CANDIDATE whose states are exact
+        // and are reported anyway.
+        List<DispatchSite> loci = DispatchFinder.locusSites(root, model);
+        trace.accept("dispatch over the hierarchy (a switch or instanceof chain discriminating "
+                + "the state — LOCUS only, no commit asked): " + verdict(loci.size())
+                + describeHosts(loci));
         trace.accept("dispatch with a hierarchy-typed commit (a switch or instanceof chain over "
                 + "the hierarchy whose result is installed as a hierarchy value): "
-                + verdict(sites.producers().size()) + describeCommits(root, model));
+                + commitVerdict(sites.producers().size(), loci.size())
+                + describeCommits(root, model));
 
         boolean hasDist = !sites.overrides().isEmpty();
         boolean hasCentral = !sites.centralized().isEmpty() || !sites.functional().isEmpty()
@@ -187,6 +198,14 @@ public final class StateMachineClassifier {
         trace.accept("no predicate above produced a transition producer: ABSTAINING. Not a "
                 + "verdict about the hierarchy — it may be the event alphabet, or its dispatch "
                 + "may sit somewhere no recognizer can see");
+        trace.accept(loci.isEmpty()
+                ? "OUTCOME: rejected, and not a candidate either — nothing in the model "
+                        + "discriminates this hierarchy. Its states are still exact by "
+                        + "construction; the tool simply has no dispatch to report them against"
+                : "OUTCOME: TIER 3 (CANDIDATE) — the state IS discriminated at " + loci.size()
+                        + " site(s) above, but no commit could be proven, so no transition "
+                        + "relation is claimed. The complete permits closure is reported on the "
+                        + "candidate channel: states are exact whether or not transitions are");
         // Abstention, stated as abstention. The old wording ("looks like a plain
         // sum type") asserted a positive classification the analysis had not made:
         // a sealed type reaches this line just as readily by being the event
@@ -202,6 +221,25 @@ public final class StateMachineClassifier {
 
     private static String verdict(int found) {
         return found == 0 ? "FAILED — none found" : "passed — " + found + " found";
+    }
+
+    /**
+     * The commit conjunct's verdict, saying which half failed.
+     *
+     * <p>"FAILED — none found" was the whole message, for both "there is no
+     * dispatch here" and "there are three and not one of them installs a hierarchy
+     * value". Those are the plain-sum-type case and the candidate case, and a
+     * reader could not tell them apart — which is also why the candidate channel
+     * had nowhere to be reported from.
+     */
+    private static String commitVerdict(int producers, int loci) {
+        if (producers > 0) return "passed — " + producers + " found";
+        return loci == 0
+                ? "FAILED — none found (no dispatch to ask about)"
+                : "FAILED — " + loci + " dispatch(es) found above, none of which installs a "
+                        + "hierarchy value. This is the exhaustive-fold guard, and it is the "
+                        + "whole precision discriminator: a transition switch and a fold are "
+                        + "identical AT the discrimination";
     }
 
     /** {@link #describeMethods} for a site list, naming each site's host. */

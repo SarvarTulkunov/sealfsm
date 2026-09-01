@@ -2,9 +2,11 @@ package io.sealfsm.detect;
 
 import io.sealfsm.detect.dispatch.Commit;
 import io.sealfsm.detect.dispatch.CommitClassifier;
+import io.sealfsm.detect.dispatch.CommitProbe;
 import io.sealfsm.detect.dispatch.CompositionVeto;
 import io.sealfsm.detect.dispatch.MutatorRecognizer;
 
+import io.sealfsm.model.CommitEvidence;
 import io.sealfsm.model.CommitForm;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.BinaryOperatorKind;
@@ -140,12 +142,20 @@ public final class DispatchCommitDetector {
      *                 spread across the links — and re-deriving it in the
      *                 extractor is how the two would come to disagree about which
      *                 value is the state
+     * @param evidence on what the commit rests: observed in this dispatch's own
+     *                 syntactic context ({@link CommitEvidence#DIRECT}), or
+     *                 established by opening one callee body
+     *                 ({@link CommitEvidence#VIA_CALLEE}). Carried per producer
+     *                 rather than derived later, because it is a property of the
+     *                 rule that fired and nothing downstream can reconstruct which
+     *                 one that was
      */
     public record Producer(CtMethod<?> host, CtElement dispatch, CommitForm commit,
-                           CtVariable<?> selector) {
+                           CtVariable<?> selector, CommitEvidence evidence) {
         /** A switch producer: the node carries its own selector. */
-        static Producer ofSwitch(CtMethod<?> host, CtAbstractSwitch<?> dispatch, CommitForm commit) {
-            return new Producer(host, dispatch, commit, null);
+        static Producer ofSwitch(CtMethod<?> host, CtAbstractSwitch<?> dispatch, CommitForm commit,
+                                 CommitEvidence evidence) {
+            return new Producer(host, dispatch, commit, null, evidence);
         }
     }
 
@@ -198,10 +208,45 @@ public final class DispatchCommitDetector {
         for (CtSwitch<?> sw : model.getElements(new TypeFilter<>(CtSwitch.class))) {
             addIfProducer(sw, hierarchy, rootQn, out);
         }
-        for (CtIf ctIf : model.getElements(new TypeFilter<>(CtIf.class))) {
-            addChainProducer(ctIf, hierarchy, rootQn, out);
+        for (ChainHead head : chainHeads(root, model)) {
+            addChainProducer(head, hierarchy, rootQn, out);
         }
         return out;
+    }
+
+    /**
+     * The head of every {@code instanceof} chain over {@code root}'s hierarchy in
+     * the model — the LOCUS half of {@link #find}, with no commit asked.
+     *
+     * <p>Split out so the locus can be reported on its own. A rejected hierarchy
+     * that <em>is</em> discriminated is a different finding from one that is never
+     * looked at: the first is a Tier 3 candidate whose states are reported, the
+     * second is (as far as this tool can tell) a plain sum type. The trace could
+     * not express that difference while the only available count was the composed
+     * one, so both printed "none found".
+     *
+     * <p>{@link #find} consumes exactly this list rather than re-deriving the head
+     * test, so the sites the classifier reports and the sites it judges cannot
+     * drift apart.
+     */
+    public static List<ChainHead> chainHeads(CtType<?> root, CtModel model) {
+        Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
+        String rootQn = root.getQualifiedName();
+        List<ChainHead> out = new ArrayList<>();
+        for (CtIf ctIf : model.getElements(new TypeFilter<>(CtIf.class))) {
+            if (isChainContinuation(ctIf, hierarchy, rootQn)) continue;  // a link, not the head
+            if (insideFunctionalCallable(ctIf)) continue;                // F7 already owns this body
+            TypeChain chain = chainOf(ctIf, hierarchy, rootQn);
+            if (chain == null) continue;
+            CtMethod<?> host = enclosingMethod(ctIf);
+            if (host == null) continue;      // an initializer, not a transition function
+            out.add(new ChainHead(host, ctIf, chain));
+        }
+        return out;
+    }
+
+    /** One decomposed chain and where it lives: the locus, before any commit is asked. */
+    public record ChainHead(CtMethod<?> host, CtIf head, TypeChain chain) {
     }
 
     private static void addIfProducer(CtAbstractSwitch<?> sw, Set<String> hierarchy,
@@ -209,11 +254,26 @@ public final class DispatchCommitDetector {
         if (!dispatchesOnHierarchy(sw, hierarchy)) return;
         CommitForm commit = commitFormOf(sw, hierarchy);
         if (commit == null) commit = mutatorCommitIn(sw.getCases(), hierarchy, rootQn);
+        CommitEvidence evidence = CommitEvidence.DIRECT;
+        if (commit == null) {
+            // k = 1 commit-existence probe. The arms are bare call statements,
+            // whose value Java discards (JLS §14.8), so no rule reading this
+            // dispatch's own context could ever answer — the commit is a side
+            // effect one call away. Asked strictly AFTER every direct rule has
+            // declined, so it can only add machines and never re-attribute one,
+            // and it asks a strictly weaker question than the resolver does:
+            // "is a hierarchy value installed?", never "which one?".
+            Commit probed = CommitProbe.probe(sw.getCases(), hierarchy, rootQn);
+            if (probed != null) {
+                commit = probed.form();
+                evidence = CommitEvidence.VIA_CALLEE;
+            }
+        }
         if (commit == null) return;                       // foreign codomain — an exhaustive fold
         if (nestsHierarchyValue(sw, hierarchy)) return;   // composition, not succession
         CtMethod<?> host = enclosingMethod(sw);
         if (host == null) return;                         // an initializer, not a transition function
-        out.add(Producer.ofSwitch(host, sw, commit));
+        out.add(Producer.ofSwitch(host, sw, commit, evidence));
     }
 
     /**
@@ -223,19 +283,26 @@ public final class DispatchCommitDetector {
      * javadoc — at least two discriminated branches, and one selector throughout,
      * both enforced inside {@link #chainOf}.
      */
-    private static void addChainProducer(CtIf head, Set<String> hierarchy, String rootQn,
+    private static void addChainProducer(ChainHead site, Set<String> hierarchy, String rootQn,
                                          List<Producer> out) {
-        if (isChainContinuation(head, hierarchy, rootQn)) return;  // a link, not the head
-        if (insideFunctionalCallable(head)) return;                // F7 already owns this body
-        TypeChain chain = chainOf(head, hierarchy, rootQn);
-        if (chain == null) return;
-        CtMethod<?> host = enclosingMethod(head);
-        if (host == null) return;                         // an initializer, not a transition function
+        TypeChain chain = site.chain();
+        CtMethod<?> host = site.host();
         CommitForm commit = commitFormOfChain(chain, host, hierarchy);
         if (commit == null) commit = mutatorCommitIn(chainBranches(chain), hierarchy, rootQn);
+        CommitEvidence evidence = CommitEvidence.DIRECT;
+        if (commit == null) {
+            // k = 1: the branches are bare calls, so nothing at this locus could
+            // prove or disprove a commit. Asked only after every direct rule has
+            // declined, so this can add machines and never re-attribute one.
+            Commit probed = CommitProbe.probe(chainBranches(chain), hierarchy, rootQn);
+            if (probed != null) {
+                commit = probed.form();
+                evidence = CommitEvidence.VIA_CALLEE;
+            }
+        }
         if (commit == null) return;                       // foreign codomain — an exhaustive fold
         if (chainNestsHierarchyValue(chain, hierarchy)) return;    // composition, not succession
-        out.add(new Producer(host, head, commit, chain.selector()));
+        out.add(new Producer(host, site.head(), commit, chain.selector(), evidence));
     }
 
     /**

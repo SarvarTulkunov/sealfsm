@@ -1,6 +1,9 @@
 package io.sealfsm;
 
+import io.sealfsm.model.Candidate;
+import io.sealfsm.model.CommitEvidence;
 import io.sealfsm.model.ExtractionResult;
+import io.sealfsm.model.State;
 import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.SuccessorForm;
 import io.sealfsm.model.Transition;
@@ -122,6 +125,8 @@ public final class Main {
                     commitList(m),
                     formList(m));
         }
+        printTierNote(result);
+        printCandidates(result);
         printUnreadDeclarationNote(result);
         printEncodingRollup(result);
         printExplanations(result);
@@ -166,6 +171,73 @@ public final class Main {
             if (!part.isBlank()) out.add(part.trim());
         }
         return out;
+    }
+
+    /**
+     * A footnote for the machines whose row reads {@code 0/n}, printed only when
+     * there are any.
+     *
+     * <p>Tier 1 and Tier 2 produce the same shape of row and make different
+     * claims. {@code 0/4} on its own reads as a failure; what it actually says
+     * here is that the dispatch and the commit are both established and that every
+     * successor is explicitly unknown — a stated boundary, with four states that
+     * are exact regardless. The line also names the evidence, because "the commit
+     * was observed at the dispatch" and "the commit was proven by opening one
+     * callee" are two strengths and pooling them would make a later gap
+     * unattributable.
+     *
+     * <p>Printed unconditionally of {@code --quiet} for the reason the unread-
+     * declaration footnote is: {@code --quiet} suppresses findings <em>about</em>
+     * the run, and this is a qualification on the numbers directly above.
+     */
+    private static void printTierNote(ExtractionResult result) {
+        var tier2 = result.machines().stream().filter(StateMachine::isDetectedEmpty).toList();
+        var viaCallee = result.machines().stream()
+                .filter(m -> m.commitEvidence() != CommitEvidence.DIRECT).toList();
+        if (tier2.isEmpty() && viaCallee.isEmpty()) return;
+        System.out.println();
+        for (StateMachine m : tier2) {
+            System.out.printf("  ! %s: TIER 2 — dispatch present, commit proven (%s), no successor "
+                            + "resolved.%n", m.name(), m.commitEvidence());
+            System.out.printf("    Its %d state(s) are exact; each of the %d dispatched arm(s) is "
+                            + "recorded as an%n", m.allStates().size(), m.transitions().size());
+            System.out.println("    unresolved edge with a known source state, never as an empty "
+                    + "relation.");
+        }
+        for (StateMachine m : viaCallee) {
+            if (tier2.contains(m)) continue;
+            System.out.printf("  ! %s: commit evidence %s — proven by opening one callee body "
+                            + "(k = 1 probe).%n", m.name(), m.commitEvidence());
+        }
+    }
+
+    /**
+     * Hierarchies the tool refuses to call machines and whose states it reports
+     * anyway — Tier 3.
+     *
+     * <p>Not folded into the diagnostics listing, and printed regardless of
+     * {@code --quiet}, because a candidate is a <em>result</em> rather than a
+     * finding about the run: it is the answer to "what are the states of this
+     * hierarchy?", which the tool can give exactly even where it can prove nothing
+     * about the transitions. Refusing to call a hierarchy a machine and refusing
+     * to say what its states are were the same refusal before this channel
+     * existed, and they are two different claims. The reason each one was rejected
+     * stays in the diagnostics, where it belongs.
+     */
+    private static void printCandidates(ExtractionResult result) {
+        if (result.candidates().isEmpty()) return;
+        System.out.println();
+        System.out.println("-".repeat(112));
+        System.out.printf("Candidate hierarchies — dispatch present, commit NOT proven, so not "
+                + "reported as machines (%d):%n", result.candidates().size());
+        for (Candidate c : result.candidates()) {
+            System.out.printf("  %-40s %2d state(s)  %s%n",
+                    truncate(c.qualifiedName(), 40),
+                    c.allStates().size(),
+                    c.allStates().stream().map(State::id).collect(Collectors.joining(", ")));
+        }
+        System.out.println("    States come from the permits clause and are exact. No transition "
+                + "relation is claimed.");
     }
 
     /**

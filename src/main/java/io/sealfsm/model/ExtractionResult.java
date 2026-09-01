@@ -33,10 +33,12 @@ public final class ExtractionResult {
     public record Explanation(String where, List<String> predicates) { }
 
     private final List<StateMachine> machines = new ArrayList<>();
+    private final List<Candidate> candidates = new ArrayList<>();
     private final List<Diagnostic> diagnostics = new ArrayList<>();
     private final List<Explanation> explanations = new ArrayList<>();
 
     public void addMachine(StateMachine m) { machines.add(m); }
+    public void addCandidate(Candidate c) { candidates.add(c); }
     public void info(String where, String message) {
         diagnostics.add(new Diagnostic(Severity.INFO, where, message));
     }
@@ -49,8 +51,23 @@ public final class ExtractionResult {
     }
 
     public List<StateMachine> machines()    { return Collections.unmodifiableList(machines); }
+
+    /**
+     * Hierarchies the tool refuses to call machines and whose states it reports
+     * anyway — see {@link Candidate}.
+     *
+     * <p>A separate channel from {@link #machines()}, not a flag on one list. A
+     * candidate carries no transition relation and no serialized output, so a
+     * caller that iterates machines must not see it; and the state set is the whole
+     * point of reporting it, so it must not be reduced to a diagnostic string
+     * either. Keeping the two lists apart is what lets "how many machines did the
+     * tool find" and "for how many hierarchies can it name the states" be two
+     * numbers instead of one.
+     */
+    public List<Candidate> candidates()     { return Collections.unmodifiableList(candidates); }
     public List<Diagnostic> diagnostics()   { return Collections.unmodifiableList(diagnostics); }
     public List<Explanation> explanations() { return Collections.unmodifiableList(explanations); }
 
+    /** True when no <em>machine</em> was found; candidates do not count as machines. */
     public boolean isEmpty() { return machines.isEmpty(); }
 }

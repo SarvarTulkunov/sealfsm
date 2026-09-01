@@ -1,5 +1,6 @@
 package io.sealfsm.serialize;
 
+import io.sealfsm.model.CommitEvidence;
 import io.sealfsm.model.State;
 import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.Transition;
@@ -57,7 +58,19 @@ public final class DotSerializer {
         sb.append("  labelloc=\"t\";\n");
         sb.append("  label=").append(q(m.name() + "  (" + m.encoding() + ")")).append(";\n");
         sb.append("  node [shape=rectangle, style=rounded, fontname=\"Helvetica\"];\n");
-        sb.append("  edge [fontname=\"Helvetica\", fontsize=10];\n\n");
+        sb.append("  edge [fontname=\"Helvetica\", fontsize=10];\n");
+        // Emitted only when it is not DIRECT, which is the rule the
+        // unread-declaration reporting already follows: on well-formed input every
+        // commit is observed in the dispatch's own syntactic context, so an
+        // unconditional line would print "DIRECT" on every diagram in the corpus
+        // and say nothing. A line that appears is a line that carries information.
+        if (m.commitEvidence() != CommitEvidence.DIRECT) {
+            sb.append("  // commit evidence: ").append(m.commitEvidence())
+              .append(" — established by opening one callee body (k = 1 probe), not observed at ")
+              .append("the dispatch. Successor identity was deliberately not attempted; the two ")
+              .append("limits are independent.\n");
+        }
+        sb.append("\n");
 
         Set<String> realIds = new LinkedHashSet<>();
         for (State s : m.allStates()) realIds.add(s.id());

@@ -1,5 +1,6 @@
 package io.sealfsm.serialize;
 
+import io.sealfsm.model.CommitEvidence;
 import io.sealfsm.model.State;
 import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.Transition;
@@ -50,6 +51,14 @@ public final class ScxmlSerializer {
           .append("; transitions resolved/total: ")
           .append(m.resolvedTransitionCount()).append('/').append(m.transitions().size())
           .append(" -->\n");
+        // Same rule as the DOT comment, and as the unread-declaration reporting:
+        // present only when it is not DIRECT. On well-formed input it never
+        // appears, so wherever it does appear it is carrying information.
+        if (m.commitEvidence() != CommitEvidence.DIRECT) {
+            sb.append("  <!-- Commit evidence: ").append(m.commitEvidence())
+              .append(" — proven by opening one callee body (k = 1 probe) rather than observed ")
+              .append("at the dispatch; successor identity was not attempted -->\n");
+        }
 
         for (State s : m.topLevelStates()) {
             emitState(m, s, sb, "  ", composites);

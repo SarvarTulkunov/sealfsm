@@ -228,6 +228,43 @@ public final class DispatchFinder {
     }
 
     /**
+     * The head of every {@code instanceof} chain over the hierarchy, as a site —
+     * {@link #switchSites}'s counterpart for the other spelling of one
+     * discrimination, and like it a LOCUS answer with no commit asked.
+     *
+     * <p>Read through {@link DispatchCommitDetector#chainHeads}, which is the same
+     * head test {@link #producerSites} goes on to apply a commit to, so the sites
+     * reported and the sites judged cannot drift apart.
+     */
+    public static List<DispatchSite> chainSites(CtType<?> root, CtModel model) {
+        Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
+        List<DispatchSite> out = new ArrayList<>();
+        for (DispatchCommitDetector.ChainHead head : DispatchCommitDetector.chainHeads(root, model)) {
+            out.add(new DispatchSite(DispatchLocus.INSTANCEOF_CHAIN, head.host(), head.head(),
+                    chainArms(head.head(), hierarchy, root.getQualifiedName())));
+        }
+        return out;
+    }
+
+    /**
+     * Every place the state is discriminated, <b>with no commit asked</b>: the
+     * locus axis on its own.
+     *
+     * <p>Reported separately from {@link #producerSites} because the two zeros mean
+     * different things and the tool used to print the same line for both. A
+     * hierarchy that is never switched over is, as far as this tool can tell, a
+     * plain sum type; a hierarchy that IS discriminated but whose commit cannot be
+     * proven is a Tier 3 candidate, whose states are exact and are reported. That
+     * distinction is the whole content of the candidate channel, and it cannot be
+     * reported from a count that has already conjoined the commit into it.
+     */
+    public static List<DispatchSite> locusSites(CtType<?> root, CtModel model) {
+        List<DispatchSite> out = new ArrayList<>(switchSites(root, model));
+        out.addAll(chainSites(root, model));
+        return out;
+    }
+
+    /**
      * The dispatches whose result is committed as a hierarchy value: the switch
      * and chain sites that survive {@link CommitClassifier} and
      * {@link CompositionVeto}.
