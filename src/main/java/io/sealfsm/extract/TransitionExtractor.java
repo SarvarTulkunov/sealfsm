@@ -1815,19 +1815,19 @@ public final class TransitionExtractor {
         boolean top = interProcStack.isEmpty();
         int resolvedBefore = top ? countResolved(out) : 0;
         interProcStack.push(sig);
+        // F25 — the frame is pushed and popped WITH the signature stack, because
+        // the two are one thing: a frame of the fold is a callee together with what
+        // its caller handed it. Keeping them in step structurally is what stops a
+        // binding outliving the body it belongs to.
+        resolver.pushFoldFrame(argumentBindings(inv, callee));
         try {
             // Walked in the *caller's* from-context, so a returned root-typed value
             // ("the current state") becomes a self-loop to the caller's from-state
             // exactly as in a direct transition method, and a returned call
             // recurses under the depth budget.
-            Set<CtVariable<?>> savedSelectors = resolver.foldSelectors();
-            resolver.setFoldSelectors(selectorParamsOf(inv, callee));
-            try {
-                walk(callee.getBody(), from, event, guard, out);
-            } finally {
-                resolver.setFoldSelectors(savedSelectors);
-            }
+            walk(callee.getBody(), from, event, guard, out);
         } finally {
+            resolver.popFoldFrame();
             interProcStack.pop();
             accountedReturns = enclosing;
             if (top) interProcResolvedEdges += Math.max(0, countResolved(out) - resolvedBefore);
@@ -1867,36 +1867,65 @@ public final class TransitionExtractor {
      * than assumed away.
      */
     /**
-     * The callee parameters that provably received the CURRENT STATE at this call.
+     * F25 — what this call HANDED the callee: each parameter mapped, positionally,
+     * to the argument expression the caller wrote.
      *
-     * <p>Positional, and matched with {@link CompositionVeto#isCurrentState} — the
-     * shared predicate for the three ways a walk knows the from-state: bare
-     * {@code this}, the dispatch selector, and the type-pattern binding of the arm
-     * or chain link that matched. Asking that predicate rather than restating it
-     * is the standing rule here; a second notion of "the current state" would
-     * disagree with the veto's, and the disagreement would be an edge.
+     * <p>This is the binding the fold used to lack, and lacking it made the fold a
+     * LOSSY step. {@code case Idle i -> wrap(new Running(), List.of())} has the
+     * successor in hand at the call site; entering {@code Carrier wrap(H s,
+     * List&lt;A&gt; a)} and reaching {@code new Carrier(s, a)} then took the
+     * hierarchy slot and found {@code s} — a parameter with nothing bound to it —
+     * so every additional hop destroyed information instead of recovering it. The
+     * map is EXACT: it records the expression the caller passed, not an
+     * approximation of it, so nothing here widens what the analysis claims.
      *
-     * <p>What this buys is stated at {@link TransitionResolver#foldSelectors}: rule
-     * 4's premise holds for a callee parameter only when the caller actually
-     * handed it the matched state. {@code fromInitial(i, event)} passes the arm's
-     * binding, so reading that parameter back out IS a self-loop;
-     * {@code lookup(state, fallback, event)} passes something else as well, and
-     * reading THAT back out is not.
+     * <p>Three restrictions, each of which is what keeps it exact:
+     * <ul>
+     *   <li><b>Identity-keyed</b> ({@link IdentityHashMap}), the F13 rule
+     *       unchanged: Spoon gives {@code CtElement} deep structural equality, so
+     *       two distinct helpers' identically-spelled parameters compare equal and
+     *       one would stand in for the other.</li>
+     *   <li><b>Not bound when the callee REASSIGNS it.</b> What such a parameter
+     *       holds at the {@code return} is no longer the argument, so the binding
+     *       would be a claim about a value that has since been overwritten.
+     *       {@link TransitionResolver#isReassigned(CtVariable, java.util.function.Consumer)}
+     *       is asked rather than re-derived — one notion of "reassigned", decided
+     *       on declaration identity.</li>
+     *   <li><b>Truncated positionally</b> on any arity mismatch, and a
+     *       <em>varargs</em> parameter is skipped outright: it collects the
+     *       remaining arguments into an array, so the positional match is not the
+     *       value it holds.</li>
+     * </ul>
      *
-     * <p>An identity set, for the F13 reason: Spoon gives {@code CtElement} deep
-     * structural equality, so two distinct helpers' identically-spelled parameters
-     * compare equal and one would stand in for the other.
+     * <p>F24's "selector parameters" — the ones the caller demonstrably handed the
+     * current state — are now the SUBSET of this map whose bound expression
+     * satisfies {@link CompositionVeto#isCurrentState}, read off by
+     * {@code TransitionResolver.selectorHoldsCurrentState}. One mechanism, not two:
+     * a separate notion of "what a parameter holds" would eventually disagree with
+     * this one, and the disagreement would be an edge.
      */
-    private Set<CtVariable<?>> selectorParamsOf(CtInvocation<?> inv, CtMethod<?> callee) {
-        Set<CtVariable<?>> out = Collections.newSetFromMap(new IdentityHashMap<>());
+    private Map<CtVariable<?>, CtExpression<?>> argumentBindings(CtInvocation<?> inv,
+                                                                 CtMethod<?> callee) {
+        Map<CtVariable<?>, CtExpression<?>> bound = new IdentityHashMap<>();
         List<CtExpression<?>> args = inv.getArguments();
         List<CtParameter<?>> params = callee.getParameters();
         for (int i = 0; i < Math.min(args.size(), params.size()); i++) {
-            if (CompositionVeto.isCurrentState(args.get(i))) {
-                out.add(params.get(i));
-            }
+            CtParameter<?> p = params.get(i);
+            CtExpression<?> arg = args.get(i);
+            if (p == null || arg == null || isVarArgs(p)) continue;
+            if (TransitionResolver.isReassigned(p, nameOnlyReassignmentChecks::add)) continue;
+            bound.put(p, arg);
         }
-        return out;
+        return bound;
+    }
+
+    /** {@code CtParameter.isVarArgs()}, answering "no" when the model cannot say. */
+    private static boolean isVarArgs(CtParameter<?> p) {
+        try {
+            return p.isVarArgs();
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private static List<CtReturn<?>> ownedReturns(CtMethod<?> callee) {

@@ -667,3 +667,236 @@ At a **top-level dispatch** `isSelectorBinding` still accepts any root-typed
 parameter, so `H step(H current, H fallback, E e)` returning `fallback` remains a
 fabricated self-loop. Same shape of fix — compare against the selector the walk
 is holding — and no corpus fixture now exercises it.
+
+---
+
+## F25 — the fold discarded the caller's argument bindings
+
+### The invariant that was violated
+
+**A fold must not destroy information the caller already had.** The
+inter-procedural summary (F3/F18) walked a callee's body in the caller's
+from-context but carried **no binding from the callee's parameters to the
+caller's actual arguments**. Any successor that arrived through a parameter read
+inside the callee was therefore unresolvable *by construction* — not by a scope
+line, not by a budget, but because the analysis had thrown away the only thing
+that could have answered.
+
+```java
+// caller
+case Idle i -> wrap(new Running(), List.of());
+// callee
+private Carrier wrap(State s, List<Action> a) { return new Carrier(s, a); }
+```
+
+The fold enters `wrap`, reaches `new Carrier(s, a)`, takes the hierarchy-typed
+slot, and gets `s` — a parameter with nothing bound to it. Unresolved edge.
+
+Note what that means. **Before** entering the callee the successor expression
+`new Running()` was in hand at the call site and resolvable; entering discarded
+it. The fold was a **lossy** step: each additional hop destroyed information
+rather than recovering it.
+
+That is visible as a number, and it is the sharpest evidence in this entry —
+the resolved-edge count against the depth budget, whole corpus:
+
+| k | before: trans / resolved | after: trans / resolved |
+|---|---|---|
+| 1 | 599 / **589** | 599 / **589** |
+| 2 | 599 / **482** | 599 / **591** |
+| 3 | 600 / **483** | 600 / **594** |
+| 4 | 600 / **483** | 600 / **594** |
+
+**Before, allowing one more hop cost 107 edges.** k=1 → k=2 is *monotone
+decreasing*, which for a sound approximation is impossible: more analysis
+budget cannot license fewer proofs. Declining to fold produced strictly better
+results than folding, and the committed default of k = 2 sat on the wrong side
+of the cliff. After the fix the curve is monotone non-decreasing and flattens at
+k = 3, which is the deepest delegation chain in the corpus. **The budget was
+never the bug.** (`MAX_INTERPROC_DEPTH`, the `>=` that tests it, and the
+ordering that runs F9 before the fold attempt are all unchanged; the sweep was
+run by editing the constant temporarily and reverting it.)
+
+### The fix
+
+A per-frame positional binding map `CtParameter → CtExpression`, pushed and
+popped **with** `interProcStack` — the two are one thing, a frame of the fold
+being a callee together with what its caller handed it, and keeping them in step
+structurally is what stops a binding outliving the body it belongs to.
+
+* `TransitionExtractor.argumentBindings(inv, callee)` builds it, positionally,
+  truncating on arity mismatch with `Math.min` exactly as `selectorParamsOf`
+  already did.
+* `TransitionResolver` holds the frames as a stack and threads a frame index
+  through `resolve`. Rule **(5)**, last in `fromVariable`: a parameter present in
+  the current frame's map resolves by **recursively resolving the bound caller
+  expression**, one frame out, under the existing `seen` set and
+  `MAX_INITIALIZER_DEPTH`, in the caller's from-context and guard context.
+
+Binding a parameter to the expression the caller actually passed is **exact**,
+not an approximation: it is the argument, not a guess about it. This widens
+nothing. It stops the analysis discarding what it already had.
+
+Three restrictions keep it exact, and each is asked of existing code rather than
+re-derived:
+
+* **Identity-keyed** (`IdentityHashMap`). Spoon gives `CtElement` deep
+  structural equality, so two distinct helpers' identically-spelled parameters
+  compare equal and one would stand in for the other. This is the F13 rule,
+  unchanged.
+* **Not bound when the callee REASSIGNS it** — what such a parameter holds at
+  the `return` is no longer the argument. `TransitionResolver.isReassigned`
+  answers it, by declaration identity; it gained a declaration-keyed entry point
+  so there is still exactly one implementation.
+* **A varargs parameter is skipped.** It collects the remaining arguments into
+  an array, so the positional match is not the value it holds.
+
+**F24's restriction is now a derived case, not a second mechanism.**
+`foldSelectors` — "the callee parameters the caller demonstrably handed the
+current state" — is read off this map as the subset whose bound expression
+satisfies `CompositionVeto.isCurrentState`. One notion of "what a parameter
+holds", not two; a second would eventually disagree with the first, and the
+disagreement would be an edge. Both directions are exercised on the corpus:
+`examples/factory` takes the positive branch (a parameter bound to the caller's
+selector, rule 4 still fires, 3/4 unchanged), `examples/lcp_automation_chatgpt`
+the negative (bound to a construction, rule 4 declines and rule 5 resolves it).
+
+### What rule (5) may NOT do, and the one narrowing that is not derived
+
+Resolving a bound argument means resolving an expression in the **caller's** body
+— and rule 4 lives there too, licensing "a root-typed parameter read means stay
+in the matched state" for *any* parameter. That is a standing
+over-approximation at a top-level dispatch (see "The half still open" under F24),
+and the fold must not route into it: it reaches that point only when the callee's
+own parameter has already been shown **not** to be the current state, so widening
+there would contradict what was just established. `fwd(spare)` would become a
+proven self-loop on the strength of `spare` being a parameter.
+
+So when the frame index walks below the innermost frame, rule 4 is licensed by
+`CompositionVeto.isCurrentState` asked of the **read** rather than of a binding —
+the same shared predicate, one level out. Measured: without it,
+`fwd(fallback)` in `H step(H current, H fallback, E e)` published a resolved
+self-loop; with it, the arm is an explicit gap.
+`src/test/resources/foldbinding`'s `Ballast` is the control, and the cost of
+getting it wrong is invisible in the score — its other arm resolves either way,
+so the machine reads a clean 2/2 with one edge fabricated.
+
+This does **not** close the top-level half of F24's open item. `isSelectorBinding`
+still accepts any root-typed parameter at a dispatch, so a direct
+`return fallback;` is still a fabricated self-loop; what changed is that the fold
+no longer reaches it.
+
+### What is now reachable
+
+A successor **computed at the call site and installed by a callee** — the
+forwarding-factory idiom — which was previously unresolvable at every locus and
+every commit form. Concretely:
+
+* a bare value forwarder, `H forward(H s) { return s; }`;
+* a forwarding factory, `Carrier wrap(H s, List<A> a) { return new Carrier(s, a); }`
+  — the shape that makes `CARRIER_RETURN` recall depend on the binding, because
+  there the successor is an *argument* to a wrapper and a factory puts it behind
+  a parameter read by construction;
+* a **three-hop** chain, dispatch arm → per-event helper → forwarding factory,
+  where the successor has to survive two frames;
+* a **selection** helper, `H pick(H a, H b, boolean c) { return c ? a : b; }`,
+  which yields both targets under opposite guards rather than collapsing them or
+  choosing by position.
+
+### Fixture
+
+`src/test/resources/foldbinding/` — six hierarchies in one package, holding the
+call shape fixed and varying only what the binding is handed. It is a test
+resource rather than an `examples/` member because every hierarchy in it is a
+single-question probe rather than a corpus specimen; all of it compiles under
+`javac`.
+
+| hierarchy | asks | answer |
+|---|---|---|
+| `Flow` | bare forwarder, selection helper, **reassigned** parameter, **bodiless** callee | 3 states, **4/6** — two proofs, two gaps, both gaps deliberate |
+| `Carry` | forwarding factory at `CARRIER_RETURN`, **three hops**, and F9 on a call syntactically identical to the factory | 3 states, **4/4** + 1 suppressed cell |
+| `Twin` | **ambiguity on the ARGUMENT side**: two hierarchy-typed arguments into a one-slot vs a two-slot construction, on one class | 2 states, **2/2** — the placed argument only, and no self-loop |
+| `Loop` | **termination**: a direct and a mutually recursive forwarder | 2 states, **0/2**, both recorded |
+| `Ballast` | rule 4 must not widen on the way back out | 2 states, **1/2** |
+
+The negatives carry the weight. `Carry`'s `reject(new Parked(), event)` is
+syntactically indistinguishable from `wrap(new Parked(), ...)` — a call whose own
+type is outside the hierarchy carrying a hierarchy-typed argument — and only the
+callee's body separates them. **F9 has to be asked first**, and the binding is
+what makes that newly load-bearing: before F25 an undefined cell was unresolved
+anyway, whereas now accepting it would publish a *resolved* edge on every input
+the source rejects, one per cell, usually as a self-loop.
+
+`Twin` is the ambiguity control the corpus lacked on this side. The existing
+`carrierdispatch` control covers the component side of a **type**; this is the
+**call**. Both dispatches pass two hierarchy-typed arguments to a forwarder — so
+the argument list alone cannot say which is the successor — and they are held on
+one class so nothing but the forwarder's construction can be what the analysis
+reacts to. `one(a, b)` places `a` in a one-slot wrapper and discards `b`: the
+binding is by USE, not "every hierarchy-typed argument is a target". `pack(a, b)`
+places both in a two-slot wrapper, and neither is published — here the guess
+would be visible, because the second slot is the current state and choosing by
+argument order would show up as a self-loop the source does not contain.
+
+### Second generality fixture
+
+**PENDING** — to be supplied independently, not derived from
+`lcp_automation_chatgpt` (which is what made the first test fail) and not
+invented here. It should be a real-world sealed hierarchy whose transition
+function delegates through a helper that installs a successor received as a
+parameter, sourced separately from the corpus above.
+
+### Measured
+
+Corpus (`scripts/capture-golden.sh`, all 40 fixture directories, 46 machines):
+
+* **one fixture moved**: `examples/lcp_automation_chatgpt`, **2/111 → 111/111**.
+  All 39 others byte-identical in `.dot`, `.scxml` and `summary.txt` — including
+  every fixture that folds (`lcp_automation` 113/113, `hiddenreturns` 8/9,
+  `nonreturning` 4/6, `dhcp-client-*`, `http2-stream-*`, `factory` 3/4,
+  `statefuldriver`, `websocket-claude`).
+* corpus totals **599 transitions / 482 resolved → 599 / 591**. The transition
+  COUNT is flat, which is the check that matters: F9 suppression is unchanged at
+  **63 suppressed calls** in every configuration, before and after and at every
+  k, so the extra 109 are the same cells resolving, not new cells appearing.
+* **no state count moved**, on any machine.
+* the three negative-control fixtures still yield **zero machines**
+  (`shape`, `treebuilder`, `foreignfold`).
+* 183 tests green (178 before, +5).
+
+### The chatgpt fixture, and why 111/111 is a different number this time
+
+F24's entry says of this fixture: *"It briefly reported 111/111, and that number
+was 109 fabrications."* It reports 111/111 again. The two are not the same claim,
+and the difference is checkable three ways rather than asserted:
+
+1. **The successor-form axis.** The fabrication resolved through rule 4, so it
+   was `SELF`. The machine now reports `CONSTRUCTION` and nothing else — the
+   fabrication's fingerprint is *absent*, not merely outweighed.
+2. **The edge F24 names.** RFC 1661 §4.1 says Initial + Up = Closed. The
+   fabrication reported `Initial --UP--> Initial`; the output now reports
+   `Initial --UP--> Closed`, and the regression test asserts both halves.
+3. **The picture.** The fabricated relation drew ten isolated nodes. Compared
+   against `examples/lcp_automation` — the same RFC, written independently, in a
+   different idiom — **39 of the 40 recovered (from, to) state pairs agree**.
+   Event spellings differ by construction (`RCR_PLUS` vs a guard split on
+   `ReceiveConfigureRequest`), so the labels cannot be compared directly, but the
+   state relation can, and it does.
+
+### What this changes about the F24 entry's closing claim
+
+F24 concluded: *"The corpus does not contain 'one specification recovered twice
+under two commit forms'; it contains one specification whose two implementations
+recover at 113/113 and 2/111 … Do not quote the two as agreeing."* That was
+correct then and is **superseded**. The gap it described was not a fact about the
+idiom — a helper reached with the state passed some other way is foldable after
+all — it was the missing binding. The pair now recovers at **113/113 and
+111/111** with 39/40 agreement on the state relation, which makes it the second
+independent-implementation agreement in the corpus after the http2 pair, and the
+larger of the two by an order of magnitude.
+
+The honest qualifier that remains: they are two *implementations* of one
+specification, so agreement is evidence about the extractor, not a ground truth.
+The 49 cells `lcp_automation_chatgpt` leaves undefined (F9-suppressed) against
+`lcp_automation`'s 31 `throw`s is a real difference between the two sources, not
+a recall gap in either.

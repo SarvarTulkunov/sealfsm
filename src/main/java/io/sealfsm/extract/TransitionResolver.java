@@ -1,5 +1,6 @@
 package io.sealfsm.extract;
 
+import io.sealfsm.detect.dispatch.CompositionVeto;
 import io.sealfsm.model.StateNaming;
 import io.sealfsm.model.SuccessorForm;
 import spoon.reflect.code.CtAssignment;
@@ -26,8 +27,10 @@ import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
@@ -112,52 +115,102 @@ public final class TransitionResolver {
     }
 
     /**
-     * While walking a FOLDED callee body: the callee parameters that provably
-     * received the caller's current state. {@code null} outside any fold.
+     * F25 — the inter-procedural frames currently on the fold stack, outermost
+     * first, each mapping a callee PARAMETER to the expression the caller actually
+     * passed at the call site being summarised. Empty outside any fold.
      *
-     * <p>Rule 4 below reads "a root-typed selector means stay in the matched
-     * state", and its premise is that the variable IS the discriminated value. At
-     * a dispatch that is established — the parameter or binding is what the switch
-     * or chain tested. Inside a folded callee it is <em>not</em>: the analysis has
-     * never mapped the call's arguments onto the callee's parameters, so a
-     * root-typed parameter there might be the current state, a fallback, a default
-     * or anything else the caller chose to pass. Applying rule 4 to it stamps
-     * "proven self-loop" on a value nothing established, which is a fabricated
-     * RESOLVED edge — the one failure mode the soundness invariant forbids
-     * outright.
+     * <p>The fold walks a callee's body in the caller's from-context, but until
+     * this map existed it carried no binding from the callee's parameters to the
+     * caller's arguments — so any successor arriving through a parameter read was
+     * unresolvable <em>by construction</em>. {@code case Idle i -> wrap(new
+     * Running(), List.of())}, folded into {@code Carrier wrap(H s, List&lt;A&gt; a)
+     * { return new Carrier(s, a); }}, reached {@code s} with nothing bound to it.
+     * The successor {@code new Running()} had been in hand at the call site and
+     * <em>entering discarded it</em>: each hop destroyed information rather than
+     * recovering it, which is why declining to fold used to score better than
+     * folding.
      *
-     * <p>{@code examples/lcp_automation_chatgpt} is what found it, and it is the
-     * two-root-typed-parameter fixture this codebase had been missing: 109 of its
-     * 111 edges were self-loops resolved this way, including {@code Initial --UP-->
-     * Initial} where RFC 1661 §4.1 says {@code Closed}. Restricted to parameters:
-     * a pattern binding inside the callee IS the discriminated value of the switch
-     * that bound it, and needs no help from the caller.
+     * <p>Binding a parameter to the expression the caller passed is EXACT — it is
+     * the argument, not an approximation of it — so this does not widen what the
+     * analysis claims. It stops it discarding what it already had. Two things keep
+     * it exact:
+     * <ul>
+     *   <li>the map is IDENTITY-keyed. Spoon gives {@code CtElement} deep
+     *       structural equality, so two distinct helpers' identically-spelled
+     *       parameters compare equal and one would stand in for the other. This is
+     *       the F13 rule, unchanged;</li>
+     *   <li>a parameter REASSIGNED inside the callee is not bound at all. What it
+     *       holds at the {@code return} is then no longer the argument, and the
+     *       binding would be a claim about a value that has since been overwritten.
+     *       {@link #isReassigned} answers it, by declaration identity.</li>
+     * </ul>
+     *
+     * <p>Rule 4's restriction (F24) is now a DERIVED case of this map rather than a
+     * second mechanism: see {@link #selectorHoldsCurrentState}. One notion of "what
+     * a parameter holds", not two — a second would eventually disagree with the
+     * first, and the disagreement would be an edge.
      */
-    private Set<CtVariable<?>> foldSelectors;
+    private final List<Map<CtVariable<?>, CtExpression<?>>> foldFrames = new ArrayList<>();
 
-    /** Set by the extractor around a folded callee body; {@code null} to clear. */
-    void setFoldSelectors(Set<CtVariable<?>> selectors) {
-        this.foldSelectors = selectors;
+    /** Pushed by the extractor with {@code interProcStack}; see {@link #foldFrames}. */
+    void pushFoldFrame(Map<CtVariable<?>, CtExpression<?>> bindings) {
+        foldFrames.add(bindings == null ? Map.of() : bindings);
     }
 
-    Set<CtVariable<?>> foldSelectors() {
-        return foldSelectors;
+    /** Popped by the extractor with {@code interProcStack}. */
+    void popFoldFrame() {
+        if (!foldFrames.isEmpty()) foldFrames.remove(foldFrames.size() - 1);
+    }
+
+    /** Number of frames on the fold stack; 0 outside any fold. Test/diagnostic use. */
+    int foldDepth() {
+        return foldFrames.size();
     }
 
     /**
-     * Is this declaration usable as "the current state" here? Always, outside a
-     * fold. Inside one, a PARAMETER must be one the caller demonstrably handed the
-     * current state to; anything else rule 4 already admits (a pattern binding) is
-     * discriminated within the callee itself.
+     * The expression the caller bound to {@code decl} in {@code frame}, or
+     * {@code null} when nothing did — a local or pattern binding, a parameter the
+     * callee reassigns, one past the end of a shorter argument list, or a read
+     * outside any fold.
      */
-    private boolean selectorHoldsCurrentState(CtVariable<?> decl) {
-        if (foldSelectors == null) return true;
+    private CtExpression<?> boundArgument(CtVariable<?> decl, int frame) {
+        if (decl == null || frame < 0 || frame >= foldFrames.size()) return null;
+        return foldFrames.get(frame).get(decl);
+    }
+
+    /**
+     * Is this declaration usable as "the current state" here — the premise rule 4
+     * rests on? Always, outside a fold: at a dispatch the parameter or binding IS
+     * what the switch or chain tested. Inside one, a PARAMETER qualifies only when
+     * the caller demonstrably handed it the current state; anything else rule 4
+     * admits (a pattern binding) is discriminated within the callee itself.
+     *
+     * <p>F24 stated that as a separate set of "selector parameters". It is the same
+     * statement read off {@link #foldFrames}: the subset whose bound expression
+     * satisfies {@link CompositionVeto#isCurrentState}, the shared predicate for
+     * the three ways a walk knows the from-state. Asking the map rather than
+     * keeping a parallel set is what stops the two drifting.
+     */
+    private boolean selectorHoldsCurrentState(CtVariable<?> decl, CtVariableAccess<?> read,
+                                              int frame) {
+        if (foldFrames.isEmpty()) return true;   // no fold in progress: rule 4 as it was
         if (!(decl instanceof CtParameter<?>)) return true;
-        return foldSelectors.contains(decl);
+        if (frame < 0) {
+            // Rule (5) has walked back OUT to the caller's own body to resolve the
+            // expression it passed. Rule 4 must not widen there: the fold reached
+            // this point only because the callee's parameter was NOT the current
+            // state, and "any parameter is the selector" would contradict what was
+            // just established — turning `fwd(fallback)` into a proven self-loop on
+            // the strength of `fallback` being a parameter. The same predicate
+            // answers it, asked of the read rather than of a binding.
+            return CompositionVeto.isCurrentState(read);
+        }
+        CtExpression<?> bound = boundArgument(decl, frame);
+        return bound != null && CompositionVeto.isCurrentState(bound);
     }
 
     public List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName) {
-        return resolve(expr, fromSimpleName, null, new HashSet<>(), 0);
+        return resolve(expr, fromSimpleName, null, new HashSet<>(), 0, foldFrames.size() - 1);
     }
 
     /**
@@ -171,7 +224,7 @@ public final class TransitionResolver {
      * dispatch selector, a helper call — yields an <em>unresolved</em> candidate.
      */
     private List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName, String guard,
-                                    Set<CtElement> seen, int depth) {
+                                    Set<CtElement> seen, int depth, int frame) {
         List<Candidate> out = new ArrayList<>();
         if (expr == null) {
             return out;
@@ -205,15 +258,15 @@ public final class TransitionResolver {
         if (expr instanceof CtConditional<?> cond) {
             String condText = safeText(cond.getCondition());
             out.addAll(resolve(cond.getThenExpression(), fromSimpleName,
-                    combine(guard, condText), seen, depth));
+                    combine(guard, condText), seen, depth, frame));
             out.addAll(resolve(cond.getElseExpression(), fromSimpleName,
-                    combine(guard, negate(condText)), seen, depth));
+                    combine(guard, negate(condText)), seen, depth, frame));
             return out;
         }
 
         // field / variable / parameter read
         if (expr instanceof CtVariableAccess<?> va) {
-            out.addAll(fromVariable(va, guard, expr, fromSimpleName, seen, depth));
+            out.addAll(fromVariable(va, guard, expr, fromSimpleName, seen, depth, frame));
             return out;
         }
 
@@ -272,13 +325,18 @@ public final class TransitionResolver {
      *   <li><b>Root-typed selector</b> — a parameter or pattern binding typed as the
      *       abstract root is the value being dispatched on, so reading it means
      *       "stay in the matched state".</li>
+     *   <li><b>Bound argument</b> (F25) — inside a folded callee, a parameter holds
+     *       the expression the caller passed; resolve that, one frame out. Last,
+     *       because the four rules above prove the target from the callee's own
+     *       text and need no help from the call site.</li>
      * </ol>
      *
-     * A root-typed local or field that survives all four cannot be pinned without
+     * A root-typed local or field that survives all five cannot be pinned without
      * leaving the method, and is reported unresolved rather than guessed.
      */
     private List<Candidate> fromVariable(CtVariableAccess<?> va, String guard, CtExpression<?> raw,
-                                         String fromSimpleName, Set<CtElement> seen, int depth) {
+                                         String fromSimpleName, Set<CtElement> seen, int depth,
+                                         int frame) {
         CtVariableReference<?> vref = va.getVariable();
         if (vref == null) return List.of(Candidate.unresolved(guard, safeText(raw)));
 
@@ -296,10 +354,18 @@ public final class TransitionResolver {
         // pointing at another singleton, a cast or a ternary all work; `seen`
         // stops a self- or mutually-referential declaration from looping.
         if (decl != null && !isReassigned(vref, nameOnlyReassignmentChecks::add)
-                && depth < MAX_INITIALIZER_DEPTH && seen.add(decl)) {
+                && depth < MAX_INITIALIZER_DEPTH) {
             CtExpression<?> init = decl.getDefaultExpression();
-            if (init != null && !(init instanceof CtVariableAccess<?> self && refersTo(self, vref))) {
-                List<Candidate> viaInit = resolve(init, fromSimpleName, guard, seen, depth + 1);
+            // `seen` is marked only once there is genuinely an initializer to
+            // descend into. Marking it before the null check made rule (5) below
+            // unreachable for every PARAMETER: a parameter has no initializer, so
+            // this rule did nothing with it — yet it had already claimed the
+            // declaration, and rule (5)'s own `seen.add` then answered false. The
+            // cycle guard is about a chase actually being started, not about the
+            // declaration having been looked at.
+            if (init != null && !(init instanceof CtVariableAccess<?> self && refersTo(self, vref))
+                    && seen.add(decl)) {
+                List<Candidate> viaInit = resolve(init, fromSimpleName, guard, seen, depth + 1, frame);
                 if (viaInit.stream().allMatch(Candidate::resolved) && !viaInit.isEmpty()) {
                     SuccessorForm form = decl instanceof CtField<?>
                             ? SuccessorForm.SINGLETON_FIELD
@@ -329,11 +395,32 @@ public final class TransitionResolver {
             // extractor's reaching-definitions pass.
             if (dq.equals(rootQualifiedName)
                     && fromSimpleName != null
-                    && selectorHoldsCurrentState(decl)
+                    && selectorHoldsCurrentState(decl, va, frame)
                     && isSelectorBinding(decl)
                     && !isReassigned(vref, nameOnlyReassignmentChecks::add)) {
                 return List.of(Candidate.of(fromSimpleName, guard, SuccessorForm.SELF));
             }
+        }
+
+        // (5) F25 — inside a FOLDED callee, a parameter holds exactly the
+        // expression the caller passed at the call site being summarised. Resolve
+        // THAT, one frame out, so the fold recovers what entering the callee used
+        // to discard. Deliberately last: rules (1)–(4) prove the target from the
+        // callee's own text where they can, and only a read they cannot pin needs
+        // the caller's argument.
+        //
+        // The resolution happens in the CALLER's context — one frame out, the
+        // caller's from-state, the guard accumulated so far — because that is
+        // where the expression is written; the fold now claims exactly what the
+        // caller would claim had it inlined the callee, and nothing more. `seen`
+        // and MAX_INITIALIZER_DEPTH are the shared cycle guards, so a recursive or
+        // mutually recursive forwarder terminates here rather than looping, and
+        // terminates UNRESOLVED rather than guessing.
+        CtExpression<?> bound = boundArgument(decl, frame);
+        if (bound != null && depth < MAX_INITIALIZER_DEPTH && seen.add(decl)) {
+            List<Candidate> viaArgument =
+                    resolve(bound, fromSimpleName, guard, seen, depth + 1, frame - 1);
+            if (!viaArgument.isEmpty()) return viaArgument;
         }
         return List.of(Candidate.unresolved(guard, safeText(raw)));
     }
@@ -416,11 +503,26 @@ public final class TransitionResolver {
      */
     static boolean isReassigned(CtVariableReference<?> vref, Consumer<String> onNameFallback) {
         if (vref == null) return false;
-        CtVariable<?> decl = vref.getDeclaration();
-        if (decl == null) return false;
+        return isReassigned(vref.getDeclaration(), vref.getSimpleName(), onNameFallback);
+    }
+
+    /**
+     * The same question asked of a DECLARATION, for a caller that holds one and no
+     * read of it — {@code TransitionExtractor.argumentBindings}, deciding whether a
+     * callee parameter still holds the argument it was handed at the {@code return}
+     * (F25). One implementation, not two: a second notion of "reassigned" would
+     * bind a parameter the resolver considers overwritten, and the disagreement
+     * would be an edge.
+     */
+    static boolean isReassigned(CtVariable<?> decl, Consumer<String> onNameFallback) {
+        return decl == null ? false : isReassigned(decl, decl.getSimpleName(), onNameFallback);
+    }
+
+    private static boolean isReassigned(CtVariable<?> decl, String name,
+                                        Consumer<String> onNameFallback) {
+        if (decl == null || name == null) return false;
         CtMethod<?> method = decl.getParent(CtMethod.class);
         if (method == null) return false;
-        String name = vref.getSimpleName();
         for (CtAssignment<?, ?> a : method.getElements(new TypeFilter<>(CtAssignment.class))) {
             CtExpression<?> lhs = a.getAssigned();
             if (!(lhs instanceof CtVariableAccess<?> vw) || lhs instanceof CtFieldAccess<?>) {

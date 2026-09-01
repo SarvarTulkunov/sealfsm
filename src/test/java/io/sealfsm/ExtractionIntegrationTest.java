@@ -145,10 +145,20 @@ class ExtractionIntegrationTest {
      * Initial} where RFC 1661 §4.1 says {@code Closed}. Every state looked
      * isolated in the rendered diagram, because almost nothing connected them.
      *
-     * <p>The two survivors are the real edges — the cells whose successor is
-     * written as a construction — and everything else is now an explicit
-     * unresolved edge. 2/111 is a poor recall figure and an honest one; 111/111
-     * was neither.
+     * <p>F24 answered that by DECLINING — 2/111, a poor recall figure and an
+     * honest one. F25 answers it properly: the fold now carries the caller's
+     * argument bindings, so the parameter resolves to the expression the caller
+     * actually passed, and every cell comes back as the CONSTRUCTION the source
+     * writes. 111/111 again, and this time not one edge of it is a self-loop
+     * resolved through rule 4 — the successor-form axis reports CONSTRUCTION and
+     * nothing else, which is the fabrication's fingerprint being absent rather
+     * than merely a better number.
+     *
+     * <p>The assertion that separates the two is therefore the EDGE, not the
+     * count: {@code Initial --UP--> Closed} is what RFC 1661 §4.1 says and what
+     * the fabrication got wrong. The stay-put cells that remain are the RFC's own
+     * ("ignore this event here"), and each is written {@code new SameState()} in
+     * the source — proven by construction, not assumed from a parameter's type.
      */
     @Test
     void aFoldedCalleesParameterIsNotAssumedToBeTheCurrentState() {
@@ -156,18 +166,222 @@ class ExtractionIntegrationTest {
         StateMachine m = single(r);
         assertEquals(10, m.allStates().size(), "state enumeration is exact regardless");
         assertEquals(111, m.transitions().size(), "every cell is still RECORDED");
-        assertEquals(2, m.resolvedTransitionCount(),
-                "only the two constructed successors are proven; the rest are gaps");
+        assertEquals(111, m.resolvedTransitionCount(),
+                "the binding recovers the successor the caller handed the helper");
 
         assertTrue(hasEventEdge(m, "ReqSent", "TO_MINUS", "Stopped"));
         assertTrue(hasEventEdge(m, "AckSent", "TO_MINUS", "Stopped"));
 
-        // The sharp assertion: no state may claim a RESOLVED self-loop here. Each
-        // one would be an edge the analysis cannot prove, and RFC 1661 contradicts
-        // them outright.
+        // The sharp assertion, and the one the fabrication failed: RFC 1661 §4.1
+        // sends Initial to Closed on UP. Rule 4 firing on the folded callee's
+        // parameter reported Initial --UP--> Initial instead.
+        assertTrue(hasEventEdge(m, "Initial", "UP", "Closed"),
+                "the RFC's own answer, and the edge the fabrication replaced with a self-loop");
+        assertFalse(hasEventEdge(m, "Initial", "UP", "Initial"),
+                "the fabricated self-loop must not come back");
+
+        // F24's property, in the form that survives F25: not one successor here is
+        // reached by reading a root-typed parameter back out. Every one is written
+        // as a construction at the call site, so SELF must not appear on the axis.
+        assertFalse(m.successorForms().contains(SuccessorForm.SELF),
+                "no edge may rest on rule 4 inside a folded callee — the binding is "
+                        + "what resolves these, and the binding is the argument");
+    }
+
+    // ---- F25: the fold carries the caller's argument bindings ---------------
+
+    /**
+     * A parameter read inside a folded callee resolves to the expression the
+     * CALLER passed, because that is what the parameter holds.
+     *
+     * <p>The fold walked a callee's body in the caller's from-context but carried
+     * no binding from the callee's parameters to the caller's arguments, so any
+     * successor arriving through a parameter read was unresolvable <em>by
+     * construction</em>. Note what that meant: {@code forward(new Running())} has
+     * the successor in hand at the call site, and <em>entering discarded it</em>.
+     * Each hop destroyed information rather than recovering it, which is why
+     * declining to fold used to score better than folding.
+     *
+     * <p>Binding a parameter to the argument is EXACT — it is the expression the
+     * caller wrote, not an approximation of it — so this widens nothing. The four
+     * arms hold that claim to its edges, and the two negatives are the guard:
+     * <ul>
+     *   <li>{@code shadow} REASSIGNS its parameter before returning it, so what it
+     *       holds at the {@code return} is no longer the argument and the binding
+     *       would describe an overwritten value — unresolved;</li>
+     *   <li>{@code supplier.supply} has no body to summarise — unresolved, exactly
+     *       as before, and above all not resolved from the argument list.</li>
+     * </ul>
+     */
+    @Test
+    void aFoldedCalleeResolvesItsParameterToTheArgumentTheCallerPassed() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("src/test/resources/foldbinding"));
+        StateMachine m = named(r, "Flow");
+        assertEquals(3, m.allStates().size());
+        assertEquals(6, m.transitions().size(), "every arm is RECORDED either way");
+        assertEquals(4, m.resolvedTransitionCount());
+
+        // The bare value forwarder: `Flow forward(Flow s) { return s; }`.
+        assertTrue(hasResolved(m, "Ready", "Running"),
+                "entering the callee must not discard the successor the call site held");
+
+        // The SELECTION helper: `return c ? a : b`, two live parameters on opposite
+        // branches. Both targets, each under its own guard — neither collapsed into
+        // the other, and neither chosen by position.
+        assertTrue(hasResolved(m, "Running", "Halted"));
+        assertTrue(hasResolved(m, "Running", "Ready"));
+        Set<String> guards = m.transitions().stream()
+                .filter(t -> t.isResolved() && "Running".equals(t.from()))
+                .map(t -> String.valueOf(t.guard())).collect(Collectors.toSet());
+        assertEquals(Set.of("c", "!(c)"), guards,
+                "the two selected parameters must arrive under opposite guards");
+
+        // NEGATIVE — a reassigned parameter no longer holds the argument.
         assertTrue(m.transitions().stream()
-                        .noneMatch(t -> t.isResolved() && t.from().equals(t.to())),
-                "a fabricated self-loop is the one failure mode the invariant forbids");
+                        .anyMatch(t -> !t.isResolved() && "Halted".equals(t.from())
+                                && "GO".equals(t.event())),
+                "a parameter overwritten inside the callee must not be bound");
+        // NEGATIVE — a callee with no body is not summarisable, and its argument
+        // list is not a substitute for the summary.
+        assertTrue(m.transitions().stream()
+                        .anyMatch(t -> !t.isResolved() && "Halted".equals(t.from())
+                                && "STOP".equals(t.event())),
+                "an abstract callee stays unresolved; the binding does not stand in "
+                        + "for a body that was never read");
+        // ...and the ordinary direct construction beside them, so the two gaps are
+        // gaps in the fold and not in the arm walking.
+        assertTrue(hasEventEdge(m, "Halted", "RESET", "Halted"));
+    }
+
+    /**
+     * The binding survives three hops and a carrier slot — the shape the depth
+     * budget used to mask.
+     *
+     * <p>{@code CARRIER_RETURN} is where the missing binding cost most, because
+     * the successor is an ARGUMENT to a wrapper: a forwarding factory puts it
+     * behind a parameter read by construction. {@code Rolling} goes dispatch arm
+     * to per-event helper to forwarding factory, so the successor has to survive
+     * two frames to reach {@code new Carriage(s, a)}'s hierarchy slot.
+     *
+     * <p>{@code Docked} is the negative control and the sharp one. {@code
+     * reject(new Parked(), event)} is syntactically indistinguishable from {@code
+     * wrap(new Parked(), ...)} — a call whose own type is outside the hierarchy
+     * carrying a hierarchy-typed argument — and only the callee's body separates
+     * them. F9 must be asked FIRST: with the binding in place, accepting it would
+     * publish a resolved edge on every input the source rejects, which is exactly
+     * what an undefined cell looks like.
+     */
+    @Test
+    void theBindingSurvivesThreeHopsIntoACarrierSlot() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("src/test/resources/foldbinding"));
+        StateMachine m = named(r, "Carry");
+        assertEquals(3, m.allStates().size());
+        assertTrue(m.commitForms().contains(CommitForm.CARRIER_RETURN));
+        assertEquals(4, m.transitions().size());
+        assertEquals(4, m.resolvedTransitionCount());
+
+        // one hop: arm -> forwarding factory
+        assertTrue(hasResolved(m, "Parked", "Rolling"));
+        // three hops: arm -> per-event helper -> forwarding factory
+        assertTrue(hasEventEdge(m, "Rolling", "STOP", "Docked"));
+        assertTrue(hasEventEdge(m, "Rolling", "GO", "Parked"));
+        assertTrue(hasEventEdge(m, "Rolling", "RESET", "Parked"));
+
+        assertTrue(m.transitions().stream().noneMatch(t -> "Docked".equals(t.from())),
+                "an always-throwing helper is an undefined input: no edge at all, and "
+                        + "above all not the fabricated self-loop the binding would now "
+                        + "make resolvable");
+    }
+
+    /**
+     * AMBIGUITY on the ARGUMENT side of a call is declined, never settled by
+     * position. The existing {@code carrierdispatch} control covers the component
+     * side of a TYPE; this is the call.
+     *
+     * <p>Both dispatches pass TWO hierarchy-typed arguments to a forwarder, so the
+     * argument list alone cannot say which is the successor, and they are held on
+     * one class so nothing but the forwarder's construction can be what the
+     * analysis reacts to. {@code one(a, b)} places {@code a} in a one-slot wrapper
+     * and discards {@code b}: exactly one successor, which is the positive half —
+     * the binding is by USE, not "every hierarchy-typed argument is a target".
+     * {@code pack(a, b)} places both in a two-slot wrapper, and neither may be
+     * published: choosing by declaration or argument order would be a guess, and
+     * here the guess is visible, because the second slot is the current state and
+     * the fabrication would be a self-loop.
+     */
+    @Test
+    void twoHierarchyTypedArgumentsIntoTwoSlotsResolveNeither() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("src/test/resources/foldbinding"));
+        StateMachine m = named(r, "Twin");
+        assertEquals(2, m.allStates().size());
+        assertEquals(2, m.transitions().size());
+        assertEquals(2, m.resolvedTransitionCount());
+
+        // the one-slot forwarder: the placed argument, and only it
+        assertTrue(hasResolved(m, "Live", "Dead"));
+        assertTrue(hasResolved(m, "Dead", "Live"));
+
+        assertTrue(m.transitions().stream().noneMatch(t -> t.from().equals(t.to())),
+                "the two-slot construction resolves neither slot — a self-loop here "
+                        + "would be argument order dressed as a proof");
+    }
+
+    /**
+     * What rule (5) may NOT do on its way back out: route into rule 4's standing
+     * over-approximation at a top-level dispatch.
+     *
+     * <p>Resolving a callee's parameter means resolving the expression the caller
+     * passed, in the caller's own body — and rule 4 lives there too, licensing "a
+     * root-typed parameter read means stay in the matched state" for <em>any</em>
+     * parameter. The fold reaches that point only when the callee's own parameter
+     * has already been shown NOT to be the current state, so widening there would
+     * contradict what was just established: {@code fwd(spare)} would become a
+     * proven self-loop on the strength of {@code spare} being a parameter.
+     *
+     * <p>It must stay unresolved, and the cost of getting it wrong is invisible in
+     * the score — the other arm resolves either way, so the machine would read a
+     * clean 2/2 with one edge fabricated. The same shared predicate answers it,
+     * asked of the read instead of the binding.
+     */
+    @Test
+    void theFoldDoesNotWidenRuleFourOnItsWayBackOut() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("src/test/resources/foldbinding"));
+        StateMachine m = named(r, "Ballast");
+        assertEquals(2, m.allStates().size());
+        assertEquals(2, m.transitions().size());
+        assertEquals(1, m.resolvedTransitionCount(),
+                "the non-selector parameter is a gap, not a self-loop");
+
+        assertTrue(hasResolved(m, "List_", "Trim"),
+                "the arm that passes a construction still resolves — this is a "
+                        + "narrowing, not a blanket refusal to fold");
+        assertFalse(hasResolved(m, "Trim", "Trim"),
+                "argument position and parameter-ness are not a proof");
+        assertFalse(m.successorForms().contains(SuccessorForm.SELF));
+    }
+
+    /**
+     * A forwarder that forwards to itself must TERMINATE, and terminate
+     * unresolved.
+     *
+     * <p>Resolving a parameter by resolving the caller's argument is a step the
+     * analysis can take repeatedly, so the guards have to hold in both spellings:
+     * {@code bounce} recurses directly, and {@code ping}/{@code pong} recurse
+     * mutually, so no single signature repeats until two frames have been pushed.
+     * Both arms are real transitions the source could make and the analysis cannot
+     * read, so both are RECORDED as unresolved — never dropped, and never resolved
+     * to the argument that started the cycle.
+     */
+    @Test
+    void aRecursiveForwarderTerminatesUnresolvedRatherThanLooping() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("src/test/resources/foldbinding"));
+        StateMachine m = named(r, "Loop");
+        assertEquals(2, m.allStates().size());
+        assertEquals(2, m.transitions().size(), "both arms are recorded");
+        assertEquals(0, m.resolvedTransitionCount(),
+                "neither cycle may settle on the argument it started from");
+        assertTrue(m.transitions().stream().anyMatch(t -> "Spin".equals(t.from())));
+        assertTrue(m.transitions().stream().anyMatch(t -> "Rest".equals(t.from())));
     }
 
     /**
