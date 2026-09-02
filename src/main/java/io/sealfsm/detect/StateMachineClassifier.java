@@ -2,6 +2,7 @@ package io.sealfsm.detect;
 
 import io.sealfsm.detect.dispatch.DispatchFinder;
 import io.sealfsm.detect.dispatch.DispatchSite;
+import io.sealfsm.detect.dispatch.EventMajorDispatch;
 import io.sealfsm.model.StateMachine.Encoding;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.CtLambda;
@@ -198,14 +199,33 @@ public final class StateMachineClassifier {
         trace.accept("no predicate above produced a transition producer: ABSTAINING. Not a "
                 + "verdict about the hierarchy — it may be the event alphabet, or its dispatch "
                 + "may sit somewhere no recognizer can see");
-        trace.accept(loci.isEmpty()
+        // F27 — the LAST thing asked, and asked only once every state-major
+        // predicate has declined, so it can only add candidates. It is reported on
+        // its own line because it is a different finding from the one above: a
+        // Σ-major dispatch HAS the commit and lacks the discrimination, which is
+        // the exact mirror of the Tier 3 case the previous line describes.
+        var eventMajor = EventMajorDispatch.find(root, model, hierarchyQualifiedNames(root));
+        trace.accept("Σ-major dispatch (a switch over the EVENT whose arms install a hierarchy "
+                + "value — evidence for the candidate channel only, never for a machine): "
+                + verdict(eventMajor.sites().size())
+                + (eventMajor.isEmpty() ? "" : " — "
+                        + eventMajor.sites().stream().map(EventMajorDispatch.Site::describe)
+                                .toList()));
+        trace.accept(loci.isEmpty() && eventMajor.isEmpty()
                 ? "OUTCOME: rejected, and not a candidate either — nothing in the model "
                         + "discriminates this hierarchy. Its states are still exact by "
                         + "construction; the tool simply has no dispatch to report them against"
-                : "OUTCOME: TIER 3 (CANDIDATE) — the state IS discriminated at " + loci.size()
-                        + " site(s) above, but no commit could be proven, so no transition "
-                        + "relation is claimed. The complete permits closure is reported on the "
-                        + "candidate channel: states are exact whether or not transitions are");
+                : !loci.isEmpty()
+                        ? "OUTCOME: TIER 3 (CANDIDATE) — the state IS discriminated at "
+                                + loci.size() + " site(s) above, but no commit could be proven, so "
+                                + "no transition relation is claimed. The complete permits closure "
+                                + "is reported on the candidate channel: states are exact whether "
+                                + "or not transitions are"
+                        : "OUTCOME: TIER 3 (CANDIDATE) — a hierarchy value IS committed at "
+                                + eventMajor.sites().size() + " Σ-major site(s), but the state is "
+                                + "discriminated nowhere, so no successor can be attributed to a "
+                                + "source state. The complete permits closure is reported on the "
+                                + "candidate channel");
         // Abstention, stated as abstention. The old wording ("looks like a plain
         // sum type") asserted a positive classification the analysis had not made:
         // a sealed type reaches this line just as readily by being the event

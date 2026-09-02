@@ -199,10 +199,20 @@ public final class Main {
         for (StateMachine m : tier2) {
             System.out.printf("  ! %s: TIER 2 — dispatch present, commit proven (%s), no successor "
                             + "resolved.%n", m.name(), m.commitEvidence());
-            System.out.printf("    Its %d state(s) are exact; each of the %d dispatched arm(s) is "
-                            + "recorded as an%n", m.allStates().size(), m.transitions().size());
-            System.out.println("    unresolved edge with a known source state, never as an empty "
-                    + "relation.");
+            if (m.transitions().isEmpty()) {
+                // F27 — the total-loss case, and the one that used to print as 0/0.
+                System.out.printf("    Its %d state(s) are exact; NO arm could be attributed to a "
+                        + "source state,%n", m.allStates().size());
+                System.out.println("    so not even an unresolved edge could be recorded. The "
+                        + "relation is entirely");
+                System.out.println("    unrecovered — read 0/0 as a total loss, never as a "
+                        + "machine without transitions.");
+            } else {
+                System.out.printf("    Its %d state(s) are exact; each of the %d dispatched arm(s) "
+                        + "is recorded as an%n", m.allStates().size(), m.transitions().size());
+                System.out.println("    unresolved edge with a known source state, never as an "
+                        + "empty relation.");
+            }
         }
         for (StateMachine m : viaCallee) {
             if (tier2.contains(m)) continue;

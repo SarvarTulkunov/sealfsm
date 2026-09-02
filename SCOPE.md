@@ -19,11 +19,25 @@ set *Q* is **complete by construction**. This is not an analysis result; it is a
 property of the source, and it holds whether or not any transition is recovered.
 
 The tool reports *Q* for every hierarchy it examines. Where a transition producer
-is recognised, *Q* is the machine's state set. Where none is — but the state is
-nevertheless discriminated somewhere in the program — *Q* is reported on a
+is recognised, *Q* is the machine's state set. Where none is, *Q* is reported on a
 separate **candidate** channel, together with the dispatch sites found and the
-reason no commit could be proven. A candidate is explicitly not a machine: no
+reason no relation is claimed. A candidate is explicitly not a machine: no
 transition relation is claimed for it and no diagram is drawn.
+
+Two disjoint kinds of evidence open that channel, and they fail for **opposite**
+reasons, which is why they are reported under different sentences:
+
+* the state is **discriminated** somewhere and no branch installs a hierarchy
+  value — the discrimination without the commit (an exhaustive fold);
+* a hierarchy value **is** committed by a Σ-major dispatch — a switch over the
+  *input* whose arms install a state — and the state is discriminated nowhere, so
+  the commit is there and no successor can be attributed to a source state.
+
+The second is F27, and it is common: `CENSUS.md` measures 25 Σ-major against 9
+state-major commits of a closed state type across JDK 21 and 145 library source
+jars. It is reported as a candidate rather than as a machine deliberately — a
+Σ-major arm matches no state, so a relation built from one would be sourced
+entirely at `<unknown>`.
 
 ## 2. Commit existence — proven, from declared types
 

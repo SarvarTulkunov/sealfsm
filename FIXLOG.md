@@ -1144,3 +1144,129 @@ State enumeration is on neither axis. It is exact by construction, from the
 `permits` clause the compiler checks, and it is now reported for every hierarchy
 the tool examines: as a machine's state set at Tier 1 and 2, and as a candidate's
 at Tier 3.
+
+---
+
+## F27 — the transition table written transposed, and the empty relation that went unmarked
+
+Two defects, found by asking what happens to a hierarchy whose dispatch switches
+on the **event** rather than on the state. They are independent and only the
+second is a widening.
+
+### The question, and why it was measured before it was answered
+
+Every locus the tool recognises is a spelling of *switch on Q*. A table can be
+written the other way round — `switch (frameType) { case GOAWAY -> connState =
+new Closed(); … }` — and then nothing discriminates the state anywhere. Such a
+hierarchy matched no recognizer, was rejected as "no transition producer found",
+and because the Tier 3 candidate channel keys on the same state-discrimination it
+reported **no states either**, though its `permits` clause names them exactly.
+
+Whether that gap is worth closing is an empirical claim about how Java is
+written, so it was counted rather than argued. `CENSUS.md` records the
+measurement in full; `scripts/census/` is the instrument. Over JDK 21 (14,723
+files) and 145 library source jars (26,432 files), of **909** state fields whose
+type is a closed set:
+
+| written by | count |
+|---|---|
+| a state-major dispatch | 9 |
+| a Σ-major dispatch, directly | 17 |
+| a Σ-major dispatch, one call deep | 8 |
+| no dispatch at all | 875 |
+
+The shape the tool could not see is the **more common** of the two it was
+choosing between, and it occurs in the thesis's own domain: Apache HttpClient 5's
+HTTP/2 multiplexer commits `connState` from inside `switch (frameType)`, and its
+HTTP/1.1 duplexer from inside `switch (closeMode)`. Both were read by hand, not
+just counted.
+
+### (a) Σ-major dispatch releases the state set — candidate channel only
+
+`EventMajorDispatch` is the new recognizer, and it is asked **last**, after every
+state-major predicate has declined, so it can only add candidates. It is
+deliberately **not** a `DispatchLocus` value: that axis classifies where the STATE
+is discriminated, and a Σ-major switch discriminates the input, so giving it a
+position there would make it reachable from the walkers.
+
+**It never produces a machine, and that is the load-bearing restriction.** A Tier
+2 machine's contract is one unresolved edge per dispatched arm *with a known
+source state*. A Σ-major arm establishes no source state at all, so a relation
+built from one would be sourced entirely at `<unknown>` — the tiers exist so that
+a gap in attribution is not dressed as a result.
+
+Three requirements, each one traceable to a population the census found:
+
+* **the selector is a closed type** (enum or sealed) outside H — an alphabet is
+  what makes the arms a table, and `switch (int opcode)` is the shape of every
+  parser and bytecode reader in Java. Answered from the *declaration*, never from
+  a reference's guessed spelling, so an unreadable import cannot decide it;
+* **≥ 2 arms commit** — one committing branch is a special case being handled.
+  The same threshold, for the same reason, that a type-test chain applies;
+* **the host holds a hierarchy value** — an H-typed parameter or field. This is
+  Q × Σ → Q asked directly, and it is what rejects `VectorShape.forBitSize(int)`,
+  `JavaKind.fromPrimitiveOrVoidTypeChar(char)` and every other decoder the census
+  turned up.
+
+The commit itself is **not** relaxed: a write to an H-typed target, a recognised
+mutator call, or the k = 1 `CommitProbe` one callee deep — asked of the shared
+recognizers rather than restated, so "what counts as a commit" stays one
+definition. A Σ-major switch folding into a `String` therefore yields nothing,
+which is `examples/voidfold`'s guarantee restated at this locus.
+
+`examples/eventmajor` holds both spellings on ONE class (committing directly, and
+committing one callee deep) so no difference of file or context can stand in, plus
+four negative controls sharing the package and the event alphabet so that only the
+clause under test can be what the recognizer reacted to: `Mode` folds into a
+`String` (and keeps an H-typed field, or it would be excluded by the wrong clause
+and test nothing), `Shade` is a factory with no Q in, `Tone` switches on an `int`,
+`Beat` commits in exactly one arm.
+
+### (b) An empty relation is a tier, not a bug to be excluded from the tiers
+
+`isDetectedEmpty()` required `!transitions.isEmpty()`, on the reasoning that a
+dispatched arm always yields an edge so "no transitions at all is a bug rather
+than a tier". The reasoning is right and the conclusion was backwards. A machine
+can be accepted on a producer's **signature** — a method taking and returning H —
+while nothing in the model discriminates the state; then there is no arm to yield
+an edge, the walk reaches no production, and the machine fell through all three
+tiers and printed as a clean `0/0`. In a stratified recall table that reads as a
+vacuous row rather than as the total loss it is.
+
+An empty relation is the most complete failure of transition recovery there is, so
+it is the last thing that may go unmarked. The predicate is now
+`resolvedTransitionCount() == 0`, and the report distinguishes the two Tier 2
+shapes: *every arm attributed and no target resolved* versus *no arm attributable
+at all*. `examples/emptyrelation` is the fixture, and `synchronized` is its
+standing probe for the same reason it is `examples/opaquesuccessor`'s.
+
+### Measured
+
+* Corpus **byte-identical**: all 46 pre-existing fixtures, `.dot`, `.scxml` and
+  `summary.txt` alike, across both halves. Nothing moved; two fixtures were added.
+* 197 tests green (194 before, +3). The property test over *every* directory in
+  `examples/` picks the two new fixtures up automatically and asserts their state
+  sets against an independently recomputed `permits` closure.
+* `examples/eventmajor`: 0 machines, **1 candidate, 4 states, 2 Σ-major sites**;
+  the four controls yield neither a machine nor a candidate. At HEAD the whole
+  package reported **0 states**.
+* `examples/emptyrelation`: 3 states, `0/0` now carrying its tier and its reason.
+
+### Cells
+
+No `(DispatchLocus × CommitForm)` cell changes: a Σ-major dispatch is not a locus
+and produces no transitions. What changes is the **reporting** channel — the Tier
+3 predicate gains a second, disjoint kind of evidence, and the two are reported
+under different sentences because they fail for opposite reasons: a state-major
+locus has the discrimination and no commit, a Σ-major one has the commit and no
+discrimination.
+
+### The scope line this leaves standing
+
+Apache's `consumeFrame` **is** a real machine, and reporting it as a candidate
+understates it. Recovering its relation means attributing a source state to an arm
+that never matched one, which requires reasoning about what the state field held
+on entry — an inter-procedural, flow-sensitive question the tool does not ask
+anywhere. The honest boundary is therefore: the states are exact and named, the
+dispatch sites are named, and no relation is claimed. Closing it is future work
+and is a genuinely larger change than this one.

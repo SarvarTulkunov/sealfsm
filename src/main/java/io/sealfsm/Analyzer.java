@@ -6,6 +6,7 @@ import io.sealfsm.detect.dispatch.CommitProbe;
 import io.sealfsm.detect.dispatch.DispatchArm;
 import io.sealfsm.detect.dispatch.DispatchFinder;
 import io.sealfsm.detect.dispatch.DispatchSite;
+import io.sealfsm.detect.dispatch.EventMajorDispatch;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.detect.StateMachineClassifier.Classification;
@@ -233,8 +234,15 @@ public final class Analyzer {
                         "TIER 2 (dispatch present, commit proven via "
                                 + machine.commitEvidence() + ", no successor resolved) — the "
                                 + machine.allStates().size() + " states are exact regardless; "
-                                + "every dispatched arm is recorded as an unresolved edge with a "
-                                + "known source state, never as an empty relation");
+                                + (machine.transitions().isEmpty()
+                                        // F27: the total loss. Marked, because a bare 0/0 reads
+                                        // as a machine that simply has no transitions.
+                                        ? "NO arm could be attributed to a source state, so not "
+                                          + "even an unresolved edge could be recorded and the "
+                                          + "relation is entirely unrecovered"
+                                        : "every dispatched arm is recorded as an unresolved edge "
+                                          + "with a known source state, never as an empty "
+                                          + "relation"));
             }
             long viaUnread = machine.transitionsViaUnreadDeclaration();
             result.info(root.getQualifiedName(),
@@ -520,14 +528,25 @@ public final class Analyzer {
     private void recordCandidate(CtType<?> root, CtModel model, Classification c,
                                  ExtractionResult result) {
         if (c.rejection() != Rejection.ABSTAINED) return;
+        Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
         List<DispatchSite> loci = DispatchFinder.locusSites(root, model);
-        if (loci.isEmpty()) return;
+        // F27 — the transition table written TRANSPOSED. A switch over the event
+        // whose arms install a state discriminates Σ, not Q, so every recognizer
+        // above answers "no dispatch" and the hierarchy previously reported no
+        // states either. That is evidence for the candidate channel and never for
+        // a machine: a Σ-major arm establishes no source state, so a relation
+        // built from one would be sourced entirely at <unknown>.
+        EventMajorDispatch.Result eventMajor = EventMajorDispatch.find(root, model, hierarchy);
+        if (loci.isEmpty() && eventMajor.isEmpty()) return;
 
         StateExtractor.Result states = stateExtractor.extract(root);
         List<String> sites = new ArrayList<>();
         for (DispatchSite site : loci) {
             sites.add(site.locus() + " @ " + (site.hostKey() == null
                     ? String.valueOf(site.host()) : site.hostKey()));
+        }
+        for (EventMajorDispatch.Site site : eventMajor.sites()) {
+            sites.add(site.describe());
         }
         // F11 — a callee whose declaration was never read is a DIFFERENT report
         // from one that was read and commits nothing: the first is a fact about
@@ -536,14 +555,28 @@ public final class Analyzer {
         // named rather than folded into the reason.
         Set<String> unreadable = new LinkedHashSet<>();
         for (DispatchSite site : loci) {
-            unreadable.addAll(CommitProbe.of(armBodies(site),
-                    StateMachineClassifier.hierarchyQualifiedNames(root),
+            unreadable.addAll(CommitProbe.of(armBodies(site), hierarchy,
                     root.getQualifiedName()).unreadable());
         }
-        String reason = "the state is discriminated at " + loci.size()
-                + " site(s), but no branch installs a hierarchy value, so no commit is proven "
-                + "(the exhaustive-fold guard: a transition switch and a fold are identical AT "
-                + "the discrimination, and only the codomain separates them)"
+        unreadable.addAll(eventMajor.unreadable());
+        // The two kinds of evidence fail for OPPOSITE reasons and a candidate must
+        // say which: a state-major locus has the discrimination and no commit, a
+        // Σ-major one has the commit and no discrimination of the state. Reporting
+        // either under the other's sentence would misattribute the gap.
+        List<String> reasons = new ArrayList<>();
+        if (!loci.isEmpty()) {
+            reasons.add("the state is discriminated at " + loci.size()
+                    + " site(s), but no branch installs a hierarchy value, so no commit is proven "
+                    + "(the exhaustive-fold guard: a transition switch and a fold are identical AT "
+                    + "the discrimination, and only the codomain separates them)");
+        }
+        if (!eventMajor.isEmpty()) {
+            reasons.add("a hierarchy value IS committed at " + eventMajor.sites().size()
+                    + " Σ-major site(s) — a switch over the event alphabet whose arms install a "
+                    + "state — but the state itself is discriminated nowhere, so no successor can "
+                    + "be attributed to a source state and no relation is claimed (F27)");
+        }
+        String reason = String.join("; additionally, ", reasons)
                 + (unreadable.isEmpty() ? ""
                         : "; additionally, the callee(s) " + unreadable + " could not be read, "
                                 + "and an unread body is not evidence of a commit (F11)");

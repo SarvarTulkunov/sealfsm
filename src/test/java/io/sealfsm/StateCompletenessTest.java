@@ -282,6 +282,99 @@ class StateCompletenessTest {
         assertTrue(r.candidates().isEmpty(), "a recursive data type is a verdict, not a candidate");
     }
 
+    // ---- 3b. F27: the transposed table, and the unmarked empty relation ------
+
+    /**
+     * F27 — {@code examples/eventmajor}. A switch over the EVENT whose arms install
+     * a state discriminates Σ, not Q, so every recognizer answered "no dispatch" and
+     * the hierarchy reported no states either. Both spellings are held on one class
+     * — committing directly, and committing one callee deep — so the site count is
+     * what proves the probe reaches this locus too.
+     *
+     * <p>It must be a CANDIDATE and never a machine. A Σ-major arm establishes no
+     * source state, so a relation built from one would be sourced entirely at
+     * {@code <unknown>}; the tiers exist precisely so a gap in attribution is not
+     * dressed as a result.
+     */
+    @Test
+    void eventMajorDispatchReleasesTheStateSet() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/eventmajor"));
+        assertTrue(r.machines().isEmpty(),
+                "a Σ-major dispatch attributes no source state, so it is evidence for the "
+                        + "candidate channel and never for a machine");
+        Candidate c = candidate(r, "eventmajor.Link");
+        assertEquals(Set.of("Ready", "Active", "Draining", "Closed"), ids(c.allStates()),
+                "the permits clause names them exactly, whether or not a relation is recovered");
+        assertEquals(2, c.dispatchSites().size(),
+                "both spellings are found: the direct field commit and the one a callee deep");
+        assertTrue(diagnosticsFor(r, "eventmajor.Link").stream()
+                        .anyMatch(d -> d.contains("CANDIDATE") && d.contains("Σ-major")),
+                "the reason names the transposition rather than borrowing the state-major "
+                        + "sentence, which fails for the opposite reason");
+    }
+
+    /**
+     * The four negative controls, each holding one requirement. They share the
+     * package and the event alphabet with the positive case, so nothing but the
+     * clause under test can be what the recognizer reacted to.
+     *
+     * <ul>
+     *   <li>{@code Mode} — the arms fold into a {@code String}. The commit
+     *       requirement is not relaxed at this locus; {@code examples/voidfold}'s
+     *       guarantee restated. It keeps a {@code Mode} field deliberately, or it
+     *       would be excluded by the Q × Σ → Q clause instead and test nothing.</li>
+     *   <li>{@code Shade} — commits in two arms, but the host holds no hierarchy
+     *       value, so the successor cannot depend on a current state. That is a
+     *       factory; JDK 21's {@code VectorShape.forBitSize(int)} and
+     *       {@code Opcode.getOpcodeBlock(int)} are the real instances.</li>
+     *   <li>{@code Tone} — the same table over an {@code int}. An open selector is
+     *       not an alphabet, and admitting one would sweep in every parser.</li>
+     *   <li>{@code Beat} — exactly one committing arm, which is a special case
+     *       being handled rather than a table.</li>
+     * </ul>
+     */
+    @Test
+    void everyEventMajorControlYieldsNothing() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/eventmajor"));
+        assertEquals(1, r.candidates().size(),
+                "exactly one hierarchy qualifies; the other four are controls and must not");
+        assertEquals("eventmajor.Link", r.candidates().get(0).qualifiedName());
+        for (String control : List.of("eventmajor.Mode", "eventmajor.Shade",
+                "eventmajor.Tone", "eventmajor.Beat")) {
+            assertTrue(r.candidates().stream().noneMatch(c -> c.qualifiedName().equals(control)),
+                    control + " must not be a candidate — it fails exactly one requirement, and "
+                            + "the requirement is what keeps this channel meaningful");
+        }
+    }
+
+    /**
+     * F27, the other half — {@code examples/emptyrelation}. A machine accepted on
+     * its helpers' <em>signatures</em> while nothing discriminates the state has no
+     * arm to attribute and no reachable production, so the walk yields no
+     * transitions at all. That fell through all three tiers and printed as a clean
+     * {@code 0/0}, which in a stratified recall table reads as a vacuous row rather
+     * than as the total loss it is.
+     *
+     * <p>An empty relation is the most complete failure of transition recovery
+     * there is, so it is the last thing that may go unmarked — and the states are
+     * exact regardless, which is the property this whole file exists to pin.
+     */
+    @Test
+    void anEmptyRelationIsMarkedRatherThanPrintedAsACleanScore() {
+        StateMachine m = single(new Analyzer().analyze(modelOf("examples/emptyrelation")));
+        assertEquals(3, m.allStates().size(), "states are exact however badly transitions do");
+        assertTrue(m.transitions().isEmpty(), "the fixture exists to produce no relation at all");
+        assertTrue(m.isDetectedEmpty(),
+                "0 of 0 is a total loss and must carry a tier, not read as a machine that "
+                        + "simply has no transitions");
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/emptyrelation"));
+        assertTrue(diagnosticsFor(r, "emptyrelation.Conn").stream()
+                        .anyMatch(d -> d.contains("TIER 2")
+                                && d.contains("NO arm could be attributed")),
+                "the report says which of the two Tier 2 shapes this is: no arm attributable, "
+                        + "rather than every arm attributed and no target resolved");
+    }
+
     // ---- 4. every existing golden unchanged ---------------------------------
 
     /**

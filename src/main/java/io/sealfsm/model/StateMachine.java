@@ -176,12 +176,25 @@ public final class StateMachine {
      * describes. The distinction matters to a consumer because the two tiers make
      * different claims with the same shape of output: a Tier 1 machine reports a
      * transition relation, a Tier 2 machine reports that it has one and that every
-     * target is unknown. An empty transition list is neither — under the
-     * record-everything invariant a dispatched arm always yields an edge, so a
-     * machine with no transitions at all is a bug rather than a tier.
+     * target is unknown.
+     *
+     * <p><b>F27 — the empty relation is included, and excluding it was the hole.</b>
+     * This predicate used to require {@code !transitions.isEmpty()} on the reasoning
+     * that a dispatched arm always yields an edge, so no transitions at all "is a
+     * bug rather than a tier". The reasoning is right and the conclusion was
+     * backwards: a machine can be accepted on a producer's <em>signature</em> — a
+     * method taking and returning H — while nothing in the model discriminates the
+     * state, and then there is no arm to yield an edge and the walk produces
+     * nothing. Such a machine fell through all three tiers and was printed as a
+     * clean {@code 0/0}, which in a stratified recall table reads as a vacuous row
+     * rather than as the total loss it is. An empty relation is the most complete
+     * failure of transition recovery there is, so it is the LAST thing that may go
+     * unmarked. {@link #transitions()} being empty is what the report then adds,
+     * because "no arm could be attributed" is a different sentence from "every arm
+     * was attributed and no target resolved".
      */
     public boolean isDetectedEmpty() {
-        return resolvedTransitionCount() == 0 && !transitions.isEmpty();
+        return resolvedTransitionCount() == 0;
     }
 
     /**
