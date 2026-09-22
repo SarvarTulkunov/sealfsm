@@ -231,23 +231,42 @@ public final class Main {
      * hierarchy?", which the tool can give exactly even where it can prove nothing
      * about the transitions. Refusing to call a hierarchy a machine and refusing
      * to say what its states are were the same refusal before this channel
-     * existed, and they are two different claims. The reason each one was rejected
-     * stays in the diagnostics, where it belongs.
+     * existed, and they are two different claims.
+     *
+     * <p><b>Each candidate carries its own reason, and the section header must not
+     * try to.</b> The two ways the evidence can fail are OPPOSITE — a state-major
+     * locus has the discrimination and no proven commit, a Σ-major one (F27) has
+     * the commit and no discrimination of the state — and a header stating either
+     * reports the other under a sentence that is false of it. The header said
+     * "dispatch present, commit NOT proven" for every entry, which contradicted
+     * {@code examples/eventmajor}'s own reason printed a few lines below it;
+     * {@code Analyzer.recordCandidate} had already been careful to keep the two
+     * apart, and the summary threw that away. So the header now states only what
+     * is true of all of them, and the per-candidate reason is printed here rather
+     * than left in the diagnostics: for a Tier 3 entry the reason IS the result —
+     * a state set with no verdict attached is not interpretable — and it is
+     * printed regardless of {@code --quiet} on the same ground as the unread-
+     * declaration footnote, because it qualifies the line directly above rather
+     * than reporting a finding about the run.
      */
     private static void printCandidates(ExtractionResult result) {
         if (result.candidates().isEmpty()) return;
         System.out.println();
         System.out.println("-".repeat(112));
-        System.out.printf("Candidate hierarchies — dispatch present, commit NOT proven, so not "
-                + "reported as machines (%d):%n", result.candidates().size());
+        System.out.printf("Candidate hierarchies — states enumerated exactly, no transition "
+                + "relation claimed (%d):%n", result.candidates().size());
+        System.out.println("    States come from the permits clause and are compiler-checked. "
+                + "These are NOT machines and");
+        System.out.println("    are counted as none; each entry names the half of the evidence "
+                + "that was missing.");
         for (Candidate c : result.candidates()) {
-            System.out.printf("  %-40s %2d state(s)  %s%n",
-                    truncate(c.qualifiedName(), 40),
+            System.out.println();
+            System.out.printf("  %-52s %2d state(s)  %s%n",
+                    truncate(c.qualifiedName(), 52),
                     c.allStates().size(),
                     c.allStates().stream().map(State::id).collect(Collectors.joining(", ")));
+            System.out.println(wrap(c.reason(), 106, "      "));
         }
-        System.out.println("    States come from the permits clause and are exact. No transition "
-                + "relation is claimed.");
     }
 
     /**
@@ -336,6 +355,31 @@ public final class Main {
 
     private static String truncate(String s, int n) {
         return s.length() <= n ? s : s.substring(0, n - 1) + "…";
+    }
+
+    /**
+     * Soft-wraps a sentence at {@code width} columns, indenting every line.
+     *
+     * <p>A candidate's reason is prose, not a column: it names the site count, the
+     * predicate that declined and — where it applies — the callee that could not be
+     * read, and truncating it to a field width would cut off exactly the part that
+     * distinguishes one kind of gap from the other. A word longer than the width is
+     * left to overrun rather than broken, since every long token here is a qualified
+     * name and splitting one makes it unsearchable.
+     */
+    private static String wrap(String text, int width, String indent) {
+        StringBuilder out = new StringBuilder();
+        StringBuilder line = new StringBuilder(indent);
+        for (String word : text.split(" +")) {
+            if (word.isEmpty()) continue;
+            if (line.length() > indent.length() && line.length() + 1 + word.length() > width) {
+                out.append(line).append(System.lineSeparator());
+                line = new StringBuilder(indent);
+            }
+            if (line.length() > indent.length()) line.append(' ');
+            line.append(word);
+        }
+        return out.append(line).toString();
     }
 
     private static void printUsage() {
