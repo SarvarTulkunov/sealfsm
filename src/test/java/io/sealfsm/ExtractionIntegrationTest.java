@@ -915,6 +915,67 @@ class ExtractionIntegrationTest {
         }
     }
 
+    /**
+     * F30: a static method on the hierarchy runs in no state, so it is never a
+     * per-state transition method — and it is offered to the centralized
+     * recognizer rather than dropped. Three hierarchies, one per direction the
+     * old reading failed in, each asserted edge by edge.
+     */
+    @Test
+    void aStaticMethodOnTheHierarchyRunsInNoState() {
+        CtModel model = modelOf("examples/staticfactory");
+        ExtractionResult r = new Analyzer().analyze(model);
+
+        // Kafka's KRaftVersionUpgrade: a sum type whose only H-returning method is
+        // a static factory. Was a machine, 1/1, its edge sourced at the root.
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Upgrade")),
+                "a static factory is not a transition");
+
+        // A real machine carrying a factory on the root, a factory on a leaf and a
+        // static helper. Was 4/4: `Lamp -> Off` sourced at the root, `Off -> Off`
+        // fabricated, and every edge labelled with a method name only because the
+        // statics made the names look like they discriminate.
+        StateMachine lamp = machine(r, "Lamp");
+        assertEquals(StateMachine.Encoding.POLYMORPHIC, lamp.encoding());
+        assertEquals(Set.of("Off->On", "On->Off"), resolvedPairs(lamp),
+                "the leaf factory adds no self-loop, and the helper still folds");
+        assertEquals(2, lamp.transitions().size());
+        assertTrue(lamp.transitions().stream().allMatch(t -> t.event() == null),
+                "one transition method name is the function, not an input (F22)");
+
+        // The control that forbids a plain drop: a transition FUNCTION declared on
+        // the root, dispatching with a switch statement no producer sees. Was a
+        // Tier 2 total loss filed as POLYMORPHIC; without the re-offer it is lost.
+        StateMachine gauge = machine(r, "Gauge");
+        assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, gauge.encoding());
+        assertEquals(Set.of("Low->Mid", "Low->Low", "Mid->High", "Mid->Low",
+                        "High->Mid", "High->High"), resolvedPairs(gauge));
+        assertTrue(gauge.transitions().stream().allMatch(Transition::isResolved));
+
+        // Nothing is sourced at a root interface anywhere.
+        for (StateMachine m : r.machines()) {
+            assertTrue(m.transitions().stream().noneMatch(t -> t.from().equals(m.name())),
+                    m.name() + " has an edge sourced at its own root");
+        }
+
+        // And the recognizers agree on WHY, so the outcome is not incidental.
+        CtType<?> lampRoot = typeNamed(model, "staticfactory.Lamp");
+        assertTrue(StateMachineClassifier.findDistributedTransitionMethods(lampRoot).stream()
+                        .noneMatch(m -> m.isStatic()),
+                "no static method is a per-state transition method");
+        CtType<?> gaugeRoot = typeNamed(model, "staticfactory.Gauge");
+        assertEquals(List.of("next"),
+                StateMachineClassifier.findCentralizedTransitionMethods(gaugeRoot, model).stream()
+                        .map(m -> m.getSimpleName()).toList(),
+                "the static transition function is found as a centralized one");
+    }
+
+    private static CtType<?> typeNamed(CtModel model, String qualifiedName) {
+        return model.getAllTypes().stream()
+                .filter(t -> t.getQualifiedName().equals(qualifiedName))
+                .findFirst().orElseThrow();
+    }
+
     private StateMachine machine(ExtractionResult r, String name) {
         return r.machines().stream().filter(m -> m.name().equals(name)).findFirst()
                 .orElseThrow(() -> new AssertionError("no machine " + name));

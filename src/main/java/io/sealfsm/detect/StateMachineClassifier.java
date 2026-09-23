@@ -400,14 +400,28 @@ public final class StateMachineClassifier {
     // ---- shared discovery, reused by the extractor ----------------------------
 
     /**
-     * Methods declared on the root or any permitted subtype whose return type is
-     * inside the hierarchy. These produce the next state in the State pattern.
+     * Instance methods declared on the root or any permitted subtype whose return
+     * type is inside the hierarchy. These produce the next state in the State
+     * pattern.
+     *
+     * <p><b>F30 — a static method runs in no state.</b> What makes a per-state
+     * method's declaring class an exact source state is that the receiver's dynamic
+     * type selects the body. A {@code static} method has no receiver, so it is not
+     * dispatched by state at all: {@code static Upgrade empty()} on the root (Apache
+     * Kafka's {@code KRaftVersionUpgrade}) was published as a machine whose one edge
+     * is sourced at the root interface, and {@code static Off create()} on a leaf as
+     * a resolved {@code Off -> Off} self-loop indistinguishable from a real one. The
+     * carrier path has always excluded statics ({@code CarrierTransitionDetector}).
+     * A static method on the hierarchy can still be a transition FUNCTION; it is
+     * offered to {@link #findCentralizedTransitionMethods} instead, which asks for
+     * the discrimination a factory does not have.
      */
     public static List<CtMethod<?>> findDistributedTransitionMethods(CtType<?> root) {
         Set<String> hierarchy = hierarchyQualifiedNames(root);
         List<CtMethod<?>> out = new ArrayList<>();
         for (CtType<?> member : hierarchyTypes(root)) {
             for (CtMethod<?> method : member.getMethods()) {
+                if (method.isStatic()) continue;
                 CtTypeReference<?> ret = method.getType();
                 if (ret != null && hierarchy.contains(ret.getQualifiedName())) {
                     out.add(method);
@@ -475,11 +489,13 @@ public final class StateMachineClassifier {
             // here to avoid handling the same body twice.
             CtType<?> declaring = method.getDeclaringType();
             if (declaring instanceof CtClass<?> c && c.isAnonymous()) continue;
-            // Exclude the per-state methods already counted as distributed:
-            // a centralized function lives outside the state classes themselves.
+            // Exclude the per-state methods already counted as distributed. A static
+            // method declared inside the hierarchy is not one of them (F30): it runs
+            // in no state, so it is a transition function only if it takes or
+            // discriminates the state, which is exactly what is asked below.
             boolean declaredInsideHierarchy =
                     declaring != null && hierarchyTypeNames.contains(declaring.getQualifiedName());
-            if (declaredInsideHierarchy) continue;
+            if (declaredInsideHierarchy && !method.isStatic()) continue;
             if (takesHierarchyParameter(method, hierarchy)
                     || DispatchCommitDetector.discriminatesState(method, hierarchy, rootQn)) {
                 out.add(method);

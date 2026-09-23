@@ -1509,3 +1509,116 @@ What it justifies, and what it does not:
   fixtures' documented numbers and adds an edge — exactly what this finding's
   regression gate forbade — so the default is **left at 2** and the choice is
   recorded as a decision to take separately, with this table as its evidence.
+
+## F30 — a static method runs in no state
+
+Found by running the tool over Apache Kafka's `raft` module (`4.5.0-SNAPSHOT`):
+`org.apache.kafka.raft.internals.KRaftVersionUpgrade`, a sealed interface its own
+javadoc calls a sum type, was published as a POLYMORPHIC machine, `1/1`, whose one
+edge ran from the root interface to `Empty`.
+
+### The defect
+
+`findDistributedTransitionMethods` admitted every method declared on a hierarchy
+member whose return type is in H, and never asked whether the method has a
+receiver. What makes a per-state method's declaring class an exact source state is
+that the receiver's dynamic type selects the body. A `static` method has no
+receiver, so it runs in no state. Its only H-returning method,
+`static KRaftVersionUpgrade empty() { return EMPTY; }`, was therefore walked as
+if it ran in every state, and `sourceStatesOf` named the root, which is not a
+state. The carrier path had always excluded statics (`CarrierTransitionDetector.
+shapeOf`, `nestedProductions`), so the two routes to the same locus disagreed.
+
+It is the same root cause as F28's `Codec.forId(int)`. F28 closed that instance by
+making enums never roots, which removed the symptom for enums and left the
+admission itself in place for every sealed class and interface. Static factories
+(`of`, `empty`, `parse`, `create`) are ordinary on sealed result and option types,
+so the admission is common on real code, not exotic.
+
+It failed in three directions, and `examples/staticfactory` holds one hierarchy
+per direction (every file compiled by `javac`):
+
+| hierarchy | shape | before | after |
+|---|---|---|---|
+| `Upgrade` | the Kafka shape: a sum type whose only H-returning method is a static factory on the root | **machine**, 1/1, edge sourced at the root | rejected |
+| `Lamp` | a real POLYMORPHIC machine carrying a static factory on the root, a static factory on a leaf (`Off.create()`), and a private static helper reached from `On.toggle()` | **4/4**: `Lamp -> Off` sourced at the root, `Off -> Off` a fabricated resolved self-loop indistinguishable from a real one, and every edge labelled with a method name because the statics made the names look like they discriminate (F22) | 2/2, no labels, the helper still folded |
+| `Gauge` | a centralized transition function **declared on the root**, `static Gauge next(Gauge, Tick)`, dispatching with a switch *statement* whose arms return | Tier 2 **total loss** (0/0), filed as POLYMORPHIC | CENTRALIZED_DISPATCH, **6/6** |
+
+`Off.create()` is the sharp case. The Kafka instance is visible in the
+diagram, because a root is drawn as a red pseudo-node. A static factory on a
+**leaf** sources its edge at a real state, and nothing in the output gives it away.
+
+### The fix: statics are never per-state, and are offered to the centralized recognizer
+
+Two lines, in the two recognizers that partition the methods declared in H:
+
+* `findDistributedTransitionMethods` skips `static` methods.
+* `findCentralizedTransitionMethods` skipped every method declared inside H, on
+  the stated ground that the distributed recognizer had already counted it. That
+  ground no longer covers a static method, so the skip now applies to instance
+  methods only. A static method on H is then asked the question every centralized
+  candidate is asked: does it take the state as an argument, or discriminate it?
+  `empty()` and `create()` do neither and are rejected. `Gauge.next` takes the
+  state and is accepted.
+
+A plain drop would not have been enough, and `Gauge` is the control that proves it.
+Its dispatch is a switch statement, which `DispatchCommitDetector` cannot see,
+so the signature-based centralized recognizer is its only route. The
+re-offer is what keeps it.
+
+**For the hierarchy whose statics are in question, the fix can only withdraw an
+acceptance, never grant one.** Every method the centralized recognizer now
+admits was, before, admitted by the distributed recognizer, since it is declared
+in H and returns H. What changes for such a method is how it is walked. The walk
+moves from a per-state walk sourced at the declaring type to a centralized walk
+that reads the source from the discrimination. There are two indirect
+consequences, both the designed behaviour of existing mechanisms and neither
+exercised by the corpus. A root that now abstains may appear on the candidate
+channel (F26). It also re-offers its nested sealed subtypes as roots, and one of
+them may then be a machine in its own right (the re-offer worklist). Both only
+report what a static factory used to hide.
+
+### Attribution, by ablation
+
+| ablated | `Upgrade` | `Lamp` | `Gauge` |
+|---|---|---|---|
+| baseline (both halves off) | machine 1/1, root-sourced | 4/4, two fabricated | Tier 2, 0/0 |
+| **none** | **rejected** | **2/2** | **6/6, CENTRALIZED** |
+| centralized re-offer only | rejected | 2/2 | **Tier 3 candidate** — the machine is lost |
+
+With the re-offer ablated, `Gauge`'s candidate reason reads "no branch installs a
+hierarchy value … the exhaustive-fold guard", which is false for a switch whose
+arms return H. That wording is the separate open issue recorded in
+`LIMITATIONS.md` (one candidate sentence for two different gaps), not part of this
+finding.
+
+### Regression gate
+
+* Corpus (`scripts/capture-golden.sh`, all **49** pre-existing fixture
+  directories): every `.dot`, `.scxml` and `summary.txt` **byte-identical**. The only
+  difference is the new `staticfactory` directory. No corpus fixture declares a
+  static H-returning method on a hierarchy member that the distributed walk
+  reached. The corpus's static transition functions (`DoorMachine.transition`,
+  `StreamStateMachine.next`, …) all live in driver classes outside H.
+* Kafka `raft`: `KRaftVersionUpgrade` is now rejected, and `EpochState` /
+  `NomineeState` are unchanged Tier 3 candidates.
+* Test: `ExtractionIntegrationTest.aStaticMethodOnTheHierarchyRunsInNoState`,
+  asserting all three hierarchies edge by edge, that no machine has an edge sourced
+  at its own root, and that the two recognizers agree on why (no static method
+  among the distributed ones, `Gauge.next` among the centralized ones).
+
+### What it leaves standing
+
+* **Initial-state rule 1 still reads a constant declared inside the hierarchy.**
+  `KRaftVersionUpgrade EMPTY = new Empty();` on the root seeded Kafka's
+  (then-accepted) machine with `Empty`. `isSelfSingleton` excludes only a field
+  that constructs its own declaring type. Rule 3 already restricts locals to
+  declarations outside H, and the same restriction for fields is the obvious
+  candidate. It is not taken here, because on the corpus it can only move an
+  initial state, and that wants its own measurement.
+* A static method on H that takes the state is now a centralized function **by
+  the same rule as one declared outside H**, including its known looseness: F19
+  admits a method with an H-typed parameter and no discrimination
+  (`factory.shutOnTurn`). Nothing new is admitted by that route that was not
+  admitted before (see above), but it is where a future false positive of this
+  shape would come from.
