@@ -2,7 +2,14 @@ package io.sealfsm.detect.dispatch;
 
 import spoon.reflect.code.CtCase;
 import spoon.reflect.code.CtExpression;
+import spoon.reflect.code.CtLiteral;
+import spoon.reflect.code.CtVariableAccess;
+import spoon.reflect.declaration.CtEnum;
+import spoon.reflect.declaration.CtEnumValue;
+import spoon.reflect.declaration.CtType;
+import spoon.reflect.reference.CtFieldReference;
 import spoon.reflect.reference.CtTypeReference;
+import spoon.reflect.reference.CtVariableReference;
 
 /**
  * Reading a type out of a {@code case} label that is a type pattern.
@@ -44,6 +51,12 @@ public final class CasePatterns {
      * a type pattern (a constant, a {@code default}, an unresolvable shape).
      */
     public static CtTypeReference<?> patternType(Object caseExpr) {
+        // A constant label is a READ, and a read carries a type: `case DIM ->`
+        // reports the enum `Lit`. Answering that here made every arm of a switch
+        // over enum constants look like a type pattern for the whole enum, so each
+        // was attributed to the composite rather than to the constant it matched.
+        // The contract above already says a constant answers null; this enforces it.
+        if (caseExpr instanceof CtVariableAccess<?> || caseExpr instanceof CtLiteral<?>) return null;
         try {
             Object pattern = caseExpr;
             // CtCasePattern -> getPattern()
@@ -59,6 +72,44 @@ public final class CasePatterns {
             if (directType instanceof CtTypeReference<?> ref) return ref;
         } catch (Throwable ignored) {
             // best effort
+        }
+        return null;
+    }
+
+    /** An {@code enum} constant named by a case label: its enum and its name. */
+    public record ConstantLabel(String ownerQualifiedName, String constant) {
+    }
+
+    /**
+     * The {@code enum} constant a label names, or {@code null} when the label is
+     * not a constant read ({@code case DIM ->}, {@code case Lit.DIM ->}).
+     *
+     * <p>The counterpart of {@link #patternType} for the other way a label selects
+     * a state: a permitted enum contributes its constants as states, so a constant
+     * label selects exactly one of them, as a type pattern selects a permitted
+     * class. Whether the owner is a hierarchy member is the caller's question.
+     *
+     * <p>The declaration is preferred; under noClasspath it may be missing, and a
+     * field reference whose owner is an enum is then enough to identify the read.
+     */
+    public static ConstantLabel enumConstant(Object caseExpr) {
+        if (!(caseExpr instanceof CtVariableAccess<?> va)) return null;
+        try {
+            CtVariableReference<?> vref = va.getVariable();
+            if (vref == null) return null;
+            if (vref.getDeclaration() instanceof CtEnumValue<?> ev) {
+                CtType<?> owner = ev.getDeclaringType();
+                return owner == null ? null
+                        : new ConstantLabel(owner.getQualifiedName(), ev.getSimpleName());
+            }
+            if (vref instanceof CtFieldReference<?> fref) {
+                CtTypeReference<?> owner = fref.getDeclaringType();
+                if (owner != null && owner.getTypeDeclaration() instanceof CtEnum<?>) {
+                    return new ConstantLabel(owner.getQualifiedName(), fref.getSimpleName());
+                }
+            }
+        } catch (Throwable ignored) {
+            // best effort: an unreadable label is not a constant we can name
         }
         return null;
     }

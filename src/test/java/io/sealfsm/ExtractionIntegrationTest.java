@@ -863,6 +863,69 @@ class ExtractionIntegrationTest {
     // ---- successor forms (the axis orthogonal to encoding) ------------------
 
     @Test
+    void anEnumWithConstantBodiesIsNeverASealedHierarchy() {
+        // JLS §8.9 makes an enum whose constants have bodies implicitly sealed, and
+        // Spoon reports the modifier. Its closure is the constant set, not a
+        // permits clause, so it is neither a root nor a sealed composite.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/enumbodies"));
+
+        // The control — Kafka's CompressionType shape: static lookups on an
+        // enum with bodies. Not a root, so no machine and no candidate.
+        assertTrue(r.machines().stream().noneMatch(sm -> sm.name().equals("Codec")),
+                "an enum with constant bodies is not a sealed root");
+        assertTrue(r.candidates().stream().noneMatch(c -> c.toString().contains("Codec")),
+                "nor a candidate");
+
+        // The in-scope half: a declared sealed machine permitting such an enum
+        // takes the enum's CONSTANTS as states, never its anonymous bodies.
+        assertEquals(Set.of("Lamp", "Knob", "Valve", "Dial"),
+                r.machines().stream().map(StateMachine::name).collect(Collectors.toSet()));
+        assertEquals(Set.of("Off", "Lit", "DIM", "BRIGHT"), stateIds(machine(r, "Lamp")));
+    }
+
+    @Test
+    void anEdgeIsSourcedAtTheStatesItsBodyActuallyRunsIn() {
+        // A method declared on a COMPOSITE (a permitted enum, or a nested sealed
+        // type) used to be sourced at the composite, which claims every member —
+        // including members whose own label or override takes them elsewhere. Each
+        // hierarchy below is the relation the source defines, exactly, with no
+        // unresolved edge: the old reading fabricated edges on the first three and
+        // lost one to `<unknown>` on the third.
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/enumbodies"));
+
+        // `switch (this)` on enum constants inside the enum's own method.
+        assertEquals(Set.of("Off->DIM", "DIM->BRIGHT", "BRIGHT->Off"),
+                resolvedPairs(machine(r, "Lamp")));
+        // Transitions in the constant BODIES; the enum-level method is inherited
+        // by CENTER alone, so its self-loop is CENTER's and no other constant's.
+        assertEquals(Set.of("Rest->LEFT", "LEFT->RIGHT", "RIGHT->Rest", "CENTER->CENTER"),
+                resolvedPairs(machine(r, "Knob")));
+        // The same rule on a nested SEALED composite: the default method runs in
+        // Half, Full and Leaky (Stuck overrides), and the `default` arm reaches
+        // only what the labelled arms left — Leaky.
+        assertEquals(Set.of("Shut->Half", "Half->Full", "Full->Shut", "Leaky->Leaky", "Stuck->Shut"),
+                resolvedPairs(machine(r, "Valve")));
+        // A centralized switch labelling arms with qualified constants.
+        assertEquals(Set.of("Idle->LOW", "LOW->HIGH", "HIGH->Idle"),
+                resolvedPairs(machine(r, "Dial")));
+
+        for (String name : List.of("Lamp", "Knob", "Valve", "Dial")) {
+            assertTrue(machine(r, name).transitions().stream().allMatch(Transition::isResolved),
+                    name + " has no unresolved edge");
+        }
+    }
+
+    private StateMachine machine(ExtractionResult r, String name) {
+        return r.machines().stream().filter(m -> m.name().equals(name)).findFirst()
+                .orElseThrow(() -> new AssertionError("no machine " + name));
+    }
+
+    private Set<String> resolvedPairs(StateMachine m) {
+        return m.transitions().stream().filter(Transition::isResolved)
+                .map(t -> t.from() + "->" + t.to()).collect(Collectors.toSet());
+    }
+
+    @Test
     void everySuccessorFormResolvesToAPermittedSubtype() {
         // The successor of a transition may be written in any of several ways, and
         // resolving them is one uniform sub-procedure independent of where dispatch

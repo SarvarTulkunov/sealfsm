@@ -1,5 +1,9 @@
 package io.sealfsm.detect;
 
+import spoon.reflect.code.CtNewClass;
+import spoon.reflect.declaration.CtElement;
+import spoon.reflect.declaration.CtEnum;
+import spoon.reflect.declaration.CtEnumValue;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.ModifierKind;
 import spoon.reflect.reference.CtArrayTypeReference;
@@ -164,8 +168,22 @@ public final class SpoonCompat {
         return out;
     }
 
-    /** True if the type carries the {@code sealed} modifier. */
+    /**
+     * True if the type is a sealed class or interface.
+     *
+     * <p>An {@code enum} is never one, even though JLS §8.9 makes an enum whose
+     * constants have bodies <em>implicitly</em> sealed and Spoon reports the
+     * modifier. That closure is the enum's constant set, not a {@code permits}
+     * clause: its "permitted subtypes" are anonymous constant bodies
+     * ({@code CompressionType$1}) naming no state. Admitting it made every such
+     * enum a candidate root — a static {@code forId(int)} lookup was published as
+     * a ten-edge automaton — and made a permitted enum a sealed composite whose
+     * children were {@code "1"}, {@code "2"} instead of its constants. A permitted
+     * enum still contributes its constants as child states, through
+     * {@link io.sealfsm.extract.StateExtractor}, which asks about enums directly.
+     */
     public static boolean isSealed(CtType<?> type) {
+        if (type instanceof CtEnum<?>) return false;
         try {
             return type.hasModifier(ModifierKind.SEALED);
         } catch (Throwable t) {
@@ -173,6 +191,36 @@ public final class SpoonCompat {
             // "has explicit permitted types".
             return !rawPermittedTypes(type).isEmpty();
         }
+    }
+
+    /**
+     * The {@code enum} constant whose body {@code type} is, or {@code null} when
+     * {@code type} is not an enum constant body.
+     *
+     * <p>{@code DIM { Lamp press() { ... } }} declares an anonymous class whose
+     * only instance is {@code DIM}, so a method declared in it runs in exactly one
+     * state, and that state is the constant. Named by its type it is
+     * {@code Lit$1}, which names no state at all. Every place that turns a
+     * declaring type into a source state asks this first.
+     *
+     * <p>Spoon models the body as the anonymous class of a {@code CtNewClass}
+     * that is the constant's default expression; the shape is checked exactly,
+     * so an anonymous class nested anywhere else inside a constant is not one.
+     */
+    public static CtEnumValue<?> enumConstantBodiedBy(CtType<?> type) {
+        if (type == null) return null;
+        try {
+            if (!type.isAnonymous()) return null;
+            CtElement parent = type.getParent();
+            if (parent instanceof CtNewClass<?> nc && nc.getAnonymousClass() == type
+                    && nc.getParent() instanceof CtEnumValue<?> ev
+                    && ev.getDefaultExpression() == nc) {
+                return ev;
+            }
+        } catch (Throwable ignored) {
+            // an unreadable parent chain is not a constant body we can name
+        }
+        return null;
     }
 
     /**

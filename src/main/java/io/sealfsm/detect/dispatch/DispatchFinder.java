@@ -130,7 +130,11 @@ public final class DispatchFinder {
         for (CtMethod<?> m : methods) {
             CtType<?> declaring = m.getDeclaringType();
             if (declaring == null) continue;
-            DispatchArm arm = DispatchArm.of(declaring.getSimpleName(), m.getBody());
+            // An enum constant's body runs in that constant's state, not in a state
+            // named after its anonymous class.
+            var constant = io.sealfsm.detect.SpoonCompat.enumConstantBodiedBy(declaring);
+            String from = constant != null ? constant.getSimpleName() : declaring.getSimpleName();
+            DispatchArm arm = DispatchArm.of(from, m.getBody());
             out.add(new DispatchSite(DispatchLocus.POLYMORPHIC_OVERRIDE, m, m, List.of(arm)));
         }
         return out;
@@ -208,12 +212,18 @@ public final class DispatchFinder {
     private static List<DispatchArm> armsOf(CtAbstractSwitch<?> sw, Set<String> hierarchy) {
         List<DispatchArm> arms = new ArrayList<>();
         for (CtCase<?> c : sw.getCases()) {
-            CtTypeReference<?> pattern = null;
+            String from = null;
             try {
                 for (CtExpression<?> label : c.getCaseExpressions()) {
                     CtTypeReference<?> t = CasePatterns.patternType(label);
                     if (t != null && hierarchy.contains(t.getQualifiedName())) {
-                        pattern = t;
+                        from = t.getSimpleName();
+                        break;
+                    }
+                    // A constant of a permitted enum selects that constant's state.
+                    CasePatterns.ConstantLabel k = CasePatterns.enumConstant(label);
+                    if (k != null && hierarchy.contains(k.ownerQualifiedName())) {
+                        from = k.constant();
                         break;
                     }
                 }
@@ -221,7 +231,7 @@ public final class DispatchFinder {
                 // an unreadable label leaves the arm unattributed, which is the
                 // honest answer and the one the walker already reports.
             }
-            arms.add(new DispatchArm(pattern == null ? null : pattern.getSimpleName(), c,
+            arms.add(new DispatchArm(from, c,
                     null, null));
         }
         return arms;

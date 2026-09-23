@@ -17,6 +17,7 @@ import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.model.CommitEvidence;
 import io.sealfsm.model.CommitForm;
 import io.sealfsm.model.StateMachine;
+import io.sealfsm.model.State;
 import io.sealfsm.model.StateNaming;
 import io.sealfsm.model.Transition;
 import spoon.reflect.CtModel;
@@ -37,6 +38,7 @@ import spoon.reflect.code.CtIf;
 import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtLambda;
 import spoon.reflect.code.CtLocalVariable;
+import spoon.reflect.code.CtNewClass;
 import spoon.reflect.code.CtLoop;
 import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtStatement;
@@ -123,6 +125,26 @@ public final class TransitionExtractor {
     // Both are set only while a functional callable is walked.
     private CtVariable<?> selector = null;
     private Set<String> concreteStateSimpleNames = Set.of();
+
+    /**
+     * Every state id mapped to the LEAF states it stands for: a leaf to itself, a
+     * composite (a nested sealed type, or a permitted enum) to the leaves below
+     * it. Read off the same {@link StateExtractor} tree the machine's states come
+     * from, so a walk and the state set cannot disagree about what a composite
+     * contains. Empty until {@link #extract} runs, in which case every id is
+     * treated as a leaf, which is the behaviour before composites were expanded.
+     */
+    private Map<String, Set<String>> leavesById = Map.of();
+
+    /** Every leaf state of the machine, in declaration order. */
+    private Set<String> allLeaves = Set.of();
+
+    /**
+     * The declaration each leaf state is realised by — a permitted class, or the
+     * {@code enum} constant a permitted enum contributes. Consulted only to ask
+     * whether that leaf overrides an inherited transition method.
+     */
+    private Map<String, CtElement> leafDeclarations = Map.of();
 
     // F22: whether a transition method's NAME carries an input symbol, decided per
     // hierarchy from whether the names DISCRIMINATE (see eventName). Two flags,
@@ -355,9 +377,141 @@ public final class TransitionExtractor {
         this.resolver = new TransitionResolver(hierarchyQualifiedNames, rootQualifiedName, this.naming);
     }
 
-    /** The id of the state declared by {@code type} — never its bare simple name. */
+    /**
+     * The id of the state declared by {@code type} — never its bare simple name.
+     *
+     * <p>An enum constant's body is an anonymous class whose only instance is the
+     * constant, so the state it declares is the constant ({@code DIM}), not the
+     * class ({@code Lit$1}, which would surface as the id {@code "1"}).
+     */
     private String stateId(CtType<?> type) {
+        CtEnumValue<?> constant = SpoonCompat.enumConstantBodiedBy(type);
+        if (constant != null && constant.getDeclaringType() != null) {
+            return naming.idForEnumConstant(constant.getDeclaringType().getQualifiedName(),
+                    constant.getSimpleName());
+        }
         return naming.idFor(type.getQualifiedName());
+    }
+
+    /** The leaf states {@code id} stands for: itself when it is a leaf. */
+    private Set<String> leavesOf(String id) {
+        Set<String> leaves = leavesById.get(id);
+        return leaves == null || leaves.isEmpty() ? Set.of(id) : leaves;
+    }
+
+    private Map<String, CtElement> leafDeclarations(CtType<?> root) {
+        Map<String, CtElement> out = new LinkedHashMap<>();
+        for (CtType<?> t : StateMachineClassifier.hierarchyTypes(root)) {
+            if (SpoonCompat.enumConstantBodiedBy(t) != null) continue;
+            if (t instanceof CtEnum<?> en) {
+                for (CtEnumValue<?> v : en.getEnumValues()) {
+                    out.put(naming.idForEnumConstant(t.getQualifiedName(), v.getSimpleName()), v);
+                }
+            } else {
+                out.put(stateId(t), t);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The states in which {@code method}'s body actually RUNS: the states at or
+     * below its declaring type that do not override it.
+     *
+     * <p>The declaring type used to be the source state, which is exact for a leaf
+     * and wrong for anything above one. A method on a permitted enum runs in every
+     * constant except those whose body overrides it; a default method on a nested
+     * sealed type runs in every member except those declaring their own. Sourcing
+     * either at the declaring type claims the overriding states too — edges out of
+     * states that never execute the body.
+     *
+     * <p>Named as coarsely as is exact: when every state below the declaring type
+     * inherits the body, the answer is the declaring type itself, which for a
+     * composite reads "any member" — true, and unchanged from before. Only when
+     * some member overrides is it split into the leaves that do not.
+     */
+    private List<String> sourceStatesOf(CtMethod<?> method) {
+        CtType<?> declaring = method.getDeclaringType();
+        if (declaring == null) return List.of();
+        String id = stateId(declaring);
+        boolean isRoot = declaring.getQualifiedName().equals(rootQualifiedName);
+        Set<String> below = isRoot ? allLeaves : leavesOf(id);
+        if (below.isEmpty() || below.equals(Set.of(id))) return List.of(id);
+        // Above a leaf, an abstract method runs in no state at all — claiming one
+        // would mark it examined and hide the gap an unread state must carry.
+        if (method.getBody() == null) return List.of();
+        List<String> running = new ArrayList<>();
+        for (String leaf : below) {
+            CtElement decl = leafDeclarations.get(leaf);
+            // A leaf whose declaration was never read cannot be shown to inherit
+            // this body, and saying it does would source a fabricated edge there.
+            if (decl != null && !overridesBelow(decl, method, declaring)) running.add(leaf);
+        }
+        if (running.size() == below.size()) return List.of(id);
+        return running;
+    }
+
+    /**
+     * Does the leaf realised by {@code leaf} replace {@code method} with a body of
+     * its own somewhere between itself and {@code declaring}? Decided by signature
+     * on the declarations, never by name alone.
+     */
+    private static boolean overridesBelow(CtElement leaf, CtMethod<?> method, CtType<?> declaring) {
+        String sig = method.getSignature();
+        CtType<?> start;
+        if (leaf instanceof CtEnumValue<?> ev) {
+            if (ev.getDefaultExpression() instanceof CtNewClass<?> nc
+                    && nc.getAnonymousClass() != null
+                    && declaresSignature(nc.getAnonymousClass(), sig)) {
+                return true;
+            }
+            start = ev.getDeclaringType();
+        } else if (leaf instanceof CtType<?> t) {
+            start = t;
+        } else {
+            return false;
+        }
+        Deque<CtType<?>> work = new ArrayDeque<>();
+        Set<CtType<?>> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        if (start != null) work.add(start);
+        while (!work.isEmpty()) {
+            CtType<?> t = work.poll();
+            if (t == declaring || !seen.add(t)) continue;
+            if (declaresSignature(t, sig)) return true;
+            List<CtTypeReference<?>> supers = new ArrayList<>(t.getSuperInterfaces());
+            if (t.getSuperclass() != null) supers.add(t.getSuperclass());
+            for (CtTypeReference<?> ref : supers) {
+                CtType<?> sup = ref.getTypeDeclaration();
+                if (sup != null && sup != declaring && sup.isSubtypeOf(declaring.getReference())) {
+                    work.add(sup);
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean declaresSignature(CtType<?> t, String signature) {
+        for (CtMethod<?> m : t.getMethods()) {
+            if (m.getSignature().equals(signature) && m.getBody() != null) return true;
+        }
+        return false;
+    }
+
+    private static Map<String, Set<String>> leafMap(List<State> states) {
+        Map<String, Set<String>> out = new LinkedHashMap<>();
+        for (State s : states) collectLeaves(s, out);
+        return out;
+    }
+
+    private static Set<String> collectLeaves(State s, Map<String, Set<String>> out) {
+        Set<String> leaves = new LinkedHashSet<>();
+        if (s.children().isEmpty()) {
+            leaves.add(s.id());
+        } else {
+            for (State c : s.children()) leaves.addAll(collectLeaves(c, out));
+        }
+        out.put(s.id(), leaves);
+        return leaves;
     }
 
     /** The id of the state named by {@code ref} — never its bare simple name. */
@@ -418,7 +572,15 @@ public final class TransitionExtractor {
         // The concrete states the selector can be, used to seed the functional
         // walk's entry from-set (finding F7).
         this.concreteStateSimpleNames = new LinkedHashSet<>();
+        List<State> topLevel = new StateExtractor().extract(root).topLevelStates();
+        this.leavesById = leafMap(topLevel);
+        this.allLeaves = new LinkedHashSet<>();
+        for (State s : topLevel) allLeaves.addAll(leavesOf(s.id()));
+        this.leafDeclarations = leafDeclarations(root);
         for (CtType<?> t : StateMachineClassifier.hierarchyTypes(root)) {
+            // An enum constant's body is reached through the enum's implicit permits
+            // list, but it is not a further state: its constant already is one.
+            if (SpoonCompat.enumConstantBodiedBy(t) != null) continue;
             if (!t.getQualifiedName().equals(rootQualifiedName)) {
                 concreteStateSimpleNames.add(stateId(t));
             }
@@ -460,6 +622,15 @@ public final class TransitionExtractor {
         // attributed to the arm that matched, once to nothing.
         Set<String> walkedHosts = new LinkedHashSet<>();
         Set<String> walkedMethods = new HashSet<>();
+        // A per-state method owns its body: the override walk already knows which
+        // states it runs in. A switch on `this` inside it is ALSO a producer, and
+        // walking it again from there drops that knowledge — its `default` arm then
+        // has no source and is published as `<unknown> -> ?`, a gap the analysis
+        // manufactured out of a context it already held.
+        for (DispatchSite site : sites.overrides()) {
+            CtMethod<?> m = (CtMethod<?>) site.host();
+            if (!helperSignatures.contains(m.getSignature())) walkedMethods.add(methodKey(m));
+        }
         for (DispatchSite site : sites.centralized()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
             if (helperSignatures.contains(m.getSignature())) continue;
@@ -685,13 +856,15 @@ public final class TransitionExtractor {
         CtType<?> declaring = method.getDeclaringType();
         if (declaring == null) return;
         commitForms.add(CommitForm.VALUE_RETURN);
-        // The declaring class IS the source state — exact, no data-flow needed —
-        // so it counts as dispatched even when the body produces nothing.
-        dispatchedStates.add(stateId(declaring));
-        // The from-state is fixed to the declaring class; a switch inside the
-        // body dispatches on the event, not on the state, so from is preserved.
-        walk(method.getBody(), stateId(declaring), eventName(method, distributedNamesDiscriminate),
-                null, out);
+        // The states the body runs in ARE the source states — exact, no data-flow
+        // needed — so they count as dispatched even when the body produces nothing.
+        // For a leaf that is the declaring class; above one it is the members that
+        // inherit this body (see sourceStatesOf).
+        for (String from : sourceStatesOf(method)) {
+            dispatchedStates.add(from);
+            walk(method.getBody(), from, eventName(method, distributedNamesDiscriminate),
+                    null, out);
+        }
     }
 
     // ---- centralized (single transition function) ----------------------------
@@ -1186,12 +1359,14 @@ public final class TransitionExtractor {
             return; // returns the hierarchy type — the distributed walker owns it
         }
         commitForms.add(CommitForm.POLY_CARRIER);
-        dispatchedStates.add(stateId(declaring));
         // Σ and the event-parameter names are per-method, and drive the event
         // attribution performed by splitEventCondition below.
         enumerateEventAlphabet(m);
         try {
-            walkCarrier(m.getBody(), stateId(declaring), null, null, out);
+            for (String from : sourceStatesOf(m)) {
+                dispatchedStates.add(from);
+                walkCarrier(m.getBody(), from, null, null, out);
+            }
         } finally {
             eventParamNames = new LinkedHashSet<>();
         }
@@ -2944,41 +3119,47 @@ public final class TransitionExtractor {
         // context the walk already had. `remaining` stays null, and nothing is
         // filtered, whenever the from-state is not yet known, which is every
         // top-level dispatch: the host walk is untouched.
-        Set<String> remaining = overState && from != null
-                ? new LinkedHashSet<>(candidateStates(from))
-                : null;
+        //
+        // The known from-state may be a COMPOSITE — a method declared on a
+        // permitted enum or a nested sealed type runs in any of its members — so
+        // what is tracked is the set of LEAF states still live, and an arm is
+        // matched by the leaves its label covers. For a leaf from-state that is the
+        // singleton it always was.
+        Set<String> entry = overState && from != null ? leavesOf(from) : null;
+        Set<String> remaining = entry != null ? new LinkedHashSet<>(entry) : null;
         for (CtCase<?> c : sw.getCases()) {
             String caseFrom = from;
+            List<String> caseFroms = Collections.singletonList(from);
             String ownGuard = caseGuard(c);
             if (overState) {
                 caseFrom = caseFromState(c);
+                caseFroms = Collections.singletonList(caseFrom);
                 if (remaining != null) {
-                    if (caseFrom == null) {
-                        // An unlabelled `default` fires for the states no earlier arm
-                        // claimed — for none of them once they all have.
-                        if (remaining.isEmpty()) {
-                            markUnreachable(c);
-                            continue;
-                        }
-                        caseFrom = remaining.iterator().next();
-                    } else if (!remaining.contains(caseFrom)) {
+                    // An unlabelled `default` fires for the states no earlier arm
+                    // claimed — for none of them once they all have.
+                    Set<String> covered = caseFrom == null ? remaining : leavesOf(caseFrom);
+                    Set<String> live = new LinkedHashSet<>(covered);
+                    live.retainAll(remaining);
+                    if (live.isEmpty()) {
                         markUnreachable(c);
                         continue;
                     }
-                    // Only an UNGUARDED arm consumes its state: a guarded one may
-                    // not fire, so the state stays live for the arms below it. Same
+                    caseFroms = sourcesOf(caseFrom, covered, live, from, entry);
+                    caseFrom = caseFroms.get(0);
+                    // Only an UNGUARDED arm consumes its states: a guarded one may
+                    // not fire, so they stay live for the arms below it. Same
                     // reasoning `chainResidual` applies to a link carrying an extra
                     // condition.
-                    if (ownGuard == null) remaining.remove(caseFrom);
+                    if (ownGuard == null) remaining.removeAll(live);
                 }
                 if (caseFrom == null) {
                     diagnostics.add(unresolvedArmDiagnostic(c));
                     // fall through with a null from so produced targets are still
                     // recorded (as undetermined-origin) rather than dropped.
                 } else {
-                    // The arm matched this state, so anything it fails to produce is
-                    // an absence the analysis observed rather than one it missed.
-                    dispatchedStates.add(caseFrom);
+                    // The arm matched these states, so anything it fails to produce
+                    // is an absence the analysis observed rather than one it missed.
+                    dispatchedStates.addAll(caseFroms);
                 }
             }
             List<String> caseEvents = overEvent ? caseEventNames(c)
@@ -2996,7 +3177,7 @@ public final class TransitionExtractor {
             // that can match the SAME input compete. Distinct labels are already
             // disjoint, and negating those would bury every edge under a pile of
             // redundant `!(event instanceof X)` clauses.
-            List<String> labels = overState ? Collections.singletonList(caseFrom) : caseEvents;
+            List<String> labels = overState ? caseFroms : caseEvents;
             String caseGuard = merge(merge(guard, priorExclusion(labels, guardsByLabel)), ownGuard);
             // Only a GUARDED arm constrains its successors. An unguarded arm
             // dominates every later arm with the same label, which the compiler
@@ -3023,23 +3204,45 @@ public final class TransitionExtractor {
             boolean discardedArms = !(sw instanceof CtSwitchExpression<?, ?>);
             try {
                 CtElement leaked = leakedGuard(c);
-                for (String caseEvent : caseEvents) {
-                    for (CtStatement st : c.getStatements()) {
-                        // The leaked `when` clause is the arm's guard, consumed
-                        // above; it is not part of the arm's body.
-                        if (st == leaked) continue;
-                        CtElement effective = st;
-                        if (discardedArms && st instanceof CtYieldStatement ys
-                                && ys.getExpression() != null) {
-                            effective = ys.getExpression();
+                for (String armFrom : caseFroms) {
+                    for (String caseEvent : caseEvents) {
+                        for (CtStatement st : c.getStatements()) {
+                            // The leaked `when` clause is the arm's guard, consumed
+                            // above; it is not part of the arm's body.
+                            if (st == leaked) continue;
+                            CtElement effective = st;
+                            if (discardedArms && st instanceof CtYieldStatement ys
+                                    && ys.getExpression() != null) {
+                                effective = ys.getExpression();
+                            }
+                            walk(effective, armFrom, caseEvent, caseGuard, out);
                         }
-                        walk(effective, caseFrom, caseEvent, caseGuard, out);
                     }
                 }
             } finally {
                 componentEvent = savedComponent;
             }
         }
+    }
+
+    /**
+     * The source states of an arm of a state switch entered with a known
+     * from-state: the states {@code live} it can run in, named as coarsely as is
+     * still exact.
+     *
+     * <p>An arm whose label covers only live states keeps its label ({@code DIM},
+     * or a composite every member of which is still live). An arm reaching every
+     * state the walk entered with is sourced at the entry state itself — a
+     * {@code default} that nothing narrowed, where a composite source reads
+     * "any member", which is what it means. Otherwise the arm runs in some but not
+     * all of what it names, and it is sourced at each live leaf: a composite
+     * there would claim members the arms above it already took.
+     */
+    private static List<String> sourcesOf(String label, Set<String> covered, Set<String> live,
+                                          String from, Set<String> entry) {
+        if (label != null && live.equals(covered)) return List.of(label);
+        if (live.equals(entry)) return List.of(from);
+        return List.copyOf(live);
     }
 
     /**
@@ -3189,13 +3392,21 @@ public final class TransitionExtractor {
         }
     }
 
-    /** Extract the matched type from a (possibly guarded) type-pattern case. */
+    /**
+     * The state a (possibly guarded) arm of a switch over the state selects: a
+     * type pattern naming a permitted type, or a constant of a permitted enum,
+     * which is as much a state as a permitted class is.
+     */
     private String caseFromState(CtCase<?> c) {
         try {
             for (CtExpression<?> ce : c.getCaseExpressions()) {
                 CtTypeReference<?> t = patternType(ce);
                 if (t != null && hierarchyQualifiedNames.contains(t.getQualifiedName())) {
                     return stateId(t);
+                }
+                CasePatterns.ConstantLabel k = CasePatterns.enumConstant(ce);
+                if (k != null && hierarchyQualifiedNames.contains(k.ownerQualifiedName())) {
+                    return naming.idForEnumConstant(k.ownerQualifiedName(), k.constant());
                 }
             }
         } catch (Throwable ignored) {
