@@ -122,10 +122,15 @@ public final class CommitProbe {
      *                   finding about the invocation, and a user can act on the
      *                   second. The verdict itself does not distinguish them —
      *                   neither is evidence of a commit
+     * @param probed     the callees whose bodies WERE read and scanned. When no
+     *                   commit was found this is what "no commit within one call"
+     *                   rests on (F32): a candidate may only say it looked one call
+     *                   deep if it did
      */
-    public record Result(Commit commit, List<String> unreadable) {
+    public record Result(Commit commit, List<String> unreadable, List<String> probed) {
         public Result {
             unreadable = List.copyOf(unreadable);
+            probed = List.copyOf(probed);
         }
     }
 
@@ -150,6 +155,7 @@ public final class CommitProbe {
                             String rootQualifiedName) {
         Commit found = null;
         Set<String> unreadable = new LinkedHashSet<>();
+        Set<String> probed = new LinkedHashSet<>();
         for (CtElement branch : branches) {
             if (branch == null) continue;
             for (CtInvocation<?> inv : statementCalls(branch)) {
@@ -181,6 +187,7 @@ public final class CommitProbe {
                 // body is scanned, or such a callee's incidental bookkeeping write
                 // would be read as a commit.
                 if (CalleeBody.neverReturnsNormally(callee)) continue;
+                probed.add(describe(inv, callee));
                 if (found != null) continue;
                 CtAssignment<?, ?> write = rootFieldWrite(callee, hierarchy, rootQualifiedName);
                 if (write != null) {
@@ -188,7 +195,7 @@ public final class CommitProbe {
                 }
             }
         }
-        return new Result(found, new ArrayList<>(unreadable));
+        return new Result(found, new ArrayList<>(unreadable), new ArrayList<>(probed));
     }
 
     /**

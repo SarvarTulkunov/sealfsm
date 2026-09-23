@@ -2,6 +2,7 @@ package io.sealfsm;
 
 import io.sealfsm.analyze.GuardAnalysis;
 import io.sealfsm.detect.SealedHierarchyDetector;
+import io.sealfsm.detect.dispatch.CommitGap;
 import io.sealfsm.detect.dispatch.CommitProbe;
 import io.sealfsm.detect.dispatch.DispatchArm;
 import io.sealfsm.detect.dispatch.DispatchFinder;
@@ -567,12 +568,13 @@ public final class Analyzer {
         // say which: a state-major locus has the discrimination and no commit, a
         // Σ-major one has the commit and no discrimination of the state. Reporting
         // either under the other's sentence would misattribute the gap.
+        // F32 — and within the state-major half, one sentence was printed for four
+        // different gaps. CommitGap names, site by site, which evidence was missing.
         List<String> reasons = new ArrayList<>();
         if (!loci.isEmpty()) {
             reasons.add("the state is discriminated at " + loci.size()
-                    + " site(s), but no branch installs a hierarchy value, so no commit is proven "
-                    + "(the exhaustive-fold guard: a transition switch and a fold are identical AT "
-                    + "the discrimination, and only the codomain separates them)");
+                    + " site(s), but no commit is proven: "
+                    + CommitGap.summarize(loci, hierarchy, root.getQualifiedName()));
         }
         if (!eventMajor.isEmpty()) {
             reasons.add("a hierarchy value IS committed at " + eventMajor.sites().size()

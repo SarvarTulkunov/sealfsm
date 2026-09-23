@@ -1,5 +1,6 @@
 package io.sealfsm.detect;
 
+import io.sealfsm.detect.dispatch.CommitGap;
 import io.sealfsm.detect.dispatch.DispatchFinder;
 import io.sealfsm.detect.dispatch.DispatchSite;
 import io.sealfsm.detect.dispatch.EventMajorDispatch;
@@ -159,7 +160,7 @@ public final class StateMachineClassifier {
                 + describeHosts(loci));
         trace.accept("dispatch with a hierarchy-typed commit (a switch or instanceof chain over "
                 + "the hierarchy whose result is installed as a hierarchy value): "
-                + commitVerdict(sites.producers().size(), loci.size())
+                + commitVerdict(sites.producers().size(), loci, root)
                 + describeCommits(root, model));
 
         boolean hasDist = !sites.overrides().isEmpty();
@@ -251,15 +252,19 @@ public final class StateMachineClassifier {
      * value". Those are the plain-sum-type case and the candidate case, and a
      * reader could not tell them apart — which is also why the candidate channel
      * had nowhere to be reported from.
+     *
+     * <p>F32: when dispatches were found and none commits, the WHY is the same
+     * per-site {@link CommitGap} summary the candidate prints. One sentence for
+     * every such site called a real dispatch whose commit lies deeper than one
+     * call a fold.
      */
-    private static String commitVerdict(int producers, int loci) {
+    private static String commitVerdict(int producers, List<DispatchSite> loci, CtType<?> root) {
         if (producers > 0) return "passed — " + producers + " found";
-        return loci == 0
+        return loci.isEmpty()
                 ? "FAILED — none found (no dispatch to ask about)"
-                : "FAILED — " + loci + " dispatch(es) found above, none of which installs a "
-                        + "hierarchy value. This is the exhaustive-fold guard, and it is the "
-                        + "whole precision discriminator: a transition switch and a fold are "
-                        + "identical AT the discrimination";
+                : "FAILED — " + loci.size() + " dispatch(es) found above, none with a proven "
+                        + "commit: " + CommitGap.summarize(loci, hierarchyQualifiedNames(root),
+                                root.getQualifiedName());
     }
 
     /** {@link #describeMethods} for a site list, naming each site's host. */

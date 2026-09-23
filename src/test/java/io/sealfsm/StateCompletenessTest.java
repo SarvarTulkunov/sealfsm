@@ -522,6 +522,53 @@ class StateCompletenessTest {
         return states.stream().map(State::qualifiedName).collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
+    /**
+     * F32: a candidate says, site by site, WHICH evidence was missing. One
+     * sentence ("no branch installs a hierarchy value … the exhaustive-fold
+     * guard") was printed for every state-major site, and on Apache Kafka it filed
+     * a real transition dispatch whose commit lies five calls away as a fold.
+     */
+    @Test
+    void aCandidateSaysWhyEachSiteProvesNoCommit() {
+        // The Kafka shape in miniature: a fold and a deep commit on one class.
+        String kiln = candidate(new Analyzer().analyze(modelOf("examples/deepcommit")),
+                "deepcommit.Phase").reason();
+        assertTrue(clause(kiln, "fold into a type outside the hierarchy (String)")
+                .contains("[Kiln.describe]"), kiln);
+        assertTrue(clause(kiln, "call methods, and no method body read one call deep")
+                .contains("[Kiln.tick]"), kiln);
+        assertFalse(clause(kiln, "fold into").contains("Kiln.tick"),
+                "a dispatch that produces no value is not a fold");
+
+        // The other kinds, each on a corpus control that already exists for it.
+        assertTrue(reasonOf("examples/chaindispatch", "chaindispatch.Tree")
+                .contains("install hierarchy values that nest another hierarchy value"),
+                "Tree's branches DO install hierarchy values; the veto rejected them as composition");
+        assertTrue(reasonOf("examples/foreignfold", "examples.foreignfold.Mode")
+                .contains("fold into a type outside the hierarchy (String, int)"));
+        assertTrue(reasonOf("examples/voidfold", "voidfold.Hopper")
+                .contains("call methods, and no method body read one call deep"));
+        assertTrue(reasonOf("examples/unreadablecallee", "unreadablecallee.Shutter")
+                .contains("call methods whose bodies could not be read"));
+        // An event alphabet Σ folds into its machine's STATE type, and now says so.
+        assertTrue(reasonOf("examples/lcp_automation", "lcp.LcpEvent")
+                .contains("fold into a type outside the hierarchy (LcpState)"));
+    }
+
+    private String reasonOf(String dir, String qualifiedName) {
+        ExtractionResult r = new Analyzer().analyze(modelOf(dir));
+        return r.candidates().stream().filter(c -> c.qualifiedName().equals(qualifiedName))
+                .map(Candidate::reason).findFirst().orElse("");
+    }
+
+    /** The one `; `-separated clause of a reason containing {@code marker}. */
+    private static String clause(String reason, String marker) {
+        for (String c : reason.split("; ")) {
+            if (c.contains(marker)) return c;
+        }
+        return "";
+    }
+
     private static Set<String> ids(List<State> states) {
         return states.stream().map(State::id).collect(Collectors.toCollection(LinkedHashSet::new));
     }

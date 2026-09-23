@@ -166,15 +166,24 @@ once the false positive is gone.
 
 ---
 
-## Related open issue: the candidate reason conflates two gaps
+## Related issue, fixed: the candidate reason conflated two gaps (F32)
 
-On the same run, `EpochState`'s candidate names 5 discrimination sites under one
-sentence: "no branch installs a hierarchy value … the exhaustive-fold guard". That
-is true of `QuorumState.maybeUnattachedState / maybeLeaderState /
-maybeProspectiveState`, which fold into `Optional`. It is **false** of
+On this run `EpochState`'s candidate used to name its 5 discrimination sites under
+one sentence: "no branch installs a hierarchy value … the exhaustive-fold guard".
+That was true of `QuorumState.maybeUnattachedState / maybeLeaderState /
+maybeProspectiveState`, which fold into `Optional`, and **false** of
 `KafkaRaftClient.maybeTransitionForward` and `maybeHandleElectionLoss`. Those two
-are genuine transition dispatches. Their arms are bare calls whose commit lies
-beyond the k = 1 probe (L1, point 3). The sentence is produced in one place
-(`Analyzer`, the candidate-reason builder) for every state-major locus. It should
-separate "folds into a type outside H" from "arms are bare calls with no commit
-within one callee". Not yet fixed.
+are genuine transition dispatches whose arms are calls committing beyond the
+k = 1 probe (L1, point 3). Since F32 the reason names each group separately:
+
+```
+the state is discriminated at 5 site(s), but no commit is proven:
+  at 3 site(s) the branches fold into a type outside the hierarchy (Optional) …
+      [QuorumState.maybeUnattachedState, QuorumState.maybeLeaderState, QuorumState.maybeProspectiveState];
+  at 2 site(s) the branches call methods, and no method body read one call deep writes a field
+      of the hierarchy's root type (a commit deeper than one call is possible and is not claimed)
+      [KafkaRaftClient.maybeTransitionForward, KafkaRaftClient.maybeHandleElectionLoss]
+```
+
+So the output itself now separates the recall limit (depth) from the precision
+guard (fold), which is the distinction this section is about.

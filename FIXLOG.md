@@ -1686,3 +1686,86 @@ driver's state field" while a driver field exists).
   declaring type, and `isSelfSingleton` already excludes them).
 * Test: `ExtractionIntegrationTest.anInitialStateSeededOnlyByARootConstantIsReportedAsWeakerEvidence`.
 
+## F32 — a candidate says which evidence was missing, site by site
+
+Found on the same Kafka run. `EpochState`'s candidate named five discrimination
+sites under one sentence, "no branch installs a hierarchy value, so no commit is
+proven (the exhaustive-fold guard …)". That was true of three sites
+(`QuorumState.maybeXState()`, which fold into `Optional`) and false of two
+(`KafkaRaftClient.maybeTransitionForward` / `maybeHandleElectionLoss`, real
+transition dispatches whose arms are calls committing five calls away). The
+`--explain` trace printed the same sentence for the same decision.
+
+### Why a wrong sentence matters here
+
+It is the tool's own explanation of a non-result, and `CANDIDATES.md` sorts the
+candidate channel by it. Filing a depth-bounded dispatch under the fold sentence
+makes a **recall** limit read as the **precision** guard working, which is the
+one confusion the tier design exists to prevent. The comment above the sentence
+already required a candidate to say which half of the evidence was missing. It
+did so between state-major and Σ-major dispatch (F27), but not within
+state-major.
+
+### Four situations, not one
+
+Measured on the corpus, the old sentence covered four distinct gaps:
+
+| sub-kind | what the branches do | corpus instance |
+|---|---|---|
+| **fold → T** | produce values of a type T outside H | the event alphabets (→ their machine's state type), `foreignfold`, `emptycandidate`, `Glyph` |
+| **composition** | install H values that nest another H value, and the veto rejected them | `chaindispatch.Tree`, where "no branch installs a hierarchy value" was false |
+| **calls** | call methods, and no body read one call deep writes a root-typed field | `voidfold`, `nestedroots.Message`, `gofcontext.Event`, and the new `deepcommit` |
+| **unreadable calls** | call methods whose bodies were not read (F11) | `unreadablecallee` |
+
+Two more kinds exist for completeness and are not reached by the corpus. The
+branches may produce H values in a position no commit rule reads (seen only
+with F30's re-offer ablated), or they may do none of the above.
+
+### The fix
+
+`detect/dispatch/CommitGap` classifies each site into exactly one kind, in a
+fixed precedence: what the branches produce comes before what they call, and
+calls come before bookkeeping writes. `summarize` groups the sites by kind and
+names each group's hosts. `Analyzer.recordCandidate` and
+`StateMachineClassifier`'s `--explain` line both print that summary, so the two
+reports of one decision cannot disagree.
+
+* Composition asks the veto's own predicate (`CompositionVeto.nestsHierarchyValue`),
+  so the explanation cannot contradict the rule that rejected the dispatch.
+* "calls" requires the probe to have actually read a body. `CommitProbe.Result`
+  gained `probed`, the callees whose bodies were read and scanned, so the candidate
+  says it looked one call deep only if it did.
+* The "calls" sentence never claims absence: "no method body read one call deep
+  writes a field of the hierarchy's root type (a commit deeper than one call is
+  possible and is not claimed)". Of the four corpus candidates with a "calls"
+  site, one is a real machine (`deepcommit`) and three are not.
+
+**Text only.** `CommitGap` is consulted by no verdict. It runs after the
+classifier has decided that no commit was proven, and a wrong kind is a wrong
+sentence, never a wrong machine. That is why it may read the arms more coarsely
+than the walkers do.
+
+### Fixture: `examples/deepcommit`
+
+Kafka's shape in miniature, on one class. `Kiln.tick()` is a real transition
+table (Cold → Warm → Hot → Cold) whose arms call helpers that call a mutator, so
+each commit is two calls deep. `Kiln.describe()` is the **negative control**: the
+same discrimination folded into `String`, which must still get the fold sentence.
+Before F32 both got one sentence. After, the reason reads "fold → String
+[Kiln.describe]; calls [Kiln.tick]". The hierarchy stays a Tier 3 candidate,
+correctly, because the probe's depth is 1 by design.
+
+### Regression gate
+
+* Corpus: every `.dot` and `.scxml` **byte-identical** across all 51 pre-existing
+  fixture directories. `summary.txt` changed in exactly the **14** directories
+  that produce a candidate, only in candidate reason text, and each new reason
+  was read against its fixture (table above). New: `deepcommit`.
+* Kafka `raft`: `EpochState`'s reason now reads "3 fold → Optional
+  [QuorumState.maybe…]; 2 calls [KafkaRaftClient.maybeTransitionForward,
+  maybeHandleElectionLoss]". `NomineeState`'s reads "2 calls".
+* `CANDIDATES.md` re-enumerated from the new capture: 17 candidates, with the kind
+  column now at sub-kind granularity. **Two** real machines are among them:
+  `eventmajor.Link` (Σ-major) and `deepcommit.Phase` (depth), where there was one.
+* Test: `StateCompletenessTest.aCandidateSaysWhyEachSiteProvesNoCommit`, covering
+  deepcommit's two groups and one existing control per other kind.
