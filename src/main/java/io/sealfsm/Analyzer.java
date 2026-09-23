@@ -655,6 +655,14 @@ public final class Analyzer {
         // candidates, and answering with the first one found lets file traversal
         // order decide where the machine starts.
         Set<String> seededFields = new LinkedHashSet<>();
+        // F31 — which seeds a DRIVER vouches for. A field declared outside the
+        // hierarchy is a context object's current-state holder; a constant declared
+        // on the hierarchy itself (`Upgrade EMPTY = new Empty();` on the root) is a
+        // shared value the program MAY start from. It is still counted — see
+        // isSelfSingleton — but an answer resting on constants alone is reported as
+        // the weaker evidence it is, never dressed as a state field.
+        Set<String> driverSeeds = new LinkedHashSet<>();
+        Set<String> constants = new TreeSet<>();
         for (CtField<?> field : model.getElements(new TypeFilter<>(CtField.class))) {
             CtTypeReference<?> ft = field.getType();
             if (ft == null || !hierarchy.contains(ft.getQualifiedName())) continue;
@@ -662,10 +670,22 @@ public final class Analyzer {
             CtTypeReference<?> init = cc.getType();
             if (init == null || !hierarchy.contains(init.getQualifiedName())) continue;
             if (isSelfSingleton(field, init)) continue;
-            seededFields.add(naming.idFor(init.getQualifiedName()));
+            String seed = naming.idFor(init.getQualifiedName());
+            seededFields.add(seed);
+            if (declaredInsideHierarchy(field, hierarchy)) {
+                constants.add(field.getDeclaringType().getSimpleName() + "." + field.getSimpleName());
+            } else {
+                driverSeeds.add(seed);
+            }
         }
         if (seededFields.size() == 1) {
-            return Optional.of(seededFields.iterator().next());
+            String only = seededFields.iterator().next();
+            if (driverSeeds.isEmpty()) {
+                initialStateEvidence = "a constant declared on the hierarchy itself ("
+                        + String.join(", ", constants) + " = new " + only
+                        + "()), not a driver's state field";
+            }
+            return Optional.of(only);
         }
         if (seededFields.size() > 1) {
             // Sorted, not in encounter order: the decision is now independent of
@@ -741,6 +761,13 @@ public final class Analyzer {
      * the field living somewhere in the hierarchy: a constant declared on the
      * sealed root ({@code Signal START = new Idle();}) does name a start state,
      * and a root is abstract, so it can never be its own instance.
+     *
+     * <p>It names one <em>weakly</em>, though (F31): a constant is a value the
+     * program may start from, not the field a driver actually starts in. So when
+     * rule 1's answer rests on such constants alone, with no driver field seeded
+     * the same way, the answer stands and is reported as weaker evidence.
+     * {@code examples/rootseed} holds both directions, including the case where
+     * the constant is not where the driver starts.
      */
     private static boolean isSelfSingleton(CtField<?> field, CtTypeReference<?> constructed) {
         CtType<?> owner = field.getDeclaringType();

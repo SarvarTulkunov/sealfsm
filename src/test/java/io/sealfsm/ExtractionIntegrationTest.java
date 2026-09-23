@@ -1965,6 +1965,47 @@ class ExtractionIntegrationTest {
                 "an inferred initial state must be reported as weaker evidence");
     }
 
+    /**
+     * F31: a constant declared on the hierarchy itself ({@code Valve SHUT = new
+     * Shut();} on the root, Kafka's {@code KRaftVersionUpgrade.EMPTY}) still seeds
+     * rule 1, but an answer resting on such constants ALONE is reported as weaker
+     * evidence. A driver field that agrees removes the label. One that disagrees
+     * still makes rule 1 abstain.
+     */
+    @Test
+    void anInitialStateSeededOnlyByARootConstantIsReportedAsWeakerEvidence() {
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/rootseed"));
+
+        // The Kafka shape: right answer, weak evidence, and the report says so.
+        assertEquals("Shut", machine(r, "Valve").initialState().orElse(null));
+        assertTrue(constantEvidenceFor(r, "rootseed.Valve"),
+                "an answer resting on a root constant alone is labelled");
+
+        // The control: the same constant, and a driver field agreeing with it.
+        assertEquals("Closed", machine(r, "Gate").initialState().orElse(null));
+        assertFalse(constantEvidenceFor(r, "rootseed.Gate"),
+                "a driver field vouches for the answer, so it is not labelled weak");
+
+        // Precedence: a constant and a driver field that disagree. Unanimity still
+        // holds in both directions; neither is promoted over the other.
+        assertTrue(machine(r, "Lamp").initialState().isEmpty());
+        assertTrue(r.diagnostics().stream().anyMatch(d -> d.where().equals("rootseed.Lamp")
+                && d.message().contains("disagree")));
+
+        // The documented cost, and a standing probe: the driver starts in Spinning
+        // through a factory rule 1 cannot see, so the root constant's Idle is
+        // WRONG. It stays reported only because it is labelled. If rule 1 learns to
+        // follow a factory, this fails, and should be updated to the new answer.
+        assertEquals("Idle", machine(r, "Fan").initialState().orElse(null));
+        assertTrue(constantEvidenceFor(r, "rootseed.Fan"));
+    }
+
+    private static boolean constantEvidenceFor(ExtractionResult r, String where) {
+        return r.diagnostics().stream().anyMatch(d -> d.where().equals(where)
+                && d.message().contains("a constant declared on the hierarchy itself")
+                && d.message().contains("weaker evidence"));
+    }
+
     // ---- initial state: no rule may pick between rival candidates -----------
 
     /**

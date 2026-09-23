@@ -1609,16 +1609,80 @@ finding.
 
 ### What it leaves standing
 
-* **Initial-state rule 1 still reads a constant declared inside the hierarchy.**
-  `KRaftVersionUpgrade EMPTY = new Empty();` on the root seeded Kafka's
-  (then-accepted) machine with `Empty`. `isSelfSingleton` excludes only a field
-  that constructs its own declaring type. Rule 3 already restricts locals to
-  declarations outside H, and the same restriction for fields is the obvious
-  candidate. It is not taken here, because on the corpus it can only move an
-  initial state, and that wants its own measurement.
+* **Initial-state rule 1 reads a constant on the root as a seed, by design.**
+  `KRaftVersionUpgrade EMPTY = new Empty();` seeded Kafka's (then-accepted)
+  machine with `Empty`, which is the correct answer: `LeaderState` starts its
+  `AtomicReference` from `empty()`. `isSelfSingleton`'s javadoc states the decision
+  explicitly: a root constant names a start state, and only a field constructing its
+  own declaring type is excluded. No corpus fixture declares a root constant, so
+  the decision is unpinned in both directions. Its weakness is that the evidence
+  is a shared constant rather than a driver's current-state field, and the output
+  does not say so.
 * A static method on H that takes the state is now a centralized function **by
   the same rule as one declared outside H**, including its known looseness: F19
   admits a method with an H-typed parameter and no discrimination
   (`factory.shutOnTurn`). Nothing new is admitted by that route that was not
   admitted before (see above), but it is where a future false positive of this
   shape would come from.
+
+## F31 — an initial state seeded only by a constant is reported as the weaker evidence it is
+
+Found on the same Kafka run as F30. `KRaftVersionUpgrade EMPTY = new Empty();`,
+a constant declared on the sealed root, was the only `new` that seeded the
+machine, and initial-state rule 1 reported `Empty` exactly as it reports a
+driver's state field (`private TrafficLight current = new Red();`), with nothing
+in the output to tell the two apart.
+
+### Not a restriction, and why
+
+My first recommendation was to ignore such constants, as rule 3 ignores locals
+declared inside the hierarchy. That was wrong, for three reasons:
+
+* **The code already decided it, on purpose.** `isSelfSingleton`'s javadoc says a
+  constant on the root (`Signal START = new Idle();`) names a start state. Only a
+  field constructing its OWN declaring type (a flyweight, an enum constant) is
+  excluded.
+* **On the one real instance it was right.** `LeaderState` starts its
+  `AtomicReference` from `KRaftVersionUpgrade.empty()`, which returns `EMPTY`.
+* **The two possible errors differ in direction.** Ignoring the constant turns that
+  right answer into a gap. Trusting it silently gives a wrong answer in the case
+  below, with nothing to warn the reader.
+
+So the verdict is unchanged, and the report changes. When rule 1's unanimous
+answer rests on constants declared inside the hierarchy ALONE, with no field
+outside it seeded the same way, the answer stands and carries the weaker-evidence
+line rule 3 already prints: "initial state 'Shut' inferred from a constant
+declared on the hierarchy itself (Valve.SHUT = new Shut()), not a driver's state
+field — weaker evidence …". "Inside the hierarchy" is the same
+`declaredInsideHierarchy` predicate rule 3 uses.
+
+### Fixture: `examples/rootseed`
+
+Four two-state POLYMORPHIC machines, identical except for what seeds them (every
+file compiled by `javac`):
+
+| hierarchy | seeds | before | after |
+|---|---|---|---|
+| `Valve` | root constant only; the driver starts from it (`Valve.SHUT`) | `Shut`, unlabelled | `Shut`, **labelled** |
+| `Gate` | root constant + a driver field `new Closed()` that agrees | `Closed` | `Closed`, **not** labelled (the control) |
+| `Lamp` | root constant `Off` + a driver field `new On()` that disagrees | no initial state, disagreement reported | unchanged: unanimity holds in both directions |
+| `Fan` | root constant `Idle`; the driver starts in `Spinning` through a static factory rule 1 cannot see | `Idle`, **wrong**, unlabelled | `Idle`, still wrong, **labelled** |
+
+`Fan` is the documented cost and a standing probe. It pins a wrong answer on
+purpose, because that is the rule's real behaviour and the label is what makes it
+honest. If rule 1 ever learns to follow a factory into the driver's field, its
+test fails and should be updated to the new answer.
+
+**Ablation.** Label every answer a constant contributed to, instead of only those
+no driver vouches for: `Gate` is labelled too, and its label becomes false ("not a
+driver's state field" while a driver field exists).
+
+### Regression gate
+
+* Corpus: all **50** pre-existing fixture directories byte-identical (`.dot`,
+  `.scxml`, `summary.txt`). The only difference is the new `rootseed`. No corpus
+  fixture declares a hierarchy-typed constant constructing another member
+  (`valueforms`' and `rivalseeds`' `INSTANCE` constants all construct their own
+  declaring type, and `isSelfSingleton` already excludes them).
+* Test: `ExtractionIntegrationTest.anInitialStateSeededOnlyByARootConstantIsReportedAsWeakerEvidence`.
+
