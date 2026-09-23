@@ -1270,3 +1270,242 @@ on entry — an inter-procedural, flow-sensitive question the tool does not ask
 anywhere. The honest boundary is therefore: the states are exact and named, the
 dispatch sites are named, and no relation is claimed. Closing it is future work
 and is a genuinely larger change than this one.
+
+---
+
+## F29 — the binding was threaded; the traversal around it was not
+
+### The premise that turned out to be false, and what was underneath it
+
+The task statement for this finding was: *"on entry to a callee, the
+inter-procedural fold discards the caller's argument expressions, so every read of
+a callee parameter is unresolvable by construction."* **That was true before F25
+and is false on `master`.** F25 (`da4f5cb`) already threads an identity-keyed
+`CtParameter → CtExpression` map per fold frame, resolves a bound parameter by
+resolving the caller's expression one frame out (rule 5), refuses a reassigned or
+varargs parameter, and derives F24's "selector parameters" from the map rather
+than keeping a second set. The binding itself was not the gap.
+
+What the audit found instead is that the binding sat inside a traversal that
+still assumed things the binding existed to establish. Seven places, each a
+separate defect, each measured on its own fixture and attributed by ablation:
+
+| # | where | what was assumed | failure direction |
+|---|---|---|---|
+| 1 | rule 5's cycle guard | `seen` was a `HashSet<CtElement>` — **structural** equality | recall: any chain reusing a parameter name (`x`→`x`, `state`→`state`) stopped at hop 2 |
+| 2 | rule 5's reading of the bound expression | the pure resolver, which never folds | recall: `forward(States.armed())` bound `s` to a call and answered "a call — unresolved" |
+| 3 | `this` inside a folded callee | always the current state (no receiver slot) | **fabrication**: `new Drive().hold()` from `Park` published `Park → Park` |
+| 4 | the body the fold enters | Spoon's STATIC binding is the body that runs | **fabrication** (a virtual call folded off one of two bodies; an overload Spoon chose by guess) **and deletion** (F9 read off the always-throwing body while an override returns) |
+| 5 | recursion detection | a signature string, which carries no declaring type | recall: `A.step(E)` → `B.step(E)` read as recursion |
+| 6 | a state switch inside a folded callee (F18) | the switched value is the current state | **fabrication + deletion**: `settle(new Blink())` from `Dark` skipped the arm that runs and published `Dark → Dark` |
+| 7 | void callees | never entered — the fold only enters callees that RETURN a state | recall: `install(new Launching(), why)`, whose body writes `this.state = next`, stayed "commit proven, successor unknown" |
+
+Rows 1, 3, 4 and 6 are the ones worth dwelling on. Row 1 is an F13 bug that F25
+reintroduced one data structure over: F25's own fixture used a distinct parameter
+name at every hop (`onRolling(Sig e)` → `wrap(Carry s, …)`), so the defect was
+invisible there and would have fired on almost any real forwarding chain. Rows 3,
+4 and 6 all failed **in the unsafe direction behind a clean score** — the
+fixtures below report 5/5, 2/2 and 3/3 before the fix, with fabricated edges in
+each.
+
+### The fix: one frame, and every fold question asked of it
+
+`extract/BindingFrame` replaces F25's two parallel stacks (the extractor's
+`Deque<String>` of signatures and the resolver's `List<Map>` of bindings, pushed
+and popped together by convention): `(callSite, callee, bindings, receiver,
+refusals, caller, depth)`. Two properties of it carry the fix.
+
+* **`caller` is a link, not a stack position.** A bound expression is evaluated in
+  the frame it is WRITTEN in. When that expression is itself a call, folding it
+  opens a new frame whose caller is that written frame, while the physical walk is
+  still inside the callee that read the parameter — an index would name the wrong
+  frame. Recursion (`onChain`, by declaration identity) and the depth budget are
+  therefore questions about the simulated call chain, not about how deep the
+  analysis's own Java stack is.
+* **The receiver is a slot of its own**: the call's target as written, `null` for
+  a static callee. `this` in a folded body resolves through it, in the caller's
+  frame; `Outer.this` and a `this` inside a nested body are not the callee's own
+  and are refused.
+
+Around it:
+
+* **Deferred evaluation (row 2).** When rule 5 or the receiver slot meets a bound
+  expression the pure resolver cannot read but the extractor can — a call, a
+  switch expression, a reassigned local — it hands it back as
+  `TransitionResolver.Deferred(expression, frame)`, and `handleValue` evaluates it
+  in that frame with the caller's own analysis. The bound expression gets exactly
+  the treatment it would have had as a value the caller produced itself; the fold
+  claims what the caller would claim had it inlined the callee, and nothing more.
+  A deferred candidate is `resolved == false` and carries the unresolved `raw` it
+  stands for, so every consumer that does not know about deferral records exactly
+  what it did before. Termination: each deferral is keyed on a distinct source
+  node (identity set); a re-entered one answers with the old unresolved edge.
+* **`seen` is identity-keyed (row 1).** The F13 rule, applied where it was missing.
+* **`detect/dispatch/CallTarget` (row 4)** answers "which body does this call
+  RUN?" before any body is read — unique by construction (`static`, `private`,
+  `final`, a `super.` call), or no method in the model overriding the bound one in
+  a type related to the receiver's static type. It also refuses a binding Spoon
+  made by guess: under `noClasspath` an argument of unresolved type gives JDT
+  nothing to choose an overload with, and Spoon binds the **first same-arity
+  declaration** (measured on Spoon 10.4.2 with a throwaway probe before any code
+  was written). Asked by the value fold, by the void fold, and by F9 on the
+  carrier path — F9 is exact about the body it reads, so it may only read the body
+  that runs; a non-unique always-throwing callee is now a recorded gap instead of
+  a deleted edge. A shadow is exempt (it is never summarised, F11).
+* **Foreign switches (row 6).** `TransitionResolver.selectorCurrentness` asks the
+  frames whether a state switch's selector — a folded parameter or `this` —
+  holds the current state. Only a definite **no** changes anything: the switch is
+  walked from the caller's from-state, arms the binding excludes are skipped, and
+  an arm not certain to match carries its type test as the guard
+  (`b instanceof Dark`). "Unknown" (a refused binding, a field, a local) leaves
+  F18's reading exactly as it was. A root-typed pattern binding of such a switch
+  is that other value, so rule 4's pattern-binding exemption does not cover it.
+* **The void fold (row 7).** At an arm the k = 1 probe proved commits, the fold
+  now enters the callee with the arm's bindings and reads the probe's own commit
+  clause (`CommitProbe.isRootFieldWrite`, made public so there is one notion of it)
+  as the production. **The probe is not made a resolver** — it still decides the
+  tier, on declared types, at depth 1; the fold decides the successor, on
+  expressions, within the k-budget every fold spends. A returned value in a void
+  fold is discarded (JLS §14.8); a nested committing call is folded in turn or
+  marks the fold incomplete, which keeps the probe's marker beside the resolved
+  edges; an owned root-field write the walk did not reach is recorded unresolved
+  (the F18 accounting). **When the fold resolves nothing, the probe's marker stands
+  byte-for-byte** — it says more than a list of unreadable writes, and it is what
+  keeps `examples/voidcommit` identical.
+* **The deferred-execution boundary** is now stated, not emergent: a parameter
+  read binds only when its nearest enclosing executable IS the frame's callee, so
+  a read inside a lambda or a local/anonymous class (which may run after the call
+  returns) is refused. Before F29 this held because the walker never descends a
+  lambda and the lookup only consulted the innermost frame; the fixture pins it on
+  the shape where that alone does not say why — a local class whose method IS
+  folded.
+* **Varargs**: bound only when the call hands the varargs slot one explicit array
+  (JLS §15.12.4.2). No resolver rule reads an array element, so this is
+  unobservable today; it makes the frame exact rather than conservative.
+* **`--explain`** now also prints, per machine, each binding chain a resolved
+  value travelled (outermost call first; one hop per call: parameter `:=` caller
+  expression `at` call site `[File:line]`) and the rule that stopped each value
+  that did not resolve — `DEPTH_EXCEEDED`, `RECURSION`, `OVERRIDDEN`,
+  `AMBIGUOUS_OVERLOAD`, `UNRESOLVED_RECEIVER`, `NO_BODY`, `LIBRARY`,
+  `REASSIGNED_PARAMETER`, `VARARGS`, `UNBOUND`, `DEFERRED_EXECUTION`,
+  `NOTHING_BOUND`. That is what separates a capability gap from a scope limit;
+  both are the same dashed edge in the output. A side channel: the output files
+  are identical with it on or off (tested).
+
+### Parameter binding belongs to the traversal, not to a cell
+
+None of the seven changes names a `CommitForm`, a `SuccessorForm` or a
+`DispatchLocus`. The frame is opened by the fold and read by the resolver, and the
+resolver is the single successor sub-procedure every cell already goes through, so
+every `(DispatchLocus × CommitForm)` cell whose successor or committed value
+crosses a call boundary gets the binding from one mechanism. The two generality
+fixtures below were chosen to differ on every axis the task names precisely so
+that a cell-specific fix could not pass both.
+
+### Fixtures
+
+`src/test/resources/bindingframes/` — ten hierarchies in one package, all compiled
+by `javac`, one question each; `src/test/resources/callambiguity/` — the overload
+guess, which by construction does not compile (the `unreadmember` precedent).
+
+| hierarchy | question | before F29 | after |
+|---|---|---|---|
+| `Bay` | **Positive A** — one hop into a VOID callee with two parameters (so not a mutator); control arm commits a value the callee computes | 0/3, Tier 2 | **2/3**, control keeps the probe marker verbatim |
+| `Valve` | **Positive B** — CARRIER_RETURN, **two** hops, successor from a **static factory** | 0/3 | **3/3**, `CONSTRUCTION` only |
+| `Gear` | **Positive C** — `this` through the receiver slot: constructed receiver, factory receiver, explicit and implicit `this`, unreadable receiver | 5/5, **every edge `SELF`** | **4/5**, the gap is the unreadable receiver |
+| `Lamp` | **Negative C** (3 hops vs a budget of 2; control at 2 hops) and **Negative A** (reassigned parameter) | 0/3 | **1/3** |
+| `Pump` | **Negative B** — virtual call, two bodies; control: the same method through a final receiver type; F9 on a virtual callee | 2/2 (one resolved off one of two bodies, one **deleted**) | **1/3** |
+| `Latch` | **Negative D** — read inside a stored lambda; inside a kept local class whose method IS folded; control in the callee's own body | 1/3 | 1/3, now explicit and explained |
+| `Tide` | recursion by identity — two different `step(Tide)` | 0/2 | **2/2** |
+| `Beacon` | a switch in a folded callee over a parameter bound to a construction / the current state / an unreadable call | 3/3, **`Dark → Dark` fabricated** | **5/5**: `Dark → Steady`; control unchanged; three guarded arms |
+| `Winch` | F9 on the CARRIER path: the same always-throwing method through a virtual receiver and through a final one | 1/1 (the virtual arm **deleted**) | **1/2**; the unique arm still contributes no edge |
+| `Knob` (`callambiguity`) | an overload chosen by guess under `noClasspath`; control with no overload | 2/3, **`Low → High` fabricated** | **1/3** |
+
+**On "independently sourced".** Positive B differs from A on every named axis
+(commit form, hop count, how the successor is produced), but both were written in
+this session. The F25 entry's standing request — a second generality fixture taken
+from real code rather than invented alongside the fix — is still open, and the
+holdout corpus was deliberately not consulted for it.
+
+### Attribution, by ablation
+
+Each sub-fix switched off alone, full rebuild, fixture re-run. "none" is the
+complete fix; "baseline" is `master` before F29.
+
+| ablated | Bay | Beacon | Gear | Lamp | Latch | Pump | Tide | Valve | Winch | Knob |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline (pre-F29) | 0/3 | 3/3 | 5/5 | 0/3 | 1/3 | 2/2 | 0/2 | 0/3 | 1/1 | 2/3 |
+| **none** | **2/3** | **5/5** | **4/5** | **1/3** | **1/3** | **1/3** | **2/2** | **3/3** | **1/2** | **1/3** |
+| identity `seen` | 2/3 | 5/5 | 4/5 | 0/3 | 1/3 | 1/3 | 0/2 | 0/3 | 1/2 | 1/3 |
+| deferral | 2/3 | 5/5 | 3/5 | 1/3 | 1/3 | 1/3 | 2/2 | 0/3 | 1/2 | 1/3 |
+| recursion by identity | 2/3 | 5/5 | 4/5 | 1/3 | 1/3 | 1/3 | 0/2 | 3/3 | 1/2 | 1/3 |
+| receiver slot | 2/3 | 5/5 | 5/5 | 1/3 | 1/3 | 1/3 | 2/2 | 3/3 | 1/2 | 1/3 |
+| `CallTarget` | 2/3 | 5/5 | 4/5 | 1/3 | 1/3 | 2/2 | 2/2 | 3/3 | 1/1 | 2/3 |
+| foreign switch | 2/3 | 3/3 | 4/5 | 1/3 | 1/3 | 1/3 | 2/2 | 3/3 | 1/2 | 1/3 |
+| void fold | 0/3 | 5/5 | 4/5 | 1/3 | 1/3 | 1/3 | 2/2 | 3/3 | 1/2 | 1/3 |
+
+Every sub-fix moves at least one fixture, and every fixture that moved is moved by
+a sub-fix it was written for. `Valve` needs both the identity `seen` and deferral,
+and `Tide` both the identity `seen` and identity recursion — each is a chain, so
+each crosses two of the defects at once. `Latch` moves under none, as stated
+above: the boundary was already held implicitly, and F29 makes it explicit and
+explainable. (The ablation rows are the score only; `Gear`'s ablated 5/5 and
+`Beacon`'s ablated 3/3 are the fabrications described above.)
+
+### Regression gate
+
+* Corpus (`scripts/capture-golden.sh`, all **49** fixture directories): **every
+  `.dot`, `.scxml` and `summary.txt` byte-identical** to `master` — no state added
+  or removed, no edge added or removed, no edge moved in either direction.
+  Checked after each sub-fix landed and again on the final build. None of the
+  seven rules fires on the corpus, which is itself a finding: the corpus's
+  forwarding chains all rename their parameters per hop, none folds a virtual or
+  receiver-bearing call, none re-switches on a foreign state, and its one
+  VIA_CALLEE machine commits an array element.
+* All 199 pre-existing tests green, plus `InterproceduralBindingTest` (14): 213.
+* Determinism: DOT and SCXML byte-identical across two runs from two independently
+  built models, on both binding fixtures and on `lcp_automation` /
+  `lcp_automation_chatgpt` (tested).
+
+### Depth sweep
+
+`scripts/depth-sweep.sh` (new) runs the analyzer over every `examples/*` directory
+plus both binding fixtures, each directory its own model, at a budget set by
+`-Dsealfsm.maxInterprocDepth=k` — one JVM per k, the property used for nothing
+else, so the sweep is re-runnable rather than a hand edit of the constant.
+`corpus/` is never passed. Final build, each k run twice: the counts were
+identical across repetitions, and the in-process analysis time (model building
+excluded) was **9.4–11.0 s at every k with no trend** — at this corpus's size the
+budget costs nothing measurable.
+
+| axis cell (Encoding / CommitForm) | machines | k=1 res/total | k=2 | k=3 | k=4 |
+|---|---|---|---|---|---|
+| CENTRALIZED_DISPATCH / CARRIER_RETURN | 5 | 119/122 | 121/122 | 121/122 | 121/122 |
+| CENTRALIZED_DISPATCH / FIELD_MUTATION | 7 | 43/48 | 43/48 | 43/48 | 43/48 |
+| CENTRALIZED_DISPATCH / FIELD_MUTATION+MUTATOR_ARGUMENT | 1 | 1/2 | 1/2 | 1/2 | 1/2 |
+| CENTRALIZED_DISPATCH / FIELD_MUTATION+VALUE_RETURN | 1 | 6/6 | 6/6 | 6/6 | 6/6 |
+| CENTRALIZED_DISPATCH / LOCAL_ACCUMULATOR | 1 | 4/5 | 4/5 | 6/6 | 6/6 |
+| CENTRALIZED_DISPATCH / MUTATOR_ARGUMENT | 3 | 12/12 | 12/12 | 12/12 | 12/12 |
+| CENTRALIZED_DISPATCH / VALUE_RETURN | 36 | 345/367 | 348/367 | 350/367 | 350/367 |
+| MIXED / FIELD_MUTATION | 1 | 3/3 | 3/3 | 3/3 | 3/3 |
+| MIXED / MUTATOR_ARGUMENT | 1 | 5/5 | 5/5 | 5/5 | 5/5 |
+| MIXED / VALUE_RETURN | 2 | 8/8 | 8/8 | 8/8 | 8/8 |
+| POLYMORPHIC / POLY_CARRIER | 4 | 63/64 | 63/64 | 63/64 | 63/64 |
+| POLYMORPHIC / VALUE_RETURN | 6 | 23/28 | 23/28 | 23/28 | 23/28 |
+| **TOTAL** | **68** | **632/670** | **637/670** | **641/671** | **641/671** |
+
+What it justifies, and what it does not:
+
+* **Monotone non-decreasing in every cell, and flat past k = 3** — the property F25
+  restored still holds now that deferred evaluations and void folds spend the same
+  budget as ordinary folds. More budget never licenses fewer proofs.
+* **It does not, on these numbers, justify k = 2 over k = 3.** k = 3 resolves four
+  more edges at no measured time cost, and exactly three machines move between the
+  two: `accumulator.Phase` 4/5 → 6/6 (its documented "one out-of-budget
+  delegation" resolves, into two edges — the one transition-count change in the
+  sweep), `factory.Bolt` 3/4 → 4/4, and `bindingframes.Lamp` 1/3 → 2/3 (Negative
+  C, by construction). What k = 3 would cost is precision, and that cannot be
+  measured without ground truth. Raising the default also changes two corpus
+  fixtures' documented numbers and adds an edge — exactly what this finding's
+  regression gate forbade — so the default is **left at 2** and the choice is
+  recorded as a decision to take separately, with this table as its evidence.

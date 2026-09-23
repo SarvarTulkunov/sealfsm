@@ -32,10 +32,21 @@ public final class ExtractionResult {
      */
     public record Explanation(String where, List<String> predicates) { }
 
+    /**
+     * How one machine's inter-procedural values were bound ({@code --explain}):
+     * for each edge resolved through a parameter or receiver binding, the chain of
+     * hops it travelled from the dispatch inward; for each call the fold declined
+     * and each binding it refused, the rule that stopped it. The same kind of
+     * channel as {@link Explanation} — the decision procedure narrating itself on
+     * request — kept apart from it because it narrates a different procedure.
+     */
+    public record BindingTrace(String where, List<String> lines) { }
+
     private final List<StateMachine> machines = new ArrayList<>();
     private final List<Candidate> candidates = new ArrayList<>();
     private final List<Diagnostic> diagnostics = new ArrayList<>();
     private final List<Explanation> explanations = new ArrayList<>();
+    private final List<BindingTrace> bindingTraces = new ArrayList<>();
 
     public void addMachine(StateMachine m) { machines.add(m); }
     public void addCandidate(Candidate c) { candidates.add(c); }
@@ -48,6 +59,10 @@ public final class ExtractionResult {
 
     public void explain(String where, List<String> predicates) {
         explanations.add(new Explanation(where, List.copyOf(predicates)));
+    }
+
+    public void traceBindings(String where, List<String> lines) {
+        bindingTraces.add(new BindingTrace(where, List.copyOf(lines)));
     }
 
     public List<StateMachine> machines()    { return Collections.unmodifiableList(machines); }
@@ -67,6 +82,7 @@ public final class ExtractionResult {
     public List<Candidate> candidates()     { return Collections.unmodifiableList(candidates); }
     public List<Diagnostic> diagnostics()   { return Collections.unmodifiableList(diagnostics); }
     public List<Explanation> explanations() { return Collections.unmodifiableList(explanations); }
+    public List<BindingTrace> bindingTraces() { return Collections.unmodifiableList(bindingTraces); }
 
     /** True when no <em>machine</em> was found; candidates do not count as machines. */
     public boolean isEmpty() { return machines.isEmpty(); }

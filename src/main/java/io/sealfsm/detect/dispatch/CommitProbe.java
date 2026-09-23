@@ -225,20 +225,33 @@ public final class CommitProbe {
         try {
             for (CtAssignment<?, ?> a
                     : callee.getBody().getElements(new TypeFilter<>(CtAssignment.class))) {
-                if (CommitClassifier.ofTarget(a.getAssigned(), hierarchy)
-                        != CommitForm.FIELD_MUTATION) {
-                    continue;
-                }
-                CtTypeReference<?> written = a.getAssigned().getType();
-                if (written != null && written.getQualifiedName().equals(rootQualifiedName)) {
-                    return a;
-                }
+                if (isRootFieldWrite(a, hierarchy, rootQualifiedName)) return a;
             }
         } catch (Throwable ignored) {
             // an unreadable body answers "no commit", the direction that cannot
             // fabricate a machine
         }
         return null;
+    }
+
+    /**
+     * The probe's one commit clause, for a single assignment: a write to a field
+     * declared with the hierarchy ROOT. Public so the extractor's fold into the
+     * same callee (F29) reads a commit by the same rule the probe proved it by —
+     * two notions of "this write installs a state" would let the fold resolve a
+     * write the probe never counted, or skip the one it did.
+     */
+    public static boolean isRootFieldWrite(CtAssignment<?, ?> a, Set<String> hierarchy,
+                                           String rootQualifiedName) {
+        try {
+            if (CommitClassifier.ofTarget(a.getAssigned(), hierarchy) != CommitForm.FIELD_MUTATION) {
+                return false;
+            }
+            CtTypeReference<?> written = a.getAssigned().getType();
+            return written != null && written.getQualifiedName().equals(rootQualifiedName);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /**

@@ -10,9 +10,13 @@ import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtLocalVariable;
+import spoon.reflect.code.CtSuperAccess;
+import spoon.reflect.code.CtSwitchExpression;
 import spoon.reflect.code.CtThisAccess;
 import spoon.reflect.code.CtVariableAccess;
+import spoon.reflect.code.CtCase;
 import spoon.reflect.declaration.CtElement;
+import spoon.reflect.declaration.CtExecutable;
 import spoon.reflect.declaration.CtEnum;
 import spoon.reflect.declaration.CtEnumValue;
 import spoon.reflect.declaration.CtField;
@@ -26,7 +30,6 @@ import spoon.reflect.reference.CtVariableReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -57,20 +60,60 @@ import java.util.function.Consumer;
  */
 public final class TransitionResolver {
 
-    /** A possible transition target derived from one expression. */
+    /**
+     * A possible transition target derived from one expression.
+     *
+     * @param deferred non-null when the expression could only be read by the
+     *                 extractor's own analysis in an OUTER frame (see
+     *                 {@link Deferred}). Such a candidate is {@code resolved ==
+     *                 false} and carries the unresolved {@code raw} it stands for,
+     *                 so any consumer that does not know about deferral records it
+     *                 exactly as it did before deferral existed
+     * @param via      the binding hops this value travelled, innermost first, for
+     *                 {@code --explain}; or why a binding was refused. Descriptive
+     *                 only — never consulted by a decision, never part of the output
+     */
     public record Candidate(String targetSimpleName, String guard, boolean resolved,
-                            String raw, SuccessorForm form) {
+                            String raw, SuccessorForm form, Deferred deferred, List<String> via) {
+        public Candidate {
+            via = via == null ? List.of() : List.copyOf(via);
+        }
         static Candidate of(String target, String guard, SuccessorForm form) {
-            return new Candidate(target, guard, true, null, form);
+            return new Candidate(target, guard, true, null, form, null, List.of());
         }
         static Candidate unresolved(String guard, String raw) {
-            return new Candidate(null, guard, false, raw, null);
+            return new Candidate(null, guard, false, raw, null, null, List.of());
         }
         /** The same candidate re-labelled with the form that reached it. */
         Candidate as(SuccessorForm f) {
-            return resolved ? new Candidate(targetSimpleName, guard, true, raw, f) : this;
+            return resolved ? new Candidate(targetSimpleName, guard, true, raw, f, deferred, via) : this;
+        }
+        /** The same candidate, having travelled one more binding hop. */
+        Candidate through(String hop) {
+            List<String> v = new ArrayList<>(via.size() + 1);
+            v.addAll(via);
+            v.add(hop);
+            return new Candidate(targetSimpleName, guard, resolved, raw, form, deferred, v);
         }
     }
+
+    /**
+     * A bound expression that the pure resolver cannot read and the extractor's
+     * analysis can — a call to fold, a switch expression to walk, a reassigned
+     * local whose reaching definitions to recover — together with the frame it is
+     * WRITTEN in, which is where it must be evaluated.
+     *
+     * <p>This is the half of F25 that stopped at the resolver's edge. Rule (5)
+     * resolved a bound argument by resolving the caller's expression, but it did so
+     * with the pure resolver, which never folds: {@code forward(States.armed())}
+     * bound {@code s} to {@code States.armed()} and then answered "a call —
+     * unresolved", although that exact call, returned directly, folds and
+     * resolves. The binding carried the expression; the analysis applied to it was
+     * weaker than the one the caller would have applied to itself. Handing it back
+     * with its frame lets the caller's own analysis finish the job — the fold
+     * claims exactly what the caller would claim had it inlined the callee.
+     */
+    public record Deferred(CtExpression<?> expression, BindingFrame frame, String hop) { }
 
     /**
      * Depth bound for chasing a variable through its initializer. Two hops covers
@@ -115,9 +158,13 @@ public final class TransitionResolver {
     }
 
     /**
-     * F25 — the inter-procedural frames currently on the fold stack, outermost
-     * first, each mapping a callee PARAMETER to the expression the caller actually
-     * passed at the call site being summarised. Empty outside any fold.
+     * F25/F29 — the fold frame expressions are currently evaluated in: a callee
+     * together with each PARAMETER mapped to the expression the caller actually
+     * passed at the call site being summarised, the receiver {@code this} denotes,
+     * and a link to the frame the call site is written in. {@code null} in the
+     * dispatch host. F25 kept this as a list of maps beside a separate stack of
+     * signature strings in the extractor; {@link BindingFrame} is now the only fold
+     * state there is.
      *
      * <p>The fold walks a callee's body in the caller's from-context, but until
      * this map existed it carried no binding from the callee's parameters to the
@@ -150,32 +197,108 @@ public final class TransitionResolver {
      * a parameter holds", not two — a second would eventually disagree with the
      * first, and the disagreement would be an edge.
      */
-    private final List<Map<CtVariable<?>, CtExpression<?>>> foldFrames = new ArrayList<>();
+    private BindingFrame frame;
 
-    /** Pushed by the extractor with {@code interProcStack}; see {@link #foldFrames}. */
-    void pushFoldFrame(Map<CtVariable<?>, CtExpression<?>> bindings) {
-        foldFrames.add(bindings == null ? Map.of() : bindings);
-    }
+    /**
+     * How many folds (and evaluations on a fold's behalf) are in progress,
+     * physically. Distinct from {@link #frame}: while a bound argument is being
+     * evaluated in the dispatch host, {@code frame} is {@code null} yet the
+     * analysis is still inside a fold, and rule 4 must know that (see
+     * {@link #selectorHoldsCurrentState}). Zero means no fold is anywhere on the
+     * stack, which is the only context in which rule 4 applies as it always did.
+     */
+    private int activity = 0;
+    private final List<BindingFrame> saved = new ArrayList<>();
 
-    /** Popped by the extractor with {@code interProcStack}. */
-    void popFoldFrame() {
-        if (!foldFrames.isEmpty()) foldFrames.remove(foldFrames.size() - 1);
-    }
+    /**
+     * Switches the walker is currently reading as a discrimination of some value
+     * OTHER than the current state (see {@link #selectorCurrentness}). A pattern
+     * binding of one of their arms is that other value, so rule 4's exemption for
+     * pattern bindings does not cover it. Identity-keyed, the F13 rule.
+     */
+    private final Set<CtElement> foreignSwitches =
+            java.util.Collections.newSetFromMap(new IdentityHashMap<>());
 
-    /** Number of frames on the fold stack; 0 outside any fold. Test/diagnostic use. */
-    int foldDepth() {
-        return foldFrames.size();
+    /** The frame expressions are currently evaluated in; {@code null} for the host. */
+    BindingFrame frame() {
+        return frame;
     }
 
     /**
-     * The expression the caller bound to {@code decl} in {@code frame}, or
-     * {@code null} when nothing did — a local or pattern binding, a parameter the
-     * callee reassigns, one past the end of a shorter argument list, or a read
-     * outside any fold.
+     * Enter {@code f} — a newly opened fold frame, or an outer frame a deferred
+     * expression is being evaluated in ({@code null} for the host). Paired with
+     * {@link #leave()} in a {@code finally} by the extractor; the frame is the only
+     * fold state there is, so nothing else can be left behind.
      */
-    private CtExpression<?> boundArgument(CtVariable<?> decl, int frame) {
-        if (decl == null || frame < 0 || frame >= foldFrames.size()) return null;
-        return foldFrames.get(frame).get(decl);
+    void enter(BindingFrame f) {
+        saved.add(frame);
+        frame = f;
+        activity++;
+    }
+
+    void leave() {
+        if (saved.isEmpty()) return;
+        frame = saved.remove(saved.size() - 1);
+        activity--;
+    }
+
+    /** Is any fold in progress? Test/diagnostic use. */
+    boolean inFold() {
+        return activity > 0;
+    }
+
+    boolean markForeign(CtElement sw) {
+        return foreignSwitches.add(sw);
+    }
+
+    void unmarkForeign(CtElement sw) {
+        foreignSwitches.remove(sw);
+    }
+
+    /**
+     * The expression the caller bound to {@code decl} in {@code f}, or {@code null}
+     * when nothing did — a local or pattern binding, a parameter the callee
+     * reassigns, a varargs slot, one past the end of a shorter argument list, a
+     * read outside any fold — or when the read is not in the frame's own body.
+     *
+     * <p>That last clause is the deferred-execution boundary, stated rather than
+     * left to fall out of the walk. A parameter read inside a lambda, an anonymous
+     * class or a local class of the callee may run after the call has returned, so
+     * the argument is no longer guaranteed to be what the parameter holds; and a
+     * read belonging to such a body is the body's own, not the callee's. Decided
+     * structurally: the read's nearest enclosing executable must BE the frame's
+     * callee.
+     */
+    private CtExpression<?> boundArgument(CtVariable<?> decl, CtElement read, BindingFrame f) {
+        if (!(decl instanceof CtParameter<?> p) || f == null) return null;
+        if (!ownedBy(read, f)) return null;
+        return f.argumentFor(p);
+    }
+
+    /** Why {@code decl} carries no binding in {@code f}, for {@code --explain}. */
+    private String unboundReason(CtVariable<?> decl, CtElement read, BindingFrame f) {
+        if (!(decl instanceof CtParameter<?> p) || f == null) return null;
+        CtExecutable<?> declaredIn;
+        try {
+            declaredIn = p.getParent(CtExecutable.class);
+        } catch (Throwable t) {
+            declaredIn = null;
+        }
+        if (!ownedBy(read, f) || (declaredIn != null && declaredIn != f.callee())) {
+            return "`" + p.getSimpleName() + "` is read across a deferred-execution boundary "
+                    + "(a lambda or a local/anonymous class) and is not bound (DEFERRED_EXECUTION)";
+        }
+        return f.refusalFor(p);
+    }
+
+    /** Is {@code read} written directly in {@code f}'s callee, with no body between? */
+    private static boolean ownedBy(CtElement read, BindingFrame f) {
+        if (read == null || f == null) return false;
+        try {
+            return read.getParent(CtExecutable.class) == f.callee();
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /**
@@ -186,16 +309,21 @@ public final class TransitionResolver {
      * admits (a pattern binding) is discriminated within the callee itself.
      *
      * <p>F24 stated that as a separate set of "selector parameters". It is the same
-     * statement read off {@link #foldFrames}: the subset whose bound expression
+     * statement read off the current {@link BindingFrame}: the subset whose bound expression
      * satisfies {@link CompositionVeto#isCurrentState}, the shared predicate for
      * the three ways a walk knows the from-state. Asking the map rather than
      * keeping a parallel set is what stops the two drifting.
      */
     private boolean selectorHoldsCurrentState(CtVariable<?> decl, CtVariableAccess<?> read,
-                                              int frame) {
-        if (foldFrames.isEmpty()) return true;   // no fold in progress: rule 4 as it was
-        if (!(decl instanceof CtParameter<?>)) return true;
-        if (frame < 0) {
+                                              BindingFrame f) {
+        if (activity == 0) return true;   // no fold in progress: rule 4 as it was
+        if (!(decl instanceof CtParameter<?>)) {
+            // A pattern binding is discriminated within the callee itself — unless
+            // the switch that bound it was shown to discriminate something OTHER
+            // than the current state, in which case the binding is that other value.
+            return !boundByForeignSwitch(decl);
+        }
+        if (f == null) {
             // Rule (5) has walked back OUT to the caller's own body to resolve the
             // expression it passed. Rule 4 must not widen there: the fold reached
             // this point only because the callee's parameter was NOT the current
@@ -205,12 +333,196 @@ public final class TransitionResolver {
             // answers it, asked of the read rather than of a binding.
             return CompositionVeto.isCurrentState(read);
         }
-        CtExpression<?> bound = boundArgument(decl, frame);
+        CtExpression<?> bound = boundArgument(decl, read, f);
         return bound != null && CompositionVeto.isCurrentState(bound);
     }
 
     public List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName) {
-        return resolve(expr, fromSimpleName, null, new HashSet<>(), 0, foldFrames.size() - 1);
+        // The cycle guard is IDENTITY-keyed — the F13 rule, and F29 found it missing
+        // here. Spoon gives CtElement deep structural equality, so `Lamp x` in one
+        // forwarder and `Lamp x` in the next compare equal: a HashSet answered "seen"
+        // at the second hop of any chain that reuses a parameter name, and rule (5)
+        // stopped there. Reusing the name is the ordinary case (`state`, `next`), so
+        // F25's transitive binding held only for chains nobody writes.
+        Set<CtElement> seen = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        return resolve(expr, fromSimpleName, null, seen, 0, frame);
+    }
+
+    // ---- what holds the current state (receiver slot, foreign switches) -------
+
+    /**
+     * Does {@code e}, written in frame {@code f}, denote the state currently being
+     * succeeded? {@code TRUE}/{@code FALSE} when the frames can say, {@code null}
+     * when they cannot (a parameter the caller's binding was refused for).
+     *
+     * <p>This is the question F24 asked of a folded parameter, asked of the two
+     * other things that had been ASSUMED to hold the current state inside a fold
+     * without anything checking it:
+     * <ul>
+     *   <li><b>{@code this}.</b> Every {@code this} read as a self-loop to the
+     *       caller's from-state, because there was no receiver slot to ask. That
+     *       is exact when the caller wrote {@code i.advance()} with {@code i} the
+     *       matched state, and a fabrication when it wrote {@code
+     *       DEFAULT.advance()} or {@code new Armed().settle()}: the target is the
+     *       receiver, not the source.</li>
+     *   <li><b>A state switch's selector</b> (see {@link #selectorCurrentness}).</li>
+     * </ul>
+     * Both now answer from the SAME frames the parameter bindings live in, so there
+     * is one notion of "what holds the current state" rather than three.
+     */
+    private Boolean currentness(CtExpression<?> e, BindingFrame f, int depth) {
+        if (e == null || depth > MAX_INITIALIZER_DEPTH + 8) return null;
+        if (e instanceof CtThisAccess<?> || e instanceof CtSuperAccess<?>) {
+            // In the host, `this` is the current state exactly when it is a state
+            // at all — a per-state method's receiver. (A driver's `this` is not
+            // hierarchy-typed and never reaches a state-valued position.)
+            if (f == null) return Boolean.TRUE;
+            if (!ownedBy(e, f) || !isOwnThis(e, f)) return Boolean.FALSE;
+            CtExpression<?> receiver = f.receiver();
+            return receiver == null ? Boolean.FALSE : currentness(receiver, f.caller(), depth + 1);
+        }
+        if (f == null) return CompositionVeto.isCurrentState(e) ? Boolean.TRUE : Boolean.FALSE;
+        if (e instanceof CtVariableAccess<?> va && va.getVariable() != null) {
+            CtVariable<?> decl = va.getVariable().getDeclaration();
+            if (decl instanceof CtParameter<?>) {
+                CtExpression<?> bound = boundArgument(decl, e, f);
+                return bound == null ? null : currentness(bound, f.caller(), depth + 1);
+            }
+            if (decl != null && !(decl instanceof CtField<?>) && !(decl instanceof CtLocalVariable<?>)
+                    && !boundByForeignSwitch(decl)) {
+                return CompositionVeto.isCurrentState(e) ? Boolean.TRUE : Boolean.FALSE;
+            }
+            if (decl instanceof CtLocalVariable<?> && !boundByForeignSwitch(decl)
+                    && CompositionVeto.isCurrentState(e)) {
+                // a pattern binding Spoon models as a local variable
+                return Boolean.TRUE;
+            }
+        }
+        return Boolean.FALSE;
+    }
+
+    /**
+     * Does the switch whose selector is {@code selector}, walked in the current
+     * frame, discriminate the CURRENT state? Answered only where a frame can say —
+     * the selector is the folded callee's {@code this} or one of its parameters —
+     * and {@code null} everywhere else, which leaves the walk exactly as it was.
+     *
+     * <p>F18 made a state switch inside a folded body context-sensitive: arms for
+     * states the caller already excluded are skipped, and the arm labels become the
+     * source states. That is right when the switched value IS the current state
+     * ({@code escalate(current)}), and wrong when the caller handed the callee some
+     * OTHER state: {@code pick(new Armed(), e)} from the {@code Idle} arm, with
+     * {@code pick} switching on its parameter, skipped the {@code Armed} arm as
+     * "unreachable" and published the {@code Idle} arm's result — a fabricated
+     * edge and a dropped one, behind a clean score. The binding is what says which
+     * case it is, so the binding is what is asked.
+     */
+    Boolean selectorCurrentness(CtExpression<?> selector) {
+        if (activity == 0 || frame == null || selector == null) return null;
+        if (selector instanceof CtThisAccess<?> || selector instanceof CtSuperAccess<?>) {
+            return currentness(selector, frame, 0);
+        }
+        if (selector instanceof CtVariableAccess<?> va && va.getVariable() != null
+                && va.getVariable().getDeclaration() instanceof CtParameter<?> p
+                && ownedBy(selector, frame)) {
+            CtExpression<?> bound = frame.argumentFor(p);
+            return bound == null ? null : currentness(bound, frame.caller(), 0);
+        }
+        return null;
+    }
+
+    /** Is {@code decl} a pattern binding of an arm of a switch read as foreign? */
+    private boolean boundByForeignSwitch(CtVariable<?> decl) {
+        if (foreignSwitches.isEmpty() || decl == null) return false;
+        try {
+            CtCase<?> arm = decl.getParent(CtCase.class);
+            return arm != null && foreignSwitches.contains(arm.getParent());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Is this {@code this} the callee's own receiver, rather than a qualified
+     * {@code Outer.this}? The type it denotes must be the callee's declaring type.
+     */
+    private static boolean isOwnThis(CtExpression<?> thisAccess, BindingFrame f) {
+        try {
+            if (!(f.callee() instanceof CtMethod<?> m) || m.getDeclaringType() == null) return false;
+            CtTypeReference<?> t = thisAccess.getType();
+            return t != null && t.getQualifiedName().equals(m.getDeclaringType().getQualifiedName());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * {@code this} inside a folded callee is the RECEIVER the caller wrote, read in
+     * the caller's frame — the slot F25 did not have. Outside any fold it is the
+     * current state, as it always was.
+     */
+    private List<Candidate> fromThis(CtExpression<?> thisAccess, String fromSimpleName, String guard,
+                                     Set<CtElement> seen, int depth, BindingFrame f) {
+        if (f == null) {
+            return List.of(fromSimpleName != null
+                    ? Candidate.of(fromSimpleName, guard, SuccessorForm.SELF)
+                    : Candidate.unresolved(guard, safeText(thisAccess)));
+        }
+        CtExpression<?> receiver = f.receiver();
+        if (!ownedBy(thisAccess, f) || !isOwnThis(thisAccess, f) || receiver == null) {
+            return List.of(Candidate.unresolved(guard, safeText(thisAccess))
+                    .through("`this` is not the callee's own receiver here "
+                            + "(a static callee, a nested body, or a qualified outer `this`)"));
+        }
+        String hop = "`this` := receiver " + BindingFrame.describe(receiver)
+                + " of " + f.describeCallSite();
+        if (Boolean.TRUE.equals(currentness(receiver, f.caller(), 0))) {
+            return List.of(fromSimpleName != null
+                    ? Candidate.of(fromSimpleName, guard, SuccessorForm.SELF).through(hop)
+                    : Candidate.unresolved(guard, safeText(thisAccess)));
+        }
+        if (depth >= MAX_INITIALIZER_DEPTH || !seen.add(thisAccess)) {
+            return List.of(Candidate.unresolved(guard, safeText(thisAccess)));
+        }
+        if (receiver instanceof CtThisAccess<?> || receiver instanceof CtSuperAccess<?>) {
+            return fromThis(receiver, fromSimpleName, guard, seen, depth + 1, f.caller()).stream()
+                    .map(c -> c.through(hop)).toList();
+        }
+        List<Candidate> viaReceiver = resolve(receiver, fromSimpleName, guard, seen, depth + 1, f.caller());
+        return deferIfCallerCanRead(viaReceiver, receiver, f.caller(), guard, hop);
+    }
+
+    /**
+     * The pure reading of a bound expression, or — when that reading failed and the
+     * expression is one the extractor's analysis reads further than this class does
+     * — the expression handed back with its frame (see {@link Deferred}). The
+     * choice is made on the expression's SHAPE, exactly as the extractor's
+     * {@code handleValue} makes it for a value the caller produced itself, so the
+     * bound expression gets precisely the treatment it would have had there.
+     */
+    private List<Candidate> deferIfCallerCanRead(List<Candidate> pure, CtExpression<?> bound,
+                                                 BindingFrame writtenIn, String guard, String hop) {
+        boolean allUnresolved = !pure.isEmpty() && pure.stream().noneMatch(Candidate::resolved);
+        if (allUnresolved && callerReadsFurther(bound)) {
+            String raw = pure.get(0).raw();
+            return List.of(new Candidate(null, guard, false, raw, null,
+                    new Deferred(bound, writtenIn, hop), List.of()));
+        }
+        return pure.stream().map(c -> c.through(hop)).toList();
+    }
+
+    /**
+     * The expression shapes the extractor reads beyond the pure resolver: a call
+     * (the inter-procedural fold), a switch expression (the arm walk), and a read of
+     * a reassigned local (reaching definitions, F1).
+     */
+    private static boolean callerReadsFurther(CtExpression<?> e) {
+        if (e instanceof CtInvocation<?> || e instanceof CtSwitchExpression<?, ?>) return true;
+        if (e instanceof CtVariableAccess<?> va && va.getVariable() != null
+                && va.getVariable().getDeclaration() instanceof CtLocalVariable<?>) {
+            return isReassigned(va.getVariable());
+        }
+        return false;
     }
 
     /**
@@ -224,7 +536,7 @@ public final class TransitionResolver {
      * dispatch selector, a helper call — yields an <em>unresolved</em> candidate.
      */
     private List<Candidate> resolve(CtExpression<?> expr, String fromSimpleName, String guard,
-                                    Set<CtElement> seen, int depth, int frame) {
+                                    Set<CtElement> seen, int depth, BindingFrame frame) {
         List<Candidate> out = new ArrayList<>();
         if (expr == null) {
             return out;
@@ -246,11 +558,9 @@ public final class TransitionResolver {
             return out;
         }
 
-        // return this  ->  self-loop
+        // return this  ->  self-loop at a dispatch; the RECEIVER inside a fold
         if (expr instanceof CtThisAccess<?>) {
-            out.add(fromSimpleName != null
-                    ? Candidate.of(fromSimpleName, guard, SuccessorForm.SELF)
-                    : Candidate.unresolved(guard, safeText(expr)));
+            out.addAll(fromThis(expr, fromSimpleName, guard, seen, depth, frame));
             return out;
         }
 
@@ -336,7 +646,7 @@ public final class TransitionResolver {
      */
     private List<Candidate> fromVariable(CtVariableAccess<?> va, String guard, CtExpression<?> raw,
                                          String fromSimpleName, Set<CtElement> seen, int depth,
-                                         int frame) {
+                                         BindingFrame frame) {
         CtVariableReference<?> vref = va.getVariable();
         if (vref == null) return List.of(Candidate.unresolved(guard, safeText(raw)));
 
@@ -366,7 +676,12 @@ public final class TransitionResolver {
             if (init != null && !(init instanceof CtVariableAccess<?> self && refersTo(self, vref))
                     && seen.add(decl)) {
                 List<Candidate> viaInit = resolve(init, fromSimpleName, guard, seen, depth + 1, frame);
-                if (viaInit.stream().allMatch(Candidate::resolved) && !viaInit.isEmpty()) {
+                // A DEFERRED reading counts as a reading here: the variable is never
+                // reassigned, so it holds exactly its initializer, and an initializer
+                // that is a bound call (`H x = p;` with `p` bound to a factory) is read
+                // by the caller's own analysis — the same as `return p;` would be.
+                if (!viaInit.isEmpty()
+                        && viaInit.stream().allMatch(c -> c.resolved() || c.deferred() != null)) {
                     SuccessorForm form = decl instanceof CtField<?>
                             ? SuccessorForm.SINGLETON_FIELD
                             : SuccessorForm.LOCAL_VARIABLE;
@@ -416,13 +731,23 @@ public final class TransitionResolver {
         // and MAX_INITIALIZER_DEPTH are the shared cycle guards, so a recursive or
         // mutually recursive forwarder terminates here rather than looping, and
         // terminates UNRESOLVED rather than guessing.
-        CtExpression<?> bound = boundArgument(decl, frame);
+        CtExpression<?> bound = boundArgument(decl, va, frame);
         if (bound != null && depth < MAX_INITIALIZER_DEPTH && seen.add(decl)) {
+            String hop = "`" + decl.getSimpleName() + "` := " + BindingFrame.describe(bound)
+                    + " at " + frame.describeCallSite();
             List<Candidate> viaArgument =
-                    resolve(bound, fromSimpleName, guard, seen, depth + 1, frame - 1);
-            if (!viaArgument.isEmpty()) return viaArgument;
+                    resolve(bound, fromSimpleName, guard, seen, depth + 1, frame.caller());
+            if (!viaArgument.isEmpty()) {
+                return deferIfCallerCanRead(viaArgument, bound, frame.caller(), guard, hop);
+            }
         }
-        return List.of(Candidate.unresolved(guard, safeText(raw)));
+        Candidate gap = Candidate.unresolved(guard, safeText(raw));
+        String why = unboundReason(decl, va, frame);
+        if (why == null && bound != null) {
+            why = "the binding of `" + decl.getSimpleName() + "` was not followed further: "
+                    + "the chain exceeded its depth bound or revisited itself";
+        }
+        return List.of(why == null ? gap : gap.through(why));
     }
 
     /**

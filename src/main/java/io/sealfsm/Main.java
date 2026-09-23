@@ -130,6 +130,7 @@ public final class Main {
         printUnreadDeclarationNote(result);
         printEncodingRollup(result);
         printExplanations(result);
+        printBindingTraces(result);
         if (!quiet && !result.diagnostics().isEmpty()) {
             System.out.println("-".repeat(72));
             System.out.println("Diagnostics:");
@@ -156,6 +157,28 @@ public final class Main {
             System.out.println("  " + e.where());
             for (String predicate : e.predicates()) {
                 System.out.println("      - " + predicate);
+            }
+        }
+    }
+
+    /**
+     * How each machine's inter-procedural values were bound, or why they were not
+     * ({@code --explain}). Printed regardless of {@code --quiet}, for the reason
+     * {@link #printExplanations} is: it was asked for. It is what lets a reader
+     * tell a capability gap (a binding the traversal should have carried) from a
+     * scope limit (a rule that refused it on purpose) — the two look identical as
+     * an unresolved edge in the output files.
+     */
+    private static void printBindingTraces(ExtractionResult result) {
+        if (result.bindingTraces().isEmpty()) return;
+        System.out.println();
+        System.out.println("-".repeat(112));
+        System.out.println("How inter-procedural values were bound, and why some were not (--explain):");
+        for (ExtractionResult.BindingTrace t : result.bindingTraces()) {
+            System.out.println();
+            System.out.println("  " + t.where());
+            for (String line : t.lines()) {
+                System.out.println("      - " + line);
             }
         }
     }
@@ -400,7 +423,10 @@ public final class Main {
                                 noClasspath either way.
               --quiet           Suppress the diagnostics listing
               --explain         For every REJECTED sealed root, print each
-                                classifier predicate and why it failed
+                                classifier predicate and why it failed; for
+                                every machine, print the binding chain each
+                                inter-procedural value travelled, and the rule
+                                that stopped each one that did not resolve
               -h, --help        Show this help
             """);
     }

@@ -160,9 +160,13 @@ public final class Analyzer {
             // composite state and once as a machine of its own.
             claimed.addAll(hierarchy);
             TransitionExtractor te =
-                    new TransitionExtractor(hierarchy, root.getQualifiedName(), states.naming());
+                    new TransitionExtractor(hierarchy, root.getQualifiedName(), states.naming())
+                            .explaining(explain);
             for (Transition t : te.extract(root, model)) {
                 machine.addTransition(t);
+            }
+            if (explain && !te.bindingTrace().isEmpty()) {
+                result.traceBindings(root.getQualifiedName(), te.bindingTrace());
             }
             // F4: register the closed-world event alphabet Σ, so it is complete
             // even for events the transition function ignores (no edge carries them).

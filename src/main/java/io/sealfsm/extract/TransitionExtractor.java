@@ -3,6 +3,7 @@ package io.sealfsm.extract;
 import io.sealfsm.detect.CarrierTransitionDetector;
 import io.sealfsm.detect.DispatchCommitDetector;
 import io.sealfsm.detect.dispatch.CalleeBody;
+import io.sealfsm.detect.dispatch.CallTarget;
 import io.sealfsm.detect.dispatch.CasePatterns;
 import io.sealfsm.detect.dispatch.Commit;
 import io.sealfsm.detect.dispatch.CommitClassifier;
@@ -256,10 +257,60 @@ public final class TransitionExtractor {
     private CommitForm dispatchCommit = null;
 
     // F3: bounded inter-procedural resolution. k = 2 keeps the fixed analysis
-    // terminating; the stack also detects recursion cycles.
-    private static final int MAX_INTERPROC_DEPTH = 2;
-    private final Deque<String> interProcStack = new ArrayDeque<>();
+    // terminating; the frame chain also detects recursion cycles.
+    //
+    // The budget is overridable by the `sealfsm.maxInterprocDepth` system property
+    // for ONE purpose: the depth sweep in scripts/depth-sweep.sh, which is the
+    // empirical justification for the default and has to be re-runnable rather
+    // than a hand edit of this constant that someone must remember to revert.
+    static final int DEFAULT_MAX_INTERPROC_DEPTH = 2;
+    private static final int MAX_INTERPROC_DEPTH =
+            Math.max(0, Integer.getInteger("sealfsm.maxInterprocDepth", DEFAULT_MAX_INTERPROC_DEPTH));
     private int interProcResolvedEdges = 0;
+    // How many folds (and evaluations on a fold's behalf) are physically in
+    // progress. `top` for the resolved-edge statistic is "none", which is not the
+    // same as "the resolver's frame is the host": a deferred argument is evaluated
+    // in the host frame while a fold is still open around it.
+    private int foldActivations = 0;
+    // F29: which body a call RUNS. Built lazily, on the first fold, from the model
+    // `extract` was handed — a machine that never folds never pays for the scan.
+    private CtModel model;
+    private CallTarget.Index callTargets;
+    // F29: calls not folded because the statically bound body is not the unique
+    // runtime target (overridden in the model, an overload chosen by guess under
+    // noClasspath, or an unresolved receiver). Each is recorded unresolved by the
+    // caller exactly as any other unsummarisable call is; the count is reported.
+    private final Set<String> nonUniqueCallees = new LinkedHashSet<>();
+    // F29: bound expressions currently being evaluated in their caller's frame.
+    // The cycle guard for deferral — each one is a distinct source node, so a chain
+    // of deferrals is finite — identity-keyed, the F13 rule.
+    private final Set<CtExpression<?>> deferralsInProgress =
+            Collections.newSetFromMap(new IdentityHashMap<>());
+    // F29: the binding hops of the deferred evaluations in progress, outermost
+    // first, so an edge emitted inside one can report the chain it travelled.
+    private final List<String> bindingTrail = new ArrayList<>();
+    private int deferredEvaluations = 0;
+    // F29: the void callee currently being folded at a probed arm, or null. While
+    // set, a write to a ROOT-typed field is the produced successor (the probe's own
+    // commit clause), a returned value is not (the caller discarded it, JLS §14.8),
+    // and a nested committing call is folded in turn or marks the fold incomplete.
+    private VoidFold voidFold = null;
+    private int voidFoldedArms = 0;
+
+    /** The state of one fold into a callee whose COMMIT, not whose value, is the successor. */
+    private static final class VoidFold {
+        final CtMethod<?> callee;
+        final Set<CtAssignment<?, ?>> accounted =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        boolean incomplete = false;
+
+        VoidFold(CtMethod<?> callee) {
+            this.callee = callee;
+        }
+    }
+    // --explain: collected only when asked for; never consulted by a decision.
+    private boolean explaining = false;
+    private final Set<String> bindingTrace = new LinkedHashSet<>();
 
     // F9: calls to an in-model helper that provably cannot return normally. The
     // arms they occupy carry no transition, so no edge is emitted; the count is
@@ -523,6 +574,28 @@ public final class TransitionExtractor {
         return diagnostics;
     }
 
+    /**
+     * Collect the {@code --explain} binding trace: for every edge resolved through
+     * a parameter or receiver binding, the chain of hops it travelled; for every
+     * call the fold declined, and every binding it refused, the rule that stopped
+     * it. Off by default — it is a side channel narrating decisions, never an input
+     * to one, and the output files are identical either way.
+     */
+    public TransitionExtractor explaining(boolean on) {
+        this.explaining = on;
+        return this;
+    }
+
+    /** The binding trace collected when {@link #explaining} is on, in walk order. */
+    public List<String> bindingTrace() {
+        return new ArrayList<>(bindingTrace);
+    }
+
+    /** The largest inter-procedural depth this build folds to (see the field). */
+    public static int maxInterproceduralDepth() {
+        return MAX_INTERPROC_DEPTH;
+    }
+
     /** The event alphabet Σ recovered from sealed/enum event parameters (F4). */
     public Set<String> alphabet() {
         return alphabet;
@@ -557,6 +630,8 @@ public final class TransitionExtractor {
 
     public List<Transition> extract(CtType<?> root, CtModel model) {
         Set<Transition> out = new LinkedHashSet<>();
+        this.model = model;
+        this.callTargets = null;
 
         // ONE recognition call. Every body this method walks comes from a
         // DispatchSite, and the site says which locus produced it; the extractor no
@@ -721,6 +796,20 @@ public final class TransitionExtractor {
             diagnostics.add(interProcResolvedEdges + " transition target(s) resolved via bounded "
                     + "inter-procedural summaries (depth ≤ " + MAX_INTERPROC_DEPTH
                     + "); precision-sensitive — audit separately");
+        }
+        if (voidFoldedArms > 0) {
+            diagnostics.add(voidFoldedArms + " dispatched arm(s) commit inside a callee whose "
+                    + "installed successor was resolved by folding it with the arm's argument "
+                    + "bindings (F29). The commit is still the one the k = 1 probe proved; only "
+                    + "the successor was recovered, on the fold's own budget");
+        }
+        if (!nonUniqueCallees.isEmpty()) {
+            diagnostics.add(nonUniqueCallees.size() + " call(s) " + sample(nonUniqueCallees)
+                    + " were not folded because the body they bind to is not provably the one "
+                    + "that runs — a virtual call overridden in the model, an overload Spoon "
+                    + "chose by guess for an argument of unresolved type, or a receiver whose "
+                    + "type did not resolve. Each is recorded unresolved rather than summarised "
+                    + "from the wrong body (F29; --explain names the rule per call)");
         }
         if (unreadableReturns > 0) {
             diagnostics.add(unreadableReturns + " return(s) of an in-model helper could not be "
@@ -1519,7 +1608,21 @@ public final class TransitionExtractor {
         // (0) F21: the call never returns, so it wraps nothing and yields nothing.
         // The arm is an undefined input, exactly as `throw illegal(...)` would be.
         if (callsNonReturningHelper(value)) {
-            nonReturningCalls++;
+            // F29: F9 is exact about the body it reads, so it may only read the body
+            // that RUNS. When another body in the model can run instead, the bound
+            // one always throwing proves nothing about the call — and the call is not
+            // a carrier either (unwrapping it is what F21 exists to prevent). What is
+            // left is a gap with a known source: recorded, never suppressed.
+            CallTarget.Result target = CallTarget.of((CtInvocation<?>) value, callTargets());
+            if (target.unique()) {
+                nonReturningCalls++;
+            } else {
+                nonUniqueCallees.add(safeText(value));
+                explainRefusal((CtInvocation<?>) value, from, event,
+                        String.valueOf(target.refusal()), target.detail());
+                out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from,
+                        event, guard, safeText(value)), event));
+            }
             return;
         }
 
@@ -2022,12 +2125,45 @@ public final class TransitionExtractor {
         if (!producesState && !producesCarrier) {
             return false; // not a state-producing call
         }
-        if (!(exe.getExecutableDeclaration() instanceof CtMethod<?> callee) || callee.getBody() == null) {
+        CtMethod<?> bound = CallTarget.boundDeclaration(inv);
+        if (bound == null || bound.getBody() == null) {
+            if (bound != null && !isShadow(bound)) {
+                explainRefusal(inv, from, event, "NO_BODY", "the bound declaration "
+                        + bound.getSignature() + " is abstract or an interface method with no "
+                        + "implementation in the source set");
+            } else {
+                explainRefusal(inv, from, event, "LIBRARY", "the call binds to "
+                        + (bound == null ? "no declaration" : bound.getSignature())
+                        + " outside the source set, so there is no body to fold (F11) — "
+                        + "whatever it runs, including a stored lambda, is not read");
+            }
             return false; // library / abstract / unavailable in the model
         }
-        String sig = callee.getSignature();
-        if (interProcStack.size() >= MAX_INTERPROC_DEPTH || interProcStack.contains(sig)) {
-            return false; // depth budget exhausted or recursion cycle
+        // F29 — the body the call RUNS, not merely the one Spoon bound it to. A
+        // shadow is exempt from the question: it is never summarised (F11), so
+        // asking which shadow runs would only spend the index on library calls.
+        CtMethod<?> callee = bound;
+        if (!isShadow(bound)) {
+            CallTarget.Result target = CallTarget.of(inv, callTargets());
+            if (!target.unique()) {
+                nonUniqueCallees.add(safeText(inv));
+                explainRefusal(inv, from, event, String.valueOf(target.refusal()), target.detail());
+                return false;
+            }
+            callee = target.method();
+        }
+        BindingFrame caller = resolver.frame();
+        int depth = caller == null ? 1 : caller.depth() + 1;
+        if (depth > MAX_INTERPROC_DEPTH) {
+            explainRefusal(inv, from, event, "DEPTH_EXCEEDED", "entering "
+                    + callee.getSignature() + " would be hop " + depth + " of a budget of "
+                    + MAX_INTERPROC_DEPTH);
+            return false; // depth budget exhausted
+        }
+        if (caller != null && caller.onChain(callee)) {
+            explainRefusal(inv, from, event, "RECURSION", callee.getSignature()
+                    + " is already being summarised on this call chain");
+            return false; // recursion cycle, decided on the declaration's identity
         }
         // F9: a callee that provably cannot return normally produces no successor,
         // so the arm holding this call carries no transition at all. This must be
@@ -2051,19 +2187,33 @@ public final class TransitionExtractor {
         // exclusion, F10's synthetic yields, F6's exceptional flow — instead of
         // re-deriving them here and drifting.
         List<CtReturn<?>> owned = ownedReturns(callee);
-        if (owned.isEmpty()) return false; // no return of its own: nothing to summarise
+        if (owned.isEmpty()) {
+            if (isShadow(callee)) {
+                explainRefusal(inv, from, event, "LIBRARY", "the bound declaration "
+                        + callee.getSignature() + " is outside the source set, so there is no "
+                        + "body to fold (F11) — whatever it runs, including a stored lambda, "
+                        + "is not read");
+            }
+            return false; // no return of its own: nothing to summarise
+        }
 
         Set<CtReturn<?>> enclosing = accountedReturns;
         Set<CtReturn<?>> accounted = Collections.newSetFromMap(new IdentityHashMap<>());
         accountedReturns = accounted;
-        boolean top = interProcStack.isEmpty();
+        boolean top = foldActivations == 0;
         int resolvedBefore = top ? countResolved(out) : 0;
-        interProcStack.push(sig);
-        // F25 — the frame is pushed and popped WITH the signature stack, because
-        // the two are one thing: a frame of the fold is a callee together with what
-        // its caller handed it. Keeping them in step structurally is what stops a
-        // binding outliving the body it belongs to.
-        resolver.pushFoldFrame(argumentBindings(inv, callee));
+        // F25/F29 — ONE frame: the callee, what its caller handed it, the receiver
+        // `this` denotes, and a link to the frame the call is written in. F25 kept
+        // the signature stack and the binding maps apart and pushed them together by
+        // convention; a single frame is what stops a binding outliving the body it
+        // belongs to, and what lets recursion be asked of the callee's identity.
+        // Built before any walker state changes, so nothing is left half-set.
+        BindingFrame frame = openFrame(inv, callee, caller);
+        // A value fold opened inside a void one reads its OWN returns as successors.
+        VoidFold enclosingVoidFold = voidFold;
+        voidFold = null;
+        resolver.enter(frame);
+        foldActivations++;
         try {
             // Walked in the *caller's* from-context, so a returned root-typed value
             // ("the current state") becomes a self-loop to the caller's from-state
@@ -2071,8 +2221,9 @@ public final class TransitionExtractor {
             // recurses under the depth budget.
             walk(callee.getBody(), from, event, guard, out);
         } finally {
-            resolver.popFoldFrame();
-            interProcStack.pop();
+            foldActivations--;
+            resolver.leave();
+            voidFold = enclosingVoidFold;
             accountedReturns = enclosing;
             if (top) interProcResolvedEdges += Math.max(0, countResolved(out) - resolvedBefore);
         }
@@ -2136,9 +2287,10 @@ public final class TransitionExtractor {
      *       is asked rather than re-derived — one notion of "reassigned", decided
      *       on declaration identity.</li>
      *   <li><b>Truncated positionally</b> on any arity mismatch, and a
-     *       <em>varargs</em> parameter is skipped outright: it collects the
-     *       remaining arguments into an array, so the positional match is not the
-     *       value it holds.</li>
+     *       <em>varargs</em> parameter is bound only when the call hands it an
+     *       explicit array — the one case in which the positional argument IS the
+     *       value it holds (JLS §15.12.4.2). Otherwise it collects the remaining
+     *       arguments into an array the source never wrote, and is left unbound.</li>
      * </ul>
      *
      * <p>F24's "selector parameters" — the ones the caller demonstrably handed the
@@ -2147,20 +2299,212 @@ public final class TransitionExtractor {
      * {@code TransitionResolver.selectorHoldsCurrentState}. One mechanism, not two:
      * a separate notion of "what a parameter holds" would eventually disagree with
      * this one, and the disagreement would be an edge.
+     *
+     * <p>F29 adds the RECEIVER as a slot of its own: the expression {@code this}
+     * denotes inside the callee, as the caller wrote it — {@code null} for a static
+     * callee, which has none.
      */
-    private Map<CtVariable<?>, CtExpression<?>> argumentBindings(CtInvocation<?> inv,
-                                                                 CtMethod<?> callee) {
-        Map<CtVariable<?>, CtExpression<?>> bound = new IdentityHashMap<>();
+    private BindingFrame openFrame(CtInvocation<?> inv, CtMethod<?> callee, BindingFrame caller) {
+        Map<CtParameter<?>, CtExpression<?>> bound = new IdentityHashMap<>();
+        Map<CtParameter<?>, String> refused = new IdentityHashMap<>();
         List<CtExpression<?>> args = inv.getArguments();
         List<CtParameter<?>> params = callee.getParameters();
-        for (int i = 0; i < Math.min(args.size(), params.size()); i++) {
+        for (int i = 0; i < params.size(); i++) {
             CtParameter<?> p = params.get(i);
+            if (p == null) continue;
+            if (i >= args.size()) {
+                refused.put(p, "`" + p.getSimpleName() + "` has no positional argument at "
+                        + BindingFrame.describe(inv) + " (UNBOUND)");
+                continue;
+            }
             CtExpression<?> arg = args.get(i);
-            if (p == null || arg == null || isVarArgs(p)) continue;
-            if (TransitionResolver.isReassigned(p, nameOnlyReassignmentChecks::add)) continue;
+            if (arg == null) continue;
+            if (isVarArgs(p) && !passesExplicitArray(args, params, i)) {
+                refused.put(p, "`" + p.getSimpleName() + "` is a varargs parameter the call "
+                        + "does not hand an explicit array, so it holds an array the source "
+                        + "never wrote (VARARGS)");
+                continue;
+            }
+            if (TransitionResolver.isReassigned(p, nameOnlyReassignmentChecks::add)) {
+                refused.put(p, "`" + p.getSimpleName() + "` is reassigned inside "
+                        + callee.getSignature() + ", so at the read it no longer holds the "
+                        + "argument (REASSIGNED_PARAMETER)");
+                continue;
+            }
             bound.put(p, arg);
         }
-        return bound;
+        return BindingFrame.open(inv, callee, bound, receiverOf(inv, callee), refused, caller);
+    }
+
+    /**
+     * The expression {@code this} denotes inside {@code callee}: the call's target
+     * as written — an implicit {@code this} for an unqualified instance call, whose
+     * meaning is then the CALLER's {@code this}. {@code null} for a static callee.
+     */
+    private static CtExpression<?> receiverOf(CtInvocation<?> inv, CtMethod<?> callee) {
+        try {
+            if (callee.isStatic()) return null;
+            CtExpression<?> target = inv.getTarget();
+            return target instanceof CtTypeAccess<?> ? null : target;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Does position {@code i} — the varargs slot — receive one explicit array? Only
+     * when it is the last argument, there is exactly one argument for it, and that
+     * argument's static type is an array: then the array IS the parameter's value.
+     */
+    private static boolean passesExplicitArray(List<CtExpression<?>> args,
+                                               List<CtParameter<?>> params, int i) {
+        if (i != params.size() - 1 || args.size() != params.size()) return false;
+        try {
+            return args.get(i).getType() instanceof spoon.reflect.reference.CtArrayTypeReference<?>;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** The note on an arm whose commit the probe proved and whose successor is unknown. */
+    private String probeMarker(CtInvocation<?> inv) {
+        return safeText(inv) + " — commit proven inside the callee (k = 1 probe); the "
+                + "successor it installs was not resolved";
+    }
+
+    /**
+     * F29 — fold a callee whose COMMIT, not whose value, carries the successor: the
+     * void (or value-discarding) callee of a bare call statement the k = 1 probe
+     * proved commits.
+     *
+     * <p>This is where the caller's argument was still discarded after F25, and
+     * for a structural reason rather than a missing binding: the fold entered only
+     * callees that RETURN a state, so {@code install(new Launching(), "go")} —
+     * whose body writes {@code this.state = next} — was never entered at all, and
+     * the arm could only ever be recorded as "commit proven, successor unknown".
+     * The binding frame is the same one a value fold opens; what differs is only
+     * what counts as a production inside it, and that is the probe's own clause
+     * ({@link CommitProbe#isRootFieldWrite}), so the fold resolves exactly the
+     * writes the probe counted and no others.
+     *
+     * <p>The probe is not made a resolver. It still decides the TIER — whether a
+     * commit exists, on declared types, at depth 1 — and this fold decides the
+     * SUCCESSOR, on expressions, within the k-budget every other fold spends. A
+     * callee the fold cannot open, or opens and resolves nothing in, leaves the
+     * probe's marker exactly as it was, which is also what keeps a machine like
+     * {@code examples/voidcommit} (successor an arithmetic index) byte-identical.
+     *
+     * <p>Completeness is asked as F18 asks it of returns: every owned root-field
+     * write the walk did not reach is recorded unresolved, and a nested committing
+     * call the fold could not enter keeps the probe's marker beside the resolved
+     * edges rather than letting them stand for the whole arm.
+     *
+     * @return {@code true} when the arm was handled — at least one successor
+     *         resolved — and {@code false} to leave the caller's marker in place
+     */
+    private boolean foldVoidCommit(CtInvocation<?> inv, String from, String event, String guard,
+                                   Set<Transition> out) {
+        CtMethod<?> bound = CallTarget.boundDeclaration(inv);
+        if (bound == null || !CalleeBody.wasRead(bound)) return false;
+        CallTarget.Result target = CallTarget.of(inv, callTargets());
+        if (!target.unique()) {
+            nonUniqueCallees.add(safeText(inv));
+            explainRefusal(inv, from, event, String.valueOf(target.refusal()), target.detail());
+            return false;
+        }
+        CtMethod<?> callee = target.method();
+        BindingFrame caller = resolver.frame();
+        int depth = caller == null ? 1 : caller.depth() + 1;
+        if (depth > MAX_INTERPROC_DEPTH) {
+            explainRefusal(inv, from, event, "DEPTH_EXCEEDED", "entering "
+                    + callee.getSignature() + " would be hop " + depth + " of a budget of "
+                    + MAX_INTERPROC_DEPTH);
+            return false;
+        }
+        if (caller != null && caller.onChain(callee)) {
+            explainRefusal(inv, from, event, "RECURSION", callee.getSignature()
+                    + " is already being summarised on this call chain");
+            return false;
+        }
+        List<CtAssignment<?, ?>> owned = new ArrayList<>();
+        for (CtAssignment<?, ?> a : callee.getBody().getElements(new TypeFilter<>(CtAssignment.class))) {
+            try {
+                if (a.getParent(CtExecutable.class) != callee) continue;
+            } catch (Throwable ignored) {
+                // unreadable parent chain: keep it, so an unwalked write is reported
+            }
+            if (CommitProbe.isRootFieldWrite(a, hierarchyQualifiedNames, rootQualifiedName)) owned.add(a);
+        }
+        if (owned.isEmpty()) return false;
+
+        Set<Transition> local = new LinkedHashSet<>();
+        VoidFold fold = new VoidFold(callee);
+        BindingFrame frame = openFrame(inv, callee, caller);
+        VoidFold enclosingFold = voidFold;
+        Set<CtReturn<?>> enclosingReturns = accountedReturns;
+        voidFold = fold;
+        accountedReturns = null;
+        resolver.enter(frame);
+        foldActivations++;
+        try {
+            walk(callee.getBody(), from, event, guard, local);
+        } finally {
+            foldActivations--;
+            resolver.leave();
+            voidFold = enclosingFold;
+            accountedReturns = enclosingReturns;
+        }
+        int unreached = 0;
+        for (CtAssignment<?, ?> w : owned) {
+            if (fold.accounted.contains(w)) continue;
+            unreached++;
+            local.add(mark(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
+                    truncate(safeText(w))), event));
+        }
+        if (local.stream().noneMatch(Transition::isResolved)) {
+            if (explaining) {
+                List<String> raws = new ArrayList<>();
+                for (Transition t : local) if (t.note() != null) raws.add(t.note());
+                explainRefusal(inv, from, event, "NOTHING_BOUND", "the callee was entered, but "
+                        + "the value its commit installs " + raws + " is not one the caller "
+                        + "handed it; the probe's gap marker stands");
+            }
+            return false;
+        }
+        unreadableReturns += unreached;
+        out.addAll(local);
+        if (fold.incomplete) {
+            out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
+                    probeMarker(inv)), event));
+        }
+        voidFoldedArms++;
+        return true;
+    }
+
+    /** Up to three members of {@code items}, for a diagnostic that names what it counts. */
+    private static String sample(Set<String> items) {
+        List<String> head = new ArrayList<>();
+        for (String s : items) {
+            if (head.size() == 3) break;
+            head.add(s.length() > 60 ? s.substring(0, 57) + "..." : s);
+        }
+        return head + (items.size() > head.size() ? " (+" + (items.size() - head.size()) + " more)" : "");
+    }
+
+    /** The shared call-target index, built on first use. */
+    private CallTarget.Index callTargets() {
+        if (callTargets == null) callTargets = new CallTarget.Index(model);
+        return callTargets;
+    }
+
+    /** Record, for {@code --explain}, a call the fold declined and the rule that declined it. */
+    private void explainRefusal(CtInvocation<?> inv, String from, String event,
+                                String rule, String detail) {
+        if (!explaining) return;
+        String what = "NOTHING_BOUND".equals(rule) ? "entered, nothing bound: " : "not folded: ";
+        bindingTrace.add(what + BindingFrame.describe(inv) + " from "
+                + (from == null ? "<unknown>" : from) + (event == null ? "" : " on " + event)
+                + " — " + rule + (detail == null ? "" : ": " + detail));
     }
 
     /** {@code CtParameter.isVarArgs()}, answering "no" when the model cannot say. */
@@ -2377,6 +2721,11 @@ public final class TransitionExtractor {
         } else if (node instanceof CtSwitch<?> sw) {
             walkSwitch(sw, from, event, guard, out);
         } else if (node instanceof CtReturn<?> ret) {
+            // F29: inside a callee folded for its COMMIT, a returned value is what
+            // the caller discarded (the call is a statement, JLS §14.8) — never a
+            // successor. Only that callee's own returns: a value fold opened below it
+            // clears `voidFold` for its own body.
+            if (voidFold != null) return;
             // F18: tell the enclosing inter-procedural fold, if any, that this
             // return was reached. Recorded BEFORE the descent, because descending
             // may start a nested fold that swaps the frame out.
@@ -2384,6 +2733,29 @@ public final class TransitionExtractor {
             handleValue(ret.getReturnedExpression(), from, event, guard, out);
         } else if (node instanceof CtYieldStatement ys) {
             handleValue(ys.getExpression(), from, event, guard, out);
+        } else if (node instanceof CtAssignment<?, ?> asg && voidFold != null) {
+            // F29: the commit the k = 1 probe proved, read by the probe's own clause,
+            // with the caller's argument bindings in scope — so `this.state = next`
+            // resolves `next` to what the arm handed the callee. Any other write in
+            // a void callee is local bookkeeping and produces nothing.
+            if (CommitProbe.isRootFieldWrite(asg, hierarchyQualifiedNames, rootQualifiedName)) {
+                voidFold.accounted.add(asg);
+                handleValue(asg.getAssignment(), from, event, guard, out);
+            }
+        } else if (node instanceof CtInvocation<?> inv && voidFold != null) {
+            // F29: a call statement inside a void callee. A recognised mutator is a
+            // commit whose value is its argument; a call the probe says commits is a
+            // further void callee, folded in turn within the budget — and when it
+            // cannot be, the fold is INCOMPLETE and the arm keeps its gap marker
+            // beside whatever did resolve. Anything else is plumbing (F10).
+            Commit commit = MutatorRecognizer.commitOfCall(inv, hierarchyQualifiedNames,
+                    rootQualifiedName);
+            if (commit != null) {
+                handleValue(commit.value(), from, event, guard, out);
+            } else if (CommitProbe.probe(List.of(inv), hierarchyQualifiedNames, rootQualifiedName) != null) {
+                VoidFold outer = voidFold;
+                if (!foldVoidCommit(inv, from, event, guard, out)) outer.incomplete = true;
+            }
         } else if (node instanceof CtAssignment<?, ?> asg) {
             // F2: an assignment to the *state field* is a transition site; the RHS
             // is the next-state expression (`this.state = new Locked();`). A bare
@@ -2435,10 +2807,17 @@ public final class TransitionExtractor {
             // is known (it is the arm), so recording nothing here would drop a
             // transition whose source is not in doubt, behind a clean-looking n/n.
             // Recorded unresolved, with the reason in the note.
+            //
+            // F29: successor identity is the FOLD's question, on the fold's own budget
+            // — the probe still asks only whether a commit exists. The fold now enters
+            // this callee with the arm's argument bindings, and where the write the
+            // probe proved installs a value the caller handed it, that value is the
+            // successor. Where it resolves nothing, the probe's marker stays exactly
+            // as it was: it says more than a list of unreadable writes would.
+            if (foldVoidCommit(inv, from, event, guard, out)) return;
             probedCommitEdges++;
             out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
-                    safeText(inv) + " — commit proven inside the callee (k = 1 probe); the "
-                            + "successor it installs was not resolved"), event));
+                    probeMarker(inv)), event));
         } else if (node instanceof CtTry tryStmt) {
             // F6: descend exceptional flow. The try body runs under the normal
             // guard; each catch under a synthetic "exception" guard (carrying the
@@ -2903,8 +3282,53 @@ public final class TransitionExtractor {
             return;
         }
         for (TransitionResolver.Candidate cand : resolver.resolve(value, from)) {
-            emit(from, event, merge(guard, cand.guard()), cand, out);
+            String g = merge(guard, cand.guard());
+            if (cand.deferred() != null && evaluateInWrittenFrame(cand.deferred(), from, event, g, out)) {
+                continue;
+            }
+            emit(from, event, g, cand, out);
         }
+    }
+
+    /**
+     * F29 — finish reading a bound expression with the caller's OWN analysis, in the
+     * frame it is written in (see {@link TransitionResolver.Deferred}).
+     *
+     * <p>The value arrived through a binding, so what it means is what it would have
+     * meant as a value the caller produced itself: a call there is folded, a switch
+     * expression walked, a reassigned local read through its reaching definitions.
+     * {@link #handleValue} is exactly that analysis, so it is reused rather than
+     * restated — a second reading of "what does this caller expression produce?"
+     * would drift from the first. Entering the written frame is what makes a fold
+     * opened from here link to the right caller, and what makes a parameter read
+     * inside the bound expression resolve against ITS frame's bindings rather than
+     * the callee's.
+     *
+     * <p>Terminates: each deferral is keyed on a distinct source node, and one that
+     * is already being evaluated further up answers {@code false}, which leaves the
+     * caller to record the same unresolved edge it recorded before deferral existed.
+     */
+    private boolean evaluateInWrittenFrame(TransitionResolver.Deferred d, String from, String event,
+                                           String guard, Set<Transition> out) {
+        if (!deferralsInProgress.add(d.expression())) return false;
+        deferredEvaluations++;
+        bindingTrail.add(d.hop() + " (evaluated in the caller's frame)");
+        // The expression belongs to the frame it is written in, not to any void
+        // callee being folded around it: its own writes are not that callee's commits.
+        VoidFold enclosingVoidFold = voidFold;
+        voidFold = null;
+        resolver.enter(d.frame());
+        foldActivations++;
+        try {
+            handleValue(d.expression(), from, event, guard, out);
+        } finally {
+            foldActivations--;
+            resolver.leave();
+            voidFold = enclosingVoidFold;
+            bindingTrail.remove(bindingTrail.size() - 1);
+            deferralsInProgress.remove(d.expression());
+        }
+        return true;
     }
 
     // ---- F1: reaching-definitions for reassigned locals ----------------------
@@ -3098,6 +3522,19 @@ public final class TransitionExtractor {
     private void walkSwitch(CtAbstractSwitch<?> sw, String from, String event,
                             String guard, Set<Transition> out) {
         boolean overState = isStateDispatch(sw);
+        // F29 — a state switch inside a folded body whose selector the frames show
+        // is NOT the current state (a parameter bound to `new Armed()`, a `this`
+        // whose receiver is some other state) is not a discrimination of the source.
+        // Its arm labels describe that other value, so they are neither source
+        // states nor grounds for skipping an arm: the from-state stays the caller's,
+        // and each arm's type test becomes a guard on the edges it produces. Only a
+        // FALSE answer changes anything; unknown leaves F18's reading in place.
+        boolean foreign = overState && from != null
+                && Boolean.FALSE.equals(resolver.selectorCurrentness(sw.getSelector()));
+        if (foreign) {
+            walkForeignSwitch(sw, from, event, guard, out);
+            return;
+        }
         boolean overEvent = !overState && isEventDispatch(sw);
         boolean overComponent = !overState && !overEvent && isComponentDispatch(sw);
         // F12 — arm order is part of the semantics. A later arm carrying the same
@@ -3201,28 +3638,154 @@ public final class TransitionExtractor {
             // unwrapped to the statement it really is — which also routes it back
             // through `walk`, where the F2 mutator branch can claim it. Inside an
             // arm's BLOCK a yield is always genuine, so this is a one-level rule.
-            boolean discardedArms = !(sw instanceof CtSwitchExpression<?, ?>);
             try {
-                CtElement leaked = leakedGuard(c);
-                for (String armFrom : caseFroms) {
-                    for (String caseEvent : caseEvents) {
-                        for (CtStatement st : c.getStatements()) {
-                            // The leaked `when` clause is the arm's guard, consumed
-                            // above; it is not part of the arm's body.
-                            if (st == leaked) continue;
-                            CtElement effective = st;
-                            if (discardedArms && st instanceof CtYieldStatement ys
-                                    && ys.getExpression() != null) {
-                                effective = ys.getExpression();
-                            }
-                            walk(effective, armFrom, caseEvent, caseGuard, out);
-                        }
-                    }
-                }
+                walkArm(sw, c, caseFroms, caseEvents, caseGuard, out);
             } finally {
                 componentEvent = savedComponent;
             }
         }
+    }
+
+    /** One arm's statements, once per (source, event) pair the arm stands for. */
+    private void walkArm(CtAbstractSwitch<?> sw, CtCase<?> c, List<String> froms,
+                         List<String> events, String caseGuard, Set<Transition> out) {
+        boolean discardedArms = !(sw instanceof CtSwitchExpression<?, ?>);
+        CtElement leaked = leakedGuard(c);
+        for (String armFrom : froms) {
+            for (String caseEvent : events) {
+                for (CtStatement st : c.getStatements()) {
+                    // The leaked `when` clause is the arm's guard, consumed
+                    // above; it is not part of the arm's body.
+                    if (st == leaked) continue;
+                    CtElement effective = st;
+                    if (discardedArms && st instanceof CtYieldStatement ys
+                            && ys.getExpression() != null) {
+                        effective = ys.getExpression();
+                    }
+                    walk(effective, armFrom, caseEvent, caseGuard, out);
+                }
+            }
+        }
+    }
+
+    /**
+     * F29 — a switch over a hierarchy value that is NOT the current state (see
+     * {@link TransitionResolver#selectorCurrentness}). Every arm may run, from the
+     * caller's from-state, and an arm's pattern is a test on that other value, so
+     * it becomes the guard of what the arm produces: {@code other instanceof
+     * Armed}. A {@code default} arm carries the negation of every unguarded label
+     * above it. F12's exclusion still applies, keyed by the type test rather than by
+     * the event: two arms testing different types are disjoint already, and
+     * negating one's {@code when} clause on the other would be a constraint the
+     * source does not impose.
+     *
+     * <p>The switch is marked foreign in the resolver for the duration, because a
+     * root-typed pattern binding of one of its arms is that other value too, and
+     * rule 4 must not read it as the current state.
+     */
+    private void walkForeignSwitch(CtAbstractSwitch<?> sw, String from, String event,
+                                   String guard, Set<Transition> out) {
+        String sel = safeText(sw.getSelector());
+        List<String> unguardedTests = new ArrayList<>();
+        Map<String, List<String>> guardsByTest = new LinkedHashMap<>();
+        // What the selector can hold, when the binding says exactly: `settle(new
+        // Blink())` makes it Blink, so only the arm that matches Blink runs and it
+        // needs no type guard. When the binding does not say (a refused binding, a
+        // call that did not fold), every leaf is possible and each arm carries its
+        // test. Either way the SOURCE stays the caller's from-state.
+        Set<String> possible = selectorStates(sw.getSelector(), from);
+        Set<String> initial = new LinkedHashSet<>(possible == null ? allLeaves : possible);
+        Set<String> remaining = new LinkedHashSet<>(initial);
+        boolean marked = resolver.markForeign(sw);
+        try {
+            for (CtCase<?> c : sw.getCases()) {
+                String label = caseFromState(c);
+                Set<String> covered = label == null ? new LinkedHashSet<>(remaining) : leavesOf(label);
+                Set<String> hit = new LinkedHashSet<>(covered);
+                hit.retainAll(remaining);
+                if (hit.isEmpty()) {
+                    markUnreachable(c);
+                    continue;
+                }
+                String ownGuard = caseGuard(c);
+                // The arm needs no test only when it covers EVERY value the selector
+                // could hold at all — asked of the initial set, not of what the arms
+                // above left over: the edges share one source, so an arm reached only
+                // because its siblings' tests failed must say so, or it reads as firing
+                // unconditionally beside them.
+                boolean certain = covered.containsAll(initial);
+                String test = armTypeTest(c, sel);
+                String labelGuard;
+                if (certain) {
+                    labelGuard = null;
+                } else if (test != null) {
+                    labelGuard = test;
+                } else if (unguardedTests.isEmpty()) {
+                    labelGuard = null;
+                } else {
+                    List<String> negated = new ArrayList<>();
+                    for (String t : unguardedTests) negated.add(negate(t));
+                    labelGuard = String.join(" && ", negated);
+                }
+                if (ownGuard == null) remaining.removeAll(hit);
+                String key = test == null ? "<default>" : test;
+                String caseGuard = merge(merge(merge(guard, labelGuard),
+                        priorExclusion(List.of(key), guardsByTest)), ownGuard);
+                if (ownGuard != null) {
+                    guardsByTest.computeIfAbsent(key, k -> new ArrayList<>()).add(ownGuard);
+                } else if (test != null) {
+                    unguardedTests.add(test);
+                }
+                walkArm(sw, c, Collections.singletonList(from), Collections.singletonList(event),
+                        caseGuard, out);
+            }
+        } finally {
+            if (marked) resolver.unmarkForeign(sw);
+        }
+    }
+
+    /**
+     * The leaf states a foreign switch's selector can hold, read through the same
+     * resolver every other value is read through — so a parameter bound to {@code
+     * new Blink()} answers {Blink} by rule (5), exactly as a returned read of it
+     * would. {@code null} when any reading is unresolved, deferred or guarded: then
+     * nothing is excluded and every arm carries its own test.
+     */
+    private Set<String> selectorStates(CtExpression<?> selector, String from) {
+        Set<String> states = new LinkedHashSet<>();
+        try {
+            for (TransitionResolver.Candidate c : resolver.resolve(selector, from)) {
+                if (!c.resolved() || c.guard() != null || c.targetSimpleName() == null) return null;
+                states.addAll(leavesOf(c.targetSimpleName()));
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        return states.isEmpty() ? null : states;
+    }
+
+    /**
+     * The test an arm's labels make of the selector, as source text — {@code sel
+     * instanceof T} for a type pattern, {@code sel == C} for an enum constant, a
+     * disjunction for several labels — or {@code null} for a {@code default}.
+     */
+    private String armTypeTest(CtCase<?> c, String sel) {
+        List<String> tests = new ArrayList<>();
+        try {
+            for (CtExpression<?> ce : c.getCaseExpressions()) {
+                CasePatterns.ConstantLabel k = CasePatterns.enumConstant(ce);
+                if (k != null) {
+                    tests.add(sel + " == " + k.constant());
+                    continue;
+                }
+                CtTypeReference<?> t = patternType(ce);
+                if (t != null) tests.add(sel + " instanceof " + t.getSimpleName());
+            }
+        } catch (Throwable ignored) {
+            // an unreadable label contributes no test: the arm is walked unguarded
+        }
+        if (tests.isEmpty()) return null;
+        return tests.size() == 1 ? tests.get(0) : "(" + String.join(" || ", tests) + ")";
     }
 
     /**
@@ -3327,6 +3890,7 @@ public final class TransitionExtractor {
 
     private void emit(String from, String event, String guard,
                       TransitionResolver.Candidate cand, Set<Transition> out) {
+        if (explaining) explainEdge(from, event, cand);
         if (cand.resolved()) {
             if (from == null) {
                 out.add(mark(Transition.unresolved("<entry>", event, guard,
@@ -3338,6 +3902,30 @@ public final class TransitionExtractor {
         } else {
             out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from,
                     event, guard, cand.raw()), event));
+        }
+    }
+
+    /**
+     * {@code --explain}: an edge that travelled at least one binding hop — a
+     * parameter bound to the caller's argument, a {@code this} bound to the
+     * caller's receiver, or a bound expression evaluated in its caller's frame —
+     * reports the chain, from the call written in the dispatch inward; an
+     * unresolved one reports the rule that stopped the chain. Edges that used no
+     * binding are not narrated: the trace is about the traversal, and the rest of
+     * the relation is already in the output files.
+     */
+    private void explainEdge(String from, String event, TransitionResolver.Candidate cand) {
+        List<String> hops = new ArrayList<>(bindingTrail);
+        hops.addAll(cand.via());
+        if (hops.isEmpty()) return;
+        String src = from == null ? "<unknown>" : from;
+        String ev = event == null ? "" : "--" + event;
+        if (cand.resolved()) {
+            bindingTrace.add("resolved " + src + " " + ev + "--> " + cand.targetSimpleName()
+                    + " through " + hops.size() + " binding hop(s): " + String.join("; ", hops));
+        } else {
+            bindingTrace.add("unresolved " + src + " " + ev + "--> ? (" + cand.raw() + "): "
+                    + String.join("; ", hops));
         }
     }
 
