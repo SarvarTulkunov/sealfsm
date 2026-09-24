@@ -410,8 +410,12 @@ public final class CarrierTransitionDetector {
         }
     }
 
-    /** The concrete state a production names, or {@code null} when it is {@code this}/opaque. */
-    private static String targetQualifiedName(CtExpression<?> value) {
+    /**
+     * The concrete state a production names, or {@code null} when it is {@code this}/opaque.
+     * Package-visible so {@link ContextCommitDetector}'s cross-state test is this
+     * one rather than a second notion of "names a sibling".
+     */
+    static String targetQualifiedName(CtExpression<?> value) {
         if (value instanceof CtConstructorCall<?> cc && cc.getType() != null) {
             return cc.getType().getQualifiedName();
         }

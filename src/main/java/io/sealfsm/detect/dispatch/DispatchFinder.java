@@ -68,7 +68,7 @@ public final class DispatchFinder {
      */
     public record Sites(List<DispatchSite> overrides, List<DispatchSite> carriers,
                         List<DispatchSite> centralized, List<DispatchSite> producers,
-                        List<DispatchSite> functional) {
+                        List<DispatchSite> functional, List<DispatchSite> contextCommits) {
 
         public List<DispatchSite> all() {
             List<DispatchSite> out = new ArrayList<>();
@@ -77,12 +77,13 @@ public final class DispatchFinder {
             out.addAll(functional);
             out.addAll(producers);
             out.addAll(carriers);
+            out.addAll(contextCommits);
             return out;
         }
 
         public boolean isEmpty() {
             return overrides.isEmpty() && carriers.isEmpty() && centralized.isEmpty()
-                    && producers.isEmpty() && functional.isEmpty();
+                    && producers.isEmpty() && functional.isEmpty() && contextCommits.isEmpty();
         }
     }
 
@@ -93,7 +94,8 @@ public final class DispatchFinder {
                 carrierSites(root),
                 centralizedMethodSites(root, model),
                 producerSites(root, model),
-                functionalSites(root, model));
+                functionalSites(root, model),
+                contextCommitSites(root));
     }
 
     // ---- POLYMORPHIC_OVERRIDE -------------------------------------------------
@@ -123,6 +125,18 @@ public final class DispatchFinder {
      */
     public static List<DispatchSite> carrierSites(CtType<?> root) {
         return sitesForMethods(CarrierTransitionDetector.findCarrierTransitionMethods(root));
+    }
+
+    /**
+     * The same locus again, reached by a method that installs its successor into
+     * a CONTEXT (F33, the GoF State pattern): {@code order.changeState(new Paid())}
+     * inside {@code CreatedState.pay}. Empty unless the hierarchy clears
+     * {@link io.sealfsm.detect.ContextCommitDetector#qualifies}, so a lone member
+     * writing some holder is not reported as a dispatch.
+     */
+    public static List<DispatchSite> contextCommitSites(CtType<?> root) {
+        if (!io.sealfsm.detect.ContextCommitDetector.qualifies(root)) return List.of();
+        return sitesForMethods(io.sealfsm.detect.ContextCommitDetector.findContextCommitMethods(root));
     }
 
     private static List<DispatchSite> sitesForMethods(List<CtMethod<?>> methods) {

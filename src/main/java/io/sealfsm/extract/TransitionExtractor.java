@@ -2,6 +2,7 @@ package io.sealfsm.extract;
 
 import io.sealfsm.detect.CarrierTransitionDetector;
 import io.sealfsm.detect.DispatchCommitDetector;
+import io.sealfsm.detect.ContextCommitDetector;
 import io.sealfsm.detect.dispatch.CalleeBody;
 import io.sealfsm.detect.dispatch.CallTarget;
 import io.sealfsm.detect.dispatch.CasePatterns;
@@ -186,7 +187,25 @@ public final class TransitionExtractor {
 
     /** How a walked body was discovered. */
     private enum Route { OVERRIDE, CARRIER, CENTRALIZED_METHOD, COMMIT_DISPATCH, FUNCTIONAL,
-                         MUTATION_FALLBACK }
+                         MUTATION_FALLBACK, CONTEXT_OVERRIDE }
+
+    /**
+     * F33: is the walker inside a per-state method that commits through a context
+     * (the GoF State pattern)? Such a method's own {@code return}s are not
+     * successors, and its context commits are.
+     */
+    private boolean inContextOverride() {
+        return walkSite != null && walkSite.route() == Route.CONTEXT_OVERRIDE;
+    }
+
+    // F33: the context-committing method being walked. Its OWN returns and commits
+    // are the ones the route reinterprets; a body the fold enters below it keeps
+    // the ordinary reading.
+    private CtMethod<?> contextHost = null;
+    // F33: (state, method) cells whose running body rejects the input by throwing.
+    // They are undefined inputs, not unresolved targets, and they are counted so
+    // the absence of their edges is stated rather than silent.
+    private int rejectingCells = 0;
 
     /**
      * Does the site being walked install its successor through a <em>carrier</em>?
@@ -674,6 +693,9 @@ public final class TransitionExtractor {
         for (CtMethod<?> m : distributed) {
             if (!helperSignatures.contains(m.getSignature())) distributedNames.add(m.getSimpleName());
         }
+        // F33: context-committing per-state methods are the same locus, so their
+        // names belong to the same question. `pay` beside `cancel` is the input.
+        for (CtMethod<?> m : methodHosts(sites.contextCommits())) distributedNames.add(m.getSimpleName());
         this.distributedNamesDiscriminate = distributedNames.size() > 1;
         Set<String> functionalNames = new LinkedHashSet<>();
         for (CtElement callable : functional) {
@@ -770,6 +792,20 @@ public final class TransitionExtractor {
             CtMethod<?> m = (CtMethod<?>) site.host();
             walkAt(site, Route.CARRIER, CommitForm.POLY_CARRIER, () -> extractCarrier(m, out));
         }
+        // F33: the GoF State pattern — per-state methods committing through a
+        // context. The source state is exact (the states the body runs in), the
+        // successor is what the commit installs.
+        for (DispatchSite site : sites.contextCommits()) {
+            CtMethod<?> m = (CtMethod<?>) site.host();
+            List<ContextCommitDetector.ContextCommit> commits =
+                    ContextCommitDetector.commitsOf(m, hierarchyQualifiedNames, rootQualifiedName);
+            CommitForm form = commits.isEmpty() ? CommitForm.MUTATOR_ARGUMENT : commits.get(0).form();
+            walkedHosts.add(methodKey(m));
+            walkAt(site, Route.CONTEXT_OVERRIDE, form, () -> extractContextCommit(m, out));
+        }
+        if (!sites.contextCommits().isEmpty()) {
+            accountRejectingCells(root, methodHosts(sites.contextCommits()));
+        }
 
         // F2: GoF / field-mutation encoding. A fallback, so it runs only when no
         // RETURN-based transition method exists: a hierarchy that already exposes a
@@ -788,8 +824,11 @@ public final class TransitionExtractor {
         // below, so nothing is counted twice.
         boolean onlyMutatorProducers = !producers.isEmpty()
                 && producers.stream().allMatch(p -> p.commit() == CommitForm.MUTATOR_ARGUMENT);
+        // F33 adds a third disjunct for the same reason: a context-committing
+        // machine is a mutation machine, and a commit none of its per-state methods
+        // claims (a context's own `reset()`) must still be recorded.
         if (distributed.isEmpty() && centralized.isEmpty() && functional.isEmpty()
-                && (out.isEmpty() || onlyMutatorProducers)) {
+                && (out.isEmpty() || onlyMutatorProducers || !sites.contextCommits().isEmpty())) {
             extractMutationEncoding(root, model, walkedHosts, out);
         }
         if (interProcResolvedEdges > 0) {
@@ -822,6 +861,12 @@ public final class TransitionExtractor {
                     + "the analysis read), the successor deliberately not chased. Each is recorded "
                     + "as an unresolved transition with a known source state — this is a Tier 2 "
                     + "machine, complete in its states and empty in its relation");
+        }
+        if (rejectingCells > 0) {
+            diagnostics.add(rejectingCells + " (state, method) cell(s) of the per-state interface "
+                    + "reject their input by throwing (an inherited default or an override). "
+                    + "They contributed no transition. They are undefined inputs, not unresolved "
+                    + "targets (F33)");
         }
         if (nonReturningCalls > 0) {
             diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
@@ -953,6 +998,61 @@ public final class TransitionExtractor {
             dispatchedStates.add(from);
             walk(method.getBody(), from, eventName(method, distributedNamesDiscriminate),
                     null, out);
+        }
+    }
+
+    /**
+     * F33: a per-state method committing through a context. Walked exactly like a
+     * value-returning override (same source states, same label rule), except that
+     * what counts as a production is the context commit, never the return value.
+     */
+    private void extractContextCommit(CtMethod<?> method, Set<Transition> out) {
+        if (method.getDeclaringType() == null) return;
+        CtMethod<?> saved = this.contextHost;
+        this.contextHost = method;
+        try {
+            for (String from : sourceStatesOf(method)) {
+                dispatchedStates.add(from);
+                walk(method.getBody(), from, eventName(method, distributedNamesDiscriminate),
+                        null, out);
+            }
+        } finally {
+            this.contextHost = saved;
+        }
+    }
+
+    /**
+     * F33: the cells of the per-state interface that REJECT their input.
+     *
+     * <p>The interface is the set of signatures some state commits through. For
+     * each one, every body declared in the hierarchy (a throwing {@code default} on
+     * the root, or a throwing override on a leaf) runs in exactly the states
+     * {@link #sourceStatesOf} computes. Where that body rejects by throwing, the
+     * cell has no successor by construction, so it contributes no edge. The state
+     * still counts as examined, because it WAS: this is what lets a state whose
+     * every input is rejected be reported terminal instead of merely unreached.
+     *
+     * <p>A body that neither commits nor rejects (it logs, or calls a helper) is
+     * deliberately NOT counted. Its successor could lie one call away, and calling
+     * such a state examined would let {@code markTerminalStates} dress a recall gap
+     * as an absorbing state.
+     */
+    private void accountRejectingCells(CtType<?> root, List<CtMethod<?>> committing) {
+        Set<String> signatures = new LinkedHashSet<>();
+        for (CtMethod<?> m : committing) signatures.add(m.getSignature());
+        for (CtType<?> member : StateMachineClassifier.hierarchyTypes(root)) {
+            for (CtMethod<?> m : member.getMethods()) {
+                if (m.isStatic() || !signatures.contains(m.getSignature())) continue;
+                if (!ContextCommitDetector.rejects(m)) continue;
+                if (!ContextCommitDetector.commitsOf(m, hierarchyQualifiedNames, rootQualifiedName)
+                        .isEmpty()) {
+                    continue; // commits on some path: walked, and its throw is just a branch
+                }
+                for (String from : sourceStatesOf(m)) {
+                    dispatchedStates.add(from);
+                    rejectingCells++;
+                }
+            }
         }
     }
 
@@ -2726,6 +2826,10 @@ public final class TransitionExtractor {
             // successor. Only that callee's own returns: a value fold opened below it
             // clears `voidFold` for its own body.
             if (voidFold != null) return;
+            // F33: the same holds for a context-committing per-state method's own
+            // return. Its successor is what it installs in the context, and what it
+            // returns (a flag, a receipt) is not a state.
+            if (inContextOverride() && ret.getParent(CtExecutable.class) == contextHost) return;
             // F18: tell the enclosing inter-procedural fold, if any, that this
             // return was reached. Recorded BEFORE the descent, because descending
             // may start a nested fold that swaps the frame out.
@@ -2769,7 +2873,13 @@ public final class TransitionExtractor {
             // read back later in the same body, and the reaching-definitions pass
             // (F1) resolves it there — honouring the write as well would report
             // that one successor twice.
-            if (inMutationFallback() && isStateFieldWrite(asg.getAssigned())) {
+            if (inContextOverride()
+                    && ContextCommitDetector.commitOfWrite(asg, hierarchyQualifiedNames,
+                                                           rootQualifiedName) != null) {
+                // F33: `order.state = new Paid();` inside a per-state method.
+                commitForms.add(CommitForm.FIELD_MUTATION);
+                handleValue(asg.getAssignment(), from, event, guard, out);
+            } else if (inMutationFallback() && isStateFieldWrite(asg.getAssigned())) {
                 commitForms.add(CommitForm.FIELD_MUTATION);
                 handleValue(asg.getAssignment(), from, event, guard, out);
             } else if (dispatchCommit == CommitForm.FIELD_MUTATION
@@ -2777,6 +2887,14 @@ public final class TransitionExtractor {
                                                              hierarchyQualifiedNames)) {
                 handleValue(asg.getAssignment(), from, event, guard, out);
             }
+        } else if (node instanceof CtInvocation<?> inv && inContextOverride()
+                && ContextCommitDetector.commitOfCall(inv, hierarchyQualifiedNames,
+                                                      rootQualifiedName) != null) {
+            // F33: `order.changeState(new Paid())` inside a per-state method. The
+            // detector's own rule, so the walked commit is the recognised one.
+            commitForms.add(CommitForm.MUTATOR_ARGUMENT);
+            handleValue(ContextCommitDetector.commitOfCall(inv, hierarchyQualifiedNames,
+                    rootQualifiedName).value(), from, event, guard, out);
         } else if (node instanceof CtInvocation<?> inv && inMutationFallback() && isMutatorCall(inv)) {
             // F2: ctx.setState(new Locked()) — the hierarchy-typed argument is the
             // next state (from-state is the enclosing arm / declaring state class).
@@ -2786,7 +2904,7 @@ public final class TransitionExtractor {
                     handleValue(arg, from, event, guard, out);
                 }
             }
-        } else if (node instanceof CtInvocation<?> inv
+        } else if (node instanceof CtInvocation<?> inv && !inContextOverride()
                 && walkSite != null && walkSite.commit() == CommitForm.MUTATOR_ARGUMENT) {
             // The same commit, reached at a DISPATCH rather than through the
             // whole-hierarchy fallback. Asked of MutatorRecognizer directly rather

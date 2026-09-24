@@ -197,6 +197,22 @@ public final class StateMachineClassifier {
         }
         trace.accept("carrier-based per-state transition (successor handed to a non-hierarchy "
                 + "wrapper): FAILED — " + describeCarrierGap(carriers));
+        // F33: the GoF State pattern — per-state methods installing the successor
+        // into a context outside the hierarchy (`order.changeState(new Paid())`).
+        // Asked after every codomain-keyed recognizer, so it only adds machines.
+        if (!sites.contextCommits().isEmpty()) {
+            trace.accept("context-committing per-state method (installs a hierarchy value into "
+                    + "a holder outside the hierarchy): " + verdict(sites.contextCommits().size())
+                    + describeHosts(sites.contextCommits()));
+            return Classification.yes(Encoding.POLYMORPHIC, sites.contextCommits().size()
+                    + " per-state method(s) committing through a context (GoF State pattern)");
+        }
+        trace.accept("context-committing per-state method (installs a hierarchy value into a "
+                + "holder outside the hierarchy): FAILED — "
+                + (ContextCommitDetector.findContextCommitMethods(root).isEmpty()
+                        ? "none found"
+                        : "committing methods found, but on fewer than two members or none "
+                                + "naming a state other than its own"));
         trace.accept("no predicate above produced a transition producer: ABSTAINING. Not a "
                 + "verdict about the hierarchy — it may be the event alphabet, or its dispatch "
                 + "may sit somewhere no recognizer can see");
@@ -392,7 +408,7 @@ public final class StateMachineClassifier {
 
     private Encoding detectEncoding(CtType<?> root, CtModel model) {
         DispatchFinder.Sites sites = DispatchFinder.find(root, model);
-        boolean dist = !sites.overrides().isEmpty();
+        boolean dist = !sites.overrides().isEmpty() || !sites.contextCommits().isEmpty();
         boolean central = !sites.centralized().isEmpty() || !sites.functional().isEmpty()
                 || !sites.producers().isEmpty();
         if (dist && central) return Encoding.MIXED;

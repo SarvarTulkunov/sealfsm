@@ -1769,3 +1769,71 @@ correctly, because the probe's depth is 1 by design.
   `eventmajor.Link` (Σ-major) and `deepcommit.Phase` (depth), where there was one.
 * Test: `StateCompletenessTest.aCandidateSaysWhyEachSiteProvesNoCommit`, covering
   deepcommit's two groups and one existing control per other kind.
+
+## F33 — the GoF State pattern commits through a context, and nothing recognised it
+
+**Defect.** The textbook State pattern (a `void` method per input on the state
+interface, rejected inputs spelled as throwing `default` bodies or as throwing
+overrides, accepted inputs installing the successor into a context with
+`order.changeState(new PaidState())` or `desk.state = new Closed()`) was
+**rejected with no states reported** unless the root carried an `@Fsm` marker.
+Every recognizer keyed the `POLYMORPHIC_OVERRIDE` locus on the codomain ("returns
+H" or "returns a carrier of H"), so a `void` per-state method matched nothing, and
+the F2 fallback that could read it runs only behind the marker, with no locus. The
+table above marked `POLYMORPHIC_OVERRIDE × {FIELD_MUTATION, MUTATOR_ARGUMENT}` as
+`R*` for that reason. Even with the marker, edges carried no event (so a
+deterministic machine drew nondeterminism warnings) and the encoding read `MIXED`.
+
+**Fix.** New `detect/ContextCommitDetector`, a sixth `DispatchFinder` route
+(`contextCommits`), asked by the classifier after the carrier check so it can only
+add machines. A context commit is a statement in a member method's own body that
+installs an H value into a holder outside H. It is either a `MutatorRecognizer`
+mutator declared outside H, or a `CommitProbe.isRootFieldWrite` whose field is
+declared outside H. The hierarchy qualifies on the carrier path's threshold:
+committing methods on ≥2 members, and ≥1 production naming another state
+(`CarrierTransitionDetector.targetQualifiedName`, now package-visible and shared).
+The extractor walks each such method at `sourceStatesOf` (so a committing root
+`default` is sourced at exactly the leaves that inherit it, F28). Its own `return`s
+are not successors. Its names join the F22 discrimination question.
+
+**Throwing cells.** A `throw` contributes no edge, as it always has (D3). It is not
+an unresolved edge, because it provably installs nothing. For every signature
+some state commits through, each hierarchy body whose last top-level statement is
+a `throw` and which commits nothing is a *rejecting cell*. It marks its states as
+examined (so an all-rejecting state is terminal rather than unreached) and is
+counted in a diagnostic. A body that neither commits nor rejects is **not**
+counted, since its successor might be one call away and calling it examined would
+dress a recall gap as an absorbing state.
+
+**Fixture** `examples/gofstate`, four hierarchies in one package:
+
+| hierarchy | role | HEAD | F33 |
+|---|---|---|---|
+| `OrderState` | positive: throwing defaults, mutator commit | rejected, 0 states | 6 states, 6/6, labelled, 3 terminal, 24 rejecting cells |
+| `TicketState` | positive: abstract + throwing overrides, field-write commit, guarded commit, `boolean` return | rejected | 3 states, 3/3, `FIELD_MUTATION`, guard `desk.resolved()` |
+| `Node` | control: a tree writing its own slot | rejected | rejected |
+| `Message` | control: an echo installing `this` | rejected | rejected |
+
+**Ablations (run, not argued).** Drop "holder outside H": `Node` published, 3/3.
+Drop "names another state": `Message` published as two self-loops, 2/2. Drop the
+own-return suppression: `TicketState` 3/4, with `return true` as a fabricated
+unresolved edge. Drop the rejecting-cell accounting: no terminal state in either
+machine.
+
+**Corpus.** Byte-identical except `gofcontext.Portal`: `MIXED` → `POLYMORPHIC`,
+relation unchanged at 5/5, plus the accurate F22 "one name names the function"
+diagnostic. That closes Portal's half of the open `MIXED` item. `Vend` is not
+affected. **Real code:** the Kafka modules with sealed types (`raft`, `server`,
+`storage`, `transaction-coordinator`, `group-coordinator-api`) give byte-identical
+output before and after, so there are no new acceptances. That is evidence about
+precision only, since none of those types is GoF-style.
+
+**Residual risk, stated.** A sealed *message/command* hierarchy whose handlers post
+a *different* member into a holder outside H (`Ping.reply(bus) { bus.publish(new
+Pong()); }` on two members) meets every clause and would be published. Structurally
+it is indistinguishable from the State pattern; the echo control rejects only
+the case where every production is `this`.
+
+**Cell table update.** `POLYMORPHIC_OVERRIDE × FIELD_MUTATION` and
+`× MUTATOR_ARGUMENT` go from `R*` to **R**: `examples/gofstate`, and
+`gofcontext.Portal` without relying on its marker.

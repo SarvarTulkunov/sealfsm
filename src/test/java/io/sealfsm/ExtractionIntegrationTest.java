@@ -970,6 +970,53 @@ class ExtractionIntegrationTest {
                 "the static transition function is found as a centralized one");
     }
 
+    /**
+     * F33: the GoF State pattern (void per-state methods committing the successor
+     * into a context) is recognised by shape, with no marker. Was rejected with
+     * no states reported. A throwing cell is an undefined input: no edge, counted.
+     */
+    @Test
+    void aPerStateMethodCommittingThroughAContextIsATransition() {
+        CtModel model = modelOf("examples/gofstate");
+        ExtractionResult r = new Analyzer().analyze(model);
+
+        // Positive 1: inherited throwing defaults, commit through a mutator.
+        StateMachine order = machine(r, "OrderState");
+        assertEquals(StateMachine.Encoding.POLYMORPHIC, order.encoding());
+        assertEquals(Set.of("CreatedState->PaidState", "CreatedState->CancelledState",
+                        "PaidState->ShippedState", "PaidState->RefundedState",
+                        "ShippedState->DeliveredState", "ShippedState->RefundedState"),
+                resolvedPairs(order));
+        assertEquals(6, order.transitions().size(), "a throwing cell contributes no edge");
+        assertTrue(order.transitions().stream().allMatch(t -> t.event() != null),
+                "five method names discriminate, so each is the input (F22)");
+        assertEquals("CreatedState", order.initialState().orElse(null));
+        assertEquals(Set.of("DeliveredState", "CancelledState", "RefundedState"),
+                order.allStates().stream().filter(State::isTerminal).map(State::id)
+                        .collect(Collectors.toSet()),
+                "a state whose every input is rejected is absorbing, not unreached");
+        assertTrue(order.commitForms().contains(CommitForm.MUTATOR_ARGUMENT));
+
+        // Positive 2: abstract methods with throwing overrides, direct field write,
+        // a guarded commit, and a boolean return that is not a successor.
+        StateMachine ticket = machine(r, "TicketState");
+        assertEquals(Set.of("Open->Assigned", "Assigned->Closed", "Assigned->Open"),
+                resolvedPairs(ticket));
+        assertEquals(3, ticket.transitions().size(), "`return true` is not an edge");
+        assertTrue(ticket.transitions().stream().anyMatch(t -> t.to().equals("Closed")
+                        && t.guard() != null && t.guard().contains("desk.resolved()")),
+                "the commit under `if (desk.resolved())` carries that guard");
+        assertTrue(ticket.commitForms().contains(CommitForm.FIELD_MUTATION));
+
+        // Negative controls, one per clause.
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Node")),
+                "a tree writing its own slot is not a context changing state");
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Message")),
+                "an echo that installs `this` everywhere moves nothing");
+        assertTrue(r.diagnostics().stream().anyMatch(d -> d.message().contains("24 (state, method)")),
+                "the rejecting cells are reported, not silently absent");
+    }
+
     private static CtType<?> typeNamed(CtModel model, String qualifiedName) {
         return model.getAllTypes().stream()
                 .filter(t -> t.getQualifiedName().equals(qualifiedName))
