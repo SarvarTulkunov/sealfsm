@@ -1017,6 +1017,94 @@ class ExtractionIntegrationTest {
                 "the rejecting cells are reported, not silently absent");
     }
 
+    /**
+     * F34: a pipeline of per-state handlers declared on an interface and
+     * implemented once, optionally driven by a run-to-completion method that
+     * re-enters itself with the successor. Written twice — with the driver and an
+     * inferred {@code permits}, without it and an explicit one — and both
+     * spellings must report the same machine.
+     */
+    @Test
+    void aPipelineOfTypedHandlersIsTheSameMachineWithOrWithoutItsDriver() {
+        Set<String> chain = Set.of("Placed->Validated", "Validated->Priced", "Priced->Invoiced",
+                "Invoiced->Shipped", "Shipped->Fulfilled");
+        ExtractionResult driven = new Analyzer().analyze(modelOf("examples/orchestrator"));
+        ExtractionResult bare = new Analyzer().analyze(modelOf("examples/typedhandler"));
+        for (ExtractionResult r : List.of(driven, bare)) {
+            StateMachine m = machine(r, "OrderState");
+            assertEquals(6, m.allStates().size(), "states exact, permits inferred or written");
+            // The driver's value is where the run ENDS; read as the successor it
+            // sourced `Fulfilled` at every state (five fabricated resolved edges).
+            assertEquals(chain, resolvedPairs(m));
+            assertEquals(5, m.transitions().size(), "no unresolved arm, no self-loop");
+            assertEquals("Placed", m.initialState().orElse(null));
+            // Only the driver EXAMINES Fulfilled (its halting arm), so only there is
+            // it provably absorbing. Without it no handler takes Fulfilled, and a
+            // state nothing examined is not promoted to terminal — that would dress
+            // a recall gap as a result.
+            assertEquals(r == driven ? Set.of("Fulfilled") : Set.of(),
+                    m.allStates().stream().filter(State::isTerminal)
+                            .map(State::id).collect(Collectors.toSet()),
+                    "the arm returning the matched state halts the run; it is not a self-loop");
+            assertTrue(m.transitions().stream().allMatch(t -> t.event() == null),
+                    "one handler name across every state names the function (F22)");
+        }
+
+        // Control: two implementations of the abstract handler disagree, so the
+        // driver's successor is not decidable. Recorded, with known sources — never
+        // one implementation's answer published as the machine's.
+        StateMachine job = machine(driven, "Job");
+        assertEquals(0, resolvedPairs(job).size());
+        assertEquals(Set.of("Queued", "Running"), job.transitions().stream()
+                .map(Transition::from).collect(Collectors.toSet()));
+        assertTrue(job.transitions().stream().noneMatch(Transition::isResolved));
+
+        // Controls on the typed-source rule. Several handler names on one state
+        // make the method the input; two state-typed parameters fix no source.
+        StateMachine hatch = machine(bare, "Hatch");
+        assertEquals(Set.of("Open->Shut", "Shut->Open", "Shut->Jammed"), resolvedPairs(hatch));
+        assertEquals(Set.of("close", "open", "jam"), hatch.transitions().stream()
+                .filter(Transition::isResolved).map(Transition::event).collect(Collectors.toSet()));
+        assertTrue(hatch.transitions().stream().filter(t -> !t.isResolved())
+                        .noneMatch(t -> t.from().equals("Open") || t.from().equals("Shut")),
+                "merge(Open, Shut) claims neither parameter as the current state");
+    }
+
+    /**
+     * F35: a typed handler has the signature of a converter, and a value-returning
+     * host is committed by its codomain alone, so one handler is a conversion and
+     * a family covering two or more source states is a dispatch — the threshold an
+     * instanceof chain already applies.
+     */
+    @Test
+    void oneTypedHandlerIsAConversionAndAFamilyIsADispatch() {
+        CtModel model = modelOf("examples/typedhandler");
+        ExtractionResult r = new Analyzer().analyze(model);
+
+        // The control: a sum type with one converter. Was 0/1 before F34 and a
+        // clean 1/1 `Circle -> Square` after. Nothing discriminates it, so it is a
+        // plain rejection and not a candidate either.
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Shape")));
+        assertTrue(r.candidates().stream().noneMatch(c -> c.name().equals("Shape")));
+
+        // The documented cost: a real machine with one handler goes with it.
+        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Lamp")),
+                "one discriminated state is too weak a signal, as for a chain");
+
+        // The standing probe, pinned as WRONG: two converters from two states clear
+        // the threshold. Flip this if a stored-back commit is ever required.
+        assertEquals(Set.of("Meters->Feet", "Feet->Meters"), resolvedPairs(machine(r, "Length")));
+
+        // The family the threshold exists to keep.
+        assertEquals(5, resolvedPairs(machine(r, "OrderState")).size());
+        assertEquals(Set.of("Open->Shut", "Shut->Open", "Shut->Jammed"),
+                resolvedPairs(machine(r, "Hatch")));
+
+        // And the recognizer agrees on WHY.
+        assertTrue(StateMachineClassifier.findCentralizedTransitionMethods(
+                typeNamed(model, "typedhandler.Shape"), model).isEmpty());
+    }
+
     private static CtType<?> typeNamed(CtModel model, String qualifiedName) {
         return model.getAllTypes().stream()
                 .filter(t -> t.getQualifiedName().equals(qualifiedName))

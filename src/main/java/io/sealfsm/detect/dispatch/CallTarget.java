@@ -48,7 +48,11 @@ import java.util.Map;
  * call — or when no method in the model overrides the bound declaration in a type
  * related to the receiver's static type. "In the model" is the honest bound: a
  * subclass outside the source set cannot be seen, which is the same limit every
- * other closed-world claim here carries.
+ * other closed-world claim here carries. On that same bound an ABSTRACT bound
+ * declaration with exactly one concrete override in a related type has a unique
+ * target too — that override (F34): an interface method implemented once in the
+ * source set runs that implementation. Two or more is refused as OVERRIDDEN, none
+ * as NO_DECLARATION.
  *
  * <p>Nothing here keys on a name (F22): the override test is
  * {@link CtMethod#isOverriding}, a declaration-level fact; the simple name only
@@ -118,7 +122,7 @@ public final class CallTarget {
         }
         Result overload = overloadAmbiguity(inv, bound, index);
         if (overload != null) return overload;
-        if (dispatchIsStatic(inv, bound)) return Result.of(bound);
+        if (bound.getBody() != null && dispatchIsStatic(inv, bound)) return Result.of(bound);
 
         CtTypeReference<?> receiver = receiverType(inv, bound);
         if (receiver == null || SpoonCompat.isUnresolved(receiver)) {
@@ -202,18 +206,32 @@ public final class CallTarget {
                     + receiver.getQualifiedName() + " has no declaration in the model");
         }
         int arity = bound.getParameters().size();
+        List<CtMethod<?>> bodies = new ArrayList<>();
+        if (bound.getBody() != null) bodies.add(bound);
         for (CtMethod<?> m : index.named(bound.getSimpleName())) {
             if (m == bound || m.getBody() == null || m.getParameters().size() != arity) continue;
             CtType<?> declaring = m.getDeclaringType();
             if (declaring == null) continue;
             if (!overrides(m, bound)) continue;
-            if (related(declaring, receiver, receiverDecl)) {
-                return Result.refused(Refusal.OVERRIDDEN, "the call is virtual and "
-                        + describe(bound) + " is overridden by " + describe(m)
-                        + ", so more than one body can run");
-            }
+            if (related(declaring, receiver, receiverDecl)) bodies.add(m);
         }
-        return Result.of(bound);
+        // An ABSTRACT bound declaration runs no body of its own, so the set of
+        // bodies the call can run is exactly its concrete overrides. One of them
+        // is the unique target on the same closed-world bound the bodied case
+        // rests on: `this.handle(state)` in an interface's default method, whose
+        // only implementation is in the model, runs that implementation and
+        // nothing else. Zero overrides is not a target at all.
+        if (bodies.size() == 1) return Result.of(bodies.get(0));
+        if (bodies.isEmpty()) {
+            return Result.refused(Refusal.NO_DECLARATION, describe(bound)
+                    + " is abstract and no implementation related to the receiver is in the model");
+        }
+        CtMethod<?> other = bodies.get(0) == bound ? bodies.get(1) : bodies.get(0);
+        return Result.refused(Refusal.OVERRIDDEN, "the call is virtual and "
+                + describe(bound) + (bound.getBody() == null
+                        ? " is abstract with more than one implementation, e.g. " + describe(other)
+                        : " is overridden by " + describe(other))
+                + ", so more than one body can run");
     }
 
     private static boolean overrides(CtMethod<?> m, CtMethod<?> bound) {

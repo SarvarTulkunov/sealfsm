@@ -146,6 +146,16 @@ public final class StateMachineClassifier {
         trace.accept("centralized transition function (produces a hierarchy value AND "
                 + "discriminates one): " + verdict(sites.centralized().size())
                 + describeHosts(sites.centralized()));
+        if (sites.centralized().isEmpty()) {
+            CentralizedScan scan = centralizedScan(root, model);
+            if (!scan.typedHandlers().isEmpty()) {
+                trace.accept("per-state handler outside the hierarchy (a parameter typed with a "
+                        + "member fixes the source): HELD BACK — " + scan.typedHandlers().size()
+                        + " handler(s)" + describeMethods(scan.typedHandlers()) + " fix "
+                        + scan.typedSources().size() + " distinct source state(s); a dispatch must "
+                        + "separate at least two, and one is a conversion (F35)");
+            }
+        }
         trace.accept("functional transition callable (lambda / anonymous-class method with that "
                 + "signature): " + verdict(sites.functional().size()));
         // The LOCUS half, reported on its own. Without this line the reader cannot
@@ -494,15 +504,36 @@ public final class StateMachineClassifier {
      * widening to methods that are transition functions.
      */
     public static List<CtMethod<?>> findCentralizedTransitionMethods(CtType<?> root, CtModel model) {
+        return centralizedScan(root, model).admitted();
+    }
+
+    /**
+     * The centralized scan, with what F35 held back kept visible: the typed
+     * handlers, and the distinct source states they fix. {@code admitted} is the
+     * decision; the other two exist so {@code --explain} can name why a lone
+     * handler was not enough, off the same scan rather than a second one.
+     */
+    record CentralizedScan(List<CtMethod<?>> admitted, List<CtMethod<?>> typedHandlers,
+                           Set<String> typedSources) {
+    }
+
+    private static CentralizedScan centralizedScan(CtType<?> root, CtModel model) {
         Set<String> hierarchy = hierarchyQualifiedNames(root);
         String rootQn = root.getQualifiedName();
         Set<String> hierarchyTypeNames = new LinkedHashSet<>();
         for (CtType<?> t : hierarchyTypes(root)) hierarchyTypeNames.add(t.getQualifiedName());
 
         List<CtMethod<?>> out = new ArrayList<>();
+        List<CtMethod<?>> typedOnly = new ArrayList<>();
+        Set<String> typedSources = new LinkedHashSet<>();
         for (CtMethod<?> method : model.getElements(new TypeFilter<>(CtMethod.class))) {
             CtTypeReference<?> ret = method.getType();
             if (ret == null || !hierarchy.contains(ret.getQualifiedName())) continue;
+            // An abstract declaration is a signature, not a transition function:
+            // it has no body to walk, and counting it beside its implementation
+            // reports one function twice. The implementations are methods of the
+            // model and are found in their own right.
+            if (method.getBody() == null) continue;
             // F7: a functional method living inside an anonymous class (a supplied
             // BiFunction/Function) is a transition callable, but it is discovered
             // and walked via findFunctionalTransitionCallables so it can be
@@ -517,12 +548,56 @@ public final class StateMachineClassifier {
             boolean declaredInsideHierarchy =
                     declaring != null && hierarchyTypeNames.contains(declaring.getQualifiedName());
             if (declaredInsideHierarchy && !method.isStatic()) continue;
-            if (takesHierarchyParameter(method, hierarchy)
-                    || DispatchCommitDetector.discriminatesState(method, hierarchy, rootQn)) {
+            if (DispatchCommitDetector.discriminatesState(method, hierarchy, rootQn)
+                    || takesRootParameter(method, rootQn)) {
                 out.add(method);
+            } else if (takesHierarchyParameter(method, hierarchy)) {
+                // Handed only PROPER members: a per-state handler written outside
+                // the hierarchy (F34). Held back until the family is known.
+                typedOnly.add(method);
+                CtParameter<?> source = typedSourceParameter(method, hierarchy, rootQn);
+                if (source != null) typedSources.add(source.getType().getQualifiedName());
             }
         }
-        return out;
+        // F35 — one typed handler is a CONVERSION, a family of them is a dispatch.
+        // `Shape boundingBox(Circle c)` and `OrderState handle(Placed p)` have the
+        // same signature, and a value-returning host is committed by its codomain
+        // alone, so nothing else separates them. The separating evidence is the one
+        // the instanceof-chain recognizer already demands for the same reason: a
+        // discrimination distinguishes at least TWO states. The overloads of
+        // `handle` do (five source states); `boundingBox` alone does not. Asked of
+        // the family, not the method, so `merge(Open, Shut)` — which fixes no
+        // source of its own — rides on its hierarchy's handlers as it did before.
+        if (typedSources.size() >= 2) out.addAll(typedOnly);
+        return new CentralizedScan(out, typedOnly, typedSources);
+    }
+
+    /**
+     * F34/F35: the parameter that fixes a centralized method's source state by its
+     * declared TYPE — exactly one hierarchy-typed parameter, declared with a proper
+     * member rather than the root, in a method that does not itself discriminate
+     * the state (its arms would be narrower). {@code null} when there is no such
+     * parameter, including when there are two: which of them is current is not in
+     * the signature. One notion, asked by the recognizer and by the extractor.
+     */
+    public static CtParameter<?> typedSourceParameter(CtMethod<?> method, Set<String> hierarchy,
+                                                      String rootQn) {
+        CtParameter<?> only = null;
+        for (CtParameter<?> p : method.getParameters()) {
+            CtTypeReference<?> t = p.getType();
+            if (t == null || !hierarchy.contains(t.getQualifiedName())) continue;
+            if (only != null) return null;
+            only = p;
+        }
+        if (only == null || rootQn.equals(only.getType().getQualifiedName())) return null;
+        if (DispatchCommitDetector.discriminatesState(method, hierarchy, rootQn)) return null;
+        return only;
+    }
+
+    private static boolean takesRootParameter(CtMethod<?> method, String rootQn) {
+        return method.getParameters().stream()
+                .map(CtParameter::getType)
+                .anyMatch(p -> p != null && rootQn.equals(p.getQualifiedName()));
     }
 
     /**

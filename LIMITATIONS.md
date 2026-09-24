@@ -166,6 +166,100 @@ once the false positive is gone.
 
 ---
 
+## L3. A value-returning function is committed by its return type alone
+
+**Observed on:** constructed fixtures, not yet on a harvested project:
+`examples/typedhandler` (`Shape`, `Lamp`, `Length`), which F35 added, plus a
+switch-spelled converter measured by hand. Unlike L1 and L2, this is a
+**precision** limitation (a sum type published as a machine), not a recall one.
+It is recorded here because it is a deliberate boundary with a known fix
+that has not been taken yet.
+
+### The shape
+
+A method that takes a state and returns a state is either a transition or a
+conversion, and nothing in its signature or body tells which:
+
+```java
+OrderState handle(OrderState.Placed p) { return new OrderState.Validated(...); } // a transition
+Shape boundingBox(Shape.Circle c)       { return new Shape.Square(2 * c.r()); } // a conversion
+```
+
+In the first, the order *moves* from Placed to Validated. In the second, the
+circle still exists when the method returns, and a separate value has been
+derived from it. The difference is in how the result is **used**: a transition's
+result replaces the input somewhere (`this.state = handle(state)`,
+`orchestrate(handle(p))`, `while (…) s = step(s)`). A conversion's result
+does not.
+
+### What the tool reports, and why
+
+The tool never asks where a returned value goes. For every value-returning host
+(a per-state `next()`, a centralized `transition(H, E)`, a typed handler) the
+commit is proven by the **codomain alone**: returning the hierarchy type
+*is* the `VALUE_RETURN` commit. That is how `examples/traffic` and
+`examples/door` are accepted, and it is applied the same way to every
+spelling:
+
+| Source | Verdict | Correct? |
+|---|---|---|
+| `static Shape bounding(Shape s) { return switch (s) { case Circle c -> new Square(..); case Square q -> new Circle(..); }; }` | machine, 2/2 | **no**: a sum type |
+| `Shape boundingBox(Circle c)`, one typed converter (`typedhandler.Shape`) | rejected (F35) | yes |
+| `Lamp press(Dark d)`, a real two-state machine with one handler (`typedhandler.Lamp`) | rejected (F35) | **no**: the cost of F35 |
+| `toFeet(Meters)` + `toMeters(Feet)` (`typedhandler.Length`) | machine, 2/2 | **no**: a sum type |
+
+F35 is only a threshold: typed handlers are admitted only as a family that fixes
+at least two distinct source states, the same "one type test is a check, not a
+dispatch" rule the `instanceof`-chain recognizer applies. It removes the
+commonest case (one converter) and nothing more. `Length` is pinned in
+`ExtractionIntegrationTest.oneTypedHandlerIsAConversionAndAFamilyIsADispatch`
+as a **wrong answer on purpose**, so that the test fails once this limitation
+is closed.
+
+### Why the threshold was chosen over the real fix
+
+The real fix is a rule that a value-returning host is a transition only if its
+result is **stored back** as the new state. Applying that rule to typed handlers
+alone was considered and rejected, because it would split one converter's verdict
+by spelling: the switch-spelled converter above would still be accepted by
+codomain while its typed-parameter twin was rejected. A rule about what a commit
+*is* has to hold at every locus or at none.
+
+### What closing it would take (not implemented)
+
+1. **A stored-back commit for `VALUE_RETURN`, tool-wide.** Accept a
+   value-returning host only when some caller installs its result into the place
+   the input came from: a hierarchy-typed field (`this.state = f(this.state)`),
+   a self-re-entering driver (F34's run-to-completion rule already recognises this
+   shape), or a loop variable reassigned from the call (`s = step(s)`).
+2. **A caller search.** The host and its commit are usually in different methods
+   (`orchestrate` → `handle`, `DoorContext.fire` → `DoorMachine.transition`), so
+   this is an inter-procedural question from the callee *back to* its callers.
+   The tool never asks a question in that direction today.
+3. **A decision on hosts with no caller in the source set.** A library's public
+   `transition(H, E)` is called only by code outside `--src`. Under a strict rule
+   it would drop to a Tier 3 candidate (states exact, no relation claimed). That is
+   honest, but it would move machines the corpus currently accepts. Every
+   value-returning fixture (`traffic`, `door`, `http2-stream-claude`,
+   `lcp_automation`, `typedhandler.OrderState`, …) would need its caller checked,
+   and the documented numbers would need re-baselining.
+4. **Fixtures:** `typedhandler.Length` flips to rejected and `Lamp` is
+   re-examined, a switch-spelled converter is added as a control, and at least one
+   machine with no in-model caller pins the Tier 3 outcome.
+
+### Suggested thesis wording
+
+> A value-returning transition function is recognised by its signature: it maps
+> a state to a state. A conversion within a sum type has the same signature, and
+> the tool does not examine whether a result replaces its input, so a sum type
+> equipped with a family of converters is reported as a state machine. A
+> single converter is rejected by requiring that handlers discriminate at least
+> two source states. Closing the gap in general requires recognising the commit
+> at the call site of the function, an inter-procedural analysis from callee to
+> caller that is left as future work.
+
+---
+
 ## Related issue, fixed: the candidate reason conflated two gaps (F32)
 
 On this run `EpochState`'s candidate used to name its 5 discrimination sites under

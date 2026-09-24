@@ -153,6 +153,17 @@ public final class TransitionExtractor {
     // because the two walks draw their names from different sets: the per-state
     // methods of the hierarchy, and the methods that supply F7 functional callables.
     private boolean distributedNamesDiscriminate = false;
+    private boolean typedNamesDiscriminate = false;
+    /**
+     * The centralized host being walked when it is a RUN-TO-COMPLETION driver —
+     * one that re-enters itself with the successor ({@link #reentryIndex}), so its
+     * return value is the state the run ends in, never the next one. {@code null}
+     * otherwise, which is every host in the corpus before this was added.
+     */
+    private CtMethod<?> reentryHost;
+    private int reentryIndex = -1;
+    private int reentryArms;
+    private int haltingArms;
     private boolean functionalNamesDiscriminate = false;
 
     // F2: mutation-encoding context, populated only while the GoF/mutation
@@ -703,6 +714,19 @@ public final class TransitionExtractor {
             if (enclosing != null) functionalNames.add(enclosing);
         }
         this.functionalNamesDiscriminate = functionalNames.size() > 1;
+        // The same F22 question for per-state handlers written OUTSIDE the
+        // hierarchy (typedSourceState): `pay(Placed)` beside `cancel(Placed)`
+        // makes the method the input; `handle(Placed)`, `handle(Validated)`, ...
+        // names one function and labels nothing.
+        Set<String> typedNames = new LinkedHashSet<>();
+        for (DispatchSite site : sites.centralized()) {
+            CtMethod<?> m = (CtMethod<?>) site.host();
+            if (m.getBody() != null && !helperSignatures.contains(m.getSignature())
+                    && typedSourceState(m) != null) {
+                typedNames.add(m.getSimpleName());
+            }
+        }
+        this.typedNamesDiscriminate = typedNames.size() > 1;
 
         for (DispatchSite site : sites.overrides()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
@@ -872,6 +896,14 @@ public final class TransitionExtractor {
             diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
                     + "(always throws or diverges) contributed no transition — the arms holding "
                     + "them are undefined inputs, not unresolved targets");
+        }
+        if (reentryArms > 0) {
+            diagnostics.add(reentryArms + " arm(s) re-enter their own dispatch with the successor "
+                    + "(a run-to-completion driver): the argument re-entered with is read as the "
+                    + "successor, never the driver's final result"
+                    + (haltingArms > 0 ? "; " + haltingArms + " arm(s) return the matched state "
+                            + "without re-entering, which is where the run stops, not a self-loop"
+                            : ""));
         }
         if (nestedProductions > 0) {
             diagnostics.add(nestedProductions + " produced value(s) NEST a hierarchy value inside "
@@ -1115,9 +1147,37 @@ public final class TransitionExtractor {
         // guard, so a fully recognised machine still reported `<unknown> -> ?`
         // for each of its edges. A switch-dispatched body sets no type test on the
         // selector, so nothing changes for one.
+        // An abstract declaration has no body to walk; its implementations are
+        // methods of the model in their own right and are walked as such.
+        if (method.getBody() == null) return;
         CtVariable<?> saved = this.selector;
         this.selector = selectorParameter(method.getParameters());
         try {
+            String typedSource = typedSourceState(method);
+            if (typedSource != null) {
+                // The source state is fixed by the TYPE SYSTEM, exactly as the
+                // declaring class fixes it for a per-state override: `handle(Placed p)`
+                // can only ever be handed a Placed. No data flow is involved, so the
+                // state counts as dispatched even if the body produces nothing.
+                dispatchedStates.add(typedSource);
+                walk(method.getBody(), typedSource, eventName(method, typedNamesDiscriminate),
+                        null, out);
+                return;
+            }
+            int reentry = reentryIndex(method);
+            if (reentry >= 0) {
+                CtMethod<?> savedHost = this.reentryHost;
+                int savedIndex = this.reentryIndex;
+                this.reentryHost = method;
+                this.reentryIndex = reentry;
+                try {
+                    walk(method.getBody(), null, null, null, out);
+                } finally {
+                    this.reentryHost = savedHost;
+                    this.reentryIndex = savedIndex;
+                }
+                return;
+            }
             if (!containsStateDispatch(method)) {
                 // Nothing we could attribute from-states to. Walk anyway so
                 // produced targets remain visible (recorded with an undetermined
@@ -1132,6 +1192,65 @@ public final class TransitionExtractor {
         } finally {
             this.selector = saved;
         }
+    }
+
+    /**
+     * The state a centralized method runs in when its SIGNATURE says so: exactly
+     * one hierarchy-typed parameter, declared with a proper member of the hierarchy
+     * rather than the root. This is the per-state handler written outside the
+     * hierarchy — {@code OrderState handle(Placed p)}, one overload per state, a
+     * visitor's {@code visit(Idle)}, a {@code static Door onOpen(Open s, Event e)} —
+     * and its source is exact for the reason a per-state override's is: the
+     * compiler admits no other argument. A composite member is its own id, as a
+     * composite's inherited method is (F28): "in any state inside it".
+     *
+     * <p>{@code null} — no fixed source — for a root-typed parameter (the method
+     * discriminates, or it is an ordinary {@code transition(H, E)}), for a method
+     * that also discriminates the state (its arms say which state, and they are
+     * narrower), and for two or more hierarchy-typed parameters: which of them is
+     * the current state is then a question the signature does not answer.
+     */
+    private String typedSourceState(CtMethod<?> method) {
+        CtParameter<?> p = StateMachineClassifier.typedSourceParameter(
+                method, hierarchyQualifiedNames, rootQualifiedName);
+        return p == null ? null : stateId(p.getType());
+    }
+
+    /**
+     * The parameter position through which {@code method} re-enters ITSELF, or
+     * {@code -1}. A host is a run-to-completion driver when it discriminates the
+     * state handed to it and some call in its body — outside a lambda or local
+     * class, whose calls run on another schedule — has this very method as its
+     * unique runtime target ({@link CallTarget}, so an override elsewhere in the
+     * model refuses rather than guesses) and passes a hierarchy value in the
+     * selector's position. That is the tail-recursive spelling of
+     * {@code while (!done) s = step(s);}, and it is decided on the declaration's
+     * identity, never on a name.
+     */
+    private int reentryIndex(CtMethod<?> method) {
+        if (!(selector instanceof CtParameter<?> sel) || !containsStateDispatch(method)) return -1;
+        int index = method.getParameters().indexOf(sel);
+        if (index < 0) return -1;
+        for (CtInvocation<?> inv : method.getBody().getElements(new TypeFilter<>(CtInvocation.class))) {
+            if (inv.getParent(CtExecutable.class) != method) continue;
+            if (runsHost(inv, method) && inv.getArguments().size() > index
+                    && isHierarchyTyped(inv.getArguments().get(index))) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    /** The successor a re-entering call hands back to {@link #reentryHost}, or {@code null}. */
+    private CtExpression<?> reentryArgument(CtInvocation<?> inv) {
+        if (!runsHost(inv, reentryHost) || inv.getArguments().size() <= reentryIndex) return null;
+        return inv.getArguments().get(reentryIndex);
+    }
+
+    private boolean runsHost(CtInvocation<?> inv, CtMethod<?> host) {
+        if (CallTarget.boundDeclaration(inv) != host) return false;
+        CallTarget.Result target = CallTarget.of(inv, callTargets());
+        return target.unique() && target.method() == host;
     }
 
     /**
@@ -2226,18 +2345,17 @@ public final class TransitionExtractor {
             return false; // not a state-producing call
         }
         CtMethod<?> bound = CallTarget.boundDeclaration(inv);
-        if (bound == null || bound.getBody() == null) {
-            if (bound != null && !isShadow(bound)) {
-                explainRefusal(inv, from, event, "NO_BODY", "the bound declaration "
-                        + bound.getSignature() + " is abstract or an interface method with no "
-                        + "implementation in the source set");
-            } else {
-                explainRefusal(inv, from, event, "LIBRARY", "the call binds to "
-                        + (bound == null ? "no declaration" : bound.getSignature())
-                        + " outside the source set, so there is no body to fold (F11) — "
-                        + "whatever it runs, including a stored lambda, is not read");
-            }
-            return false; // library / abstract / unavailable in the model
+        // An abstract declaration read from source is not a dead end: the body
+        // that runs is one of its implementations, and CallTarget names it when
+        // exactly one exists in the model. Only a shadow (F11) or no declaration
+        // at all is refused here.
+        boolean abstractInModel = bound != null && bound.getBody() == null && !isShadow(bound);
+        if (bound == null || (bound.getBody() == null && !abstractInModel)) {
+            explainRefusal(inv, from, event, "LIBRARY", "the call binds to "
+                    + (bound == null ? "no declaration" : bound.getSignature())
+                    + " outside the source set, so there is no body to fold (F11) — "
+                    + "whatever it runs, including a stored lambda, is not read");
+            return false; // library / unavailable in the model
         }
         // F29 — the body the call RUNS, not merely the one Spoon bound it to. A
         // shadow is exempt from the question: it is never summarised (F11), so
@@ -2246,6 +2364,12 @@ public final class TransitionExtractor {
         if (!isShadow(bound)) {
             CallTarget.Result target = CallTarget.of(inv, callTargets());
             if (!target.unique()) {
+                if (abstractInModel && target.refusal() == CallTarget.Refusal.NO_DECLARATION) {
+                    explainRefusal(inv, from, event, "NO_BODY", "the bound declaration "
+                            + bound.getSignature() + " is abstract or an interface method with no "
+                            + "implementation in the source set");
+                    return false;
+                }
                 nonUniqueCallees.add(safeText(inv));
                 explainRefusal(inv, from, event, String.valueOf(target.refusal()), target.detail());
                 return false;
@@ -3353,6 +3477,31 @@ public final class TransitionExtractor {
         if (value instanceof CtVariableAccess<?> va && isReassignedLocal(va)) {
             handleReassignedLocal(va, from, event, guard, out);
             return;
+        }
+        // A run-to-completion driver: `case A a -> run(step(a))`. The host's value
+        // is where the whole run ENDS, so reading it as the successor sources the
+        // final state at every state the run passes through — a fabricated,
+        // resolved edge per arm. What the arm commits is the argument it re-enters
+        // the machine with, and that is what is resolved. Top level only: inside a
+        // fold the host is not the one being walked.
+        if (reentryHost != null && resolver.frame() == null) {
+            if (value instanceof CtInvocation<?> inv) {
+                CtExpression<?> next = reentryArgument(inv);
+                if (next != null) {
+                    reentryArms++;
+                    handleValue(next, from, event, guard, out);
+                    return;
+                }
+            }
+            // An arm that returns the state it matched WITHOUT re-entering is where
+            // the run stops. That is not a step to itself: nothing ever leaves that
+            // state through this driver, and a self-loop would both claim a
+            // transition the program never takes and keep the state from reading
+            // as absorbing. The arm is still dispatched, so the state is examined.
+            if (from != null && CompositionVeto.isCurrentState(value)) {
+                haltingArms++;
+                return;
+            }
         }
         // F3: an invocation returning the hierarchy type may be an in-model
         // helper/factory; fold its bounded return-value summary when we soundly
