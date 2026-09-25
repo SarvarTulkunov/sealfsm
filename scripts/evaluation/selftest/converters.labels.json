@@ -1,0 +1,26 @@
+{
+  "corpusEntry": "selftest-converters",
+  "labelledBy": "fixture intent (examples/converters javadoc), for a MECHANICS check of score.py only",
+  "labelledOn": "2026-09-25",
+  "labelledBeforeToolOutput": false,
+  "hierarchies": [
+    {
+      "root": "converters.Tint",
+      "label": "FSM",
+      "codingPattern": "centralized-switch",
+      "evidence": ["Tint.java: Lens.flip stores Tints.invert(tint) back into the field it read"],
+      "directBranches": ["converters.Tint.Warm", "converters.Tint.Cool"],
+      "atomicStates": ["converters.Tint.Warm", "converters.Tint.Cool"],
+      "transitions": [
+        {"from": "Warm", "to": "Cool", "event": null, "evidence": "Tint.java invert"},
+        {"from": "Cool", "to": "Warm", "event": null, "evidence": "Tint.java invert"}
+      ]
+    },
+    {"root": "converters.Shade", "label": "NON_FSM", "codingPattern": "none",
+     "evidence": ["Shade.java: the only caller tests the result with instanceof and drops it"]},
+    {"root": "converters.Currency", "label": "NON_FSM", "codingPattern": "none",
+     "evidence": ["Currency.java: Ledger.quotedInEuro examines exchange() and drops it"]},
+    {"root": "converters.Hue", "label": "UNCERTAIN", "codingPattern": "centralized-switch",
+     "evidence": ["Hue.java: no caller; conversion and state update cannot be told apart"]}
+  ]
+}

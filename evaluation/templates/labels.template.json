@@ -1,0 +1,42 @@
+{
+  "corpusEntry": "REPLACE-short-unique-id",
+  "labelledBy": "REPLACE-name-or-initials",
+  "labelledOn": "YYYY-MM-DD",
+  "labelledBeforeToolOutput": true,
+  "hierarchies": [
+    {
+      "root": "com.example.Door",
+      "label": "FSM",
+      "codingPattern": "centralized-switch",
+      "evidence": [
+        "DoorContext.java:8 - current = DoorMachine.transition(current, event): the result replaces the stored state",
+        "DoorMachine.java:6 - switch over the current state, one arm per state"
+      ],
+      "directBranches": ["com.example.Open", "com.example.Closed", "com.example.Locked"],
+      "enumChildStates": {},
+      "atomicStates": ["com.example.Open", "com.example.Closed", "com.example.Locked"],
+      "transitions": [
+        {"from": "com.example.Closed", "to": "com.example.Locked", "event": null, "evidence": "DoorMachine.java:7"},
+        {"from": "com.example.Closed", "to": "com.example.Open", "event": null, "evidence": "DoorMachine.java:7"},
+        {"from": "com.example.Open", "to": "com.example.Closed", "event": null, "evidence": "DoorMachine.java:8"}
+      ],
+      "notes": "States may be named by qualified name (preferred) or by the tool's simple id."
+    },
+    {
+      "root": "com.example.Length",
+      "label": "NON_FSM",
+      "codingPattern": "none",
+      "evidence": [
+        "Units.java:3 - toFeet(Meters) derives a new value; Ruler.java:12 prints it and never stores it as a state"
+      ],
+      "notes": "A converter (Decision 4): must not be reported as a machine."
+    },
+    {
+      "root": "com.example.Ambiguous",
+      "label": "UNCERTAIN",
+      "codingPattern": "typed-handler",
+      "evidence": ["Api.java:20 - public next(A) returns B; no caller in this module"],
+      "notes": "Why a careful reader cannot decide."
+    }
+  ]
+}

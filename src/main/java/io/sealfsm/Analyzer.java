@@ -8,6 +8,7 @@ import io.sealfsm.detect.dispatch.DispatchArm;
 import io.sealfsm.detect.dispatch.DispatchFinder;
 import io.sealfsm.detect.dispatch.DispatchSite;
 import io.sealfsm.detect.dispatch.EventMajorDispatch;
+import io.sealfsm.detect.dispatch.Installation;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.detect.StateMachineClassifier.Classification;
@@ -110,20 +111,22 @@ public final class Analyzer {
                     : classifier.classify(root, model, trace::add);
             if (!c.isStateMachine()) {
                 result.info(root.getQualifiedName(),
-                        "skipped — " + c.reason() + reoffer(root, c, pending, claimed));
+                        (c.rejection() == Rejection.CONVERTED ? "REJECTED AS A CONVERSION — " : "skipped — ")
+                                + c.reason() + reoffer(root, c, pending, claimed));
                 reportResolution(root, result, resolution, true);
                 if (trace != null) result.explain(root.getQualifiedName(), trace);
-                // The two claims are of different strength and must not be coupled.
-                // States come from `permits`, which is compiler-checked, so they are
-                // exact whether or not any transition producer was recognised — yet
-                // this `continue` used to be the only path a rejected root took, and
-                // StateExtractor was never reached for one. The tool therefore
-                // reported ZERO states for a hierarchy whose states were never in
-                // doubt, silently downgrading "states are exact" to "states are
-                // exact when transitions resolve". A rejected root that IS
-                // discriminated is now reported as a Tier 3 candidate, states and
-                // all, and still not as a machine.
-                recordCandidate(root, model, c, result);
+                // Thesis Decision 1: locating a sealed declaration is not deciding it
+                // is a machine. A rejected hierarchy is never a machine and its
+                // members are never recovered FSM states. What a rejection may still
+                // release is a PROVISIONAL candidate, and only where a supported
+                // dispatch pattern supplied plausible evidence and the relation could
+                // not be established. Its member listing is the answer to "if this is
+                // a machine, what would its states be?", and it is never counted as
+                // recovered states. An established conversion releases nothing
+                // (Decision 4).
+                boolean candidate = recordCandidate(root, model, c, result);
+                result.outcome(root.getQualifiedName(), candidate
+                        ? ExtractionResult.Outcome.CANDIDATE : outcomeOf(c.rejection()), c.reason());
                 continue;
             }
             reportResolution(root, result, resolution, false);
@@ -137,7 +140,7 @@ public final class Analyzer {
             // every transition endpoint, so an edge cannot name a state that does
             // not exist — or, worse, silently merge with an edge between two other
             // states because both endpoints collapsed to one spelling.
-            StateExtractor.Result states = stateExtractor.extract(root);
+            StateExtractor.Result states = stateExtractor.extract(root, model);
             for (State s : states.topLevelStates()) {
                 machine.addTopLevelState(s);
             }
@@ -151,6 +154,7 @@ public final class Analyzer {
                         "disambiguated state name(s) " + states.naming().collidingSimpleNames()
                                 + " — the permits clause names distinct types sharing a simple name");
             }
+            reportBranchLimits(root, states, result);
 
             Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
             // Every member of an accepted machine is one of its STATES, so none of
@@ -160,9 +164,13 @@ public final class Analyzer {
             // machine: without this the type would be reported twice, once as a
             // composite state and once as a machine of its own.
             claimed.addAll(hierarchy);
+            // F36: the extractor walks exactly the sites whose successor the
+            // classifier showed becoming the current state. It receives the same
+            // report, rather than re-deriving one, so the two cannot disagree.
             TransitionExtractor te =
                     new TransitionExtractor(hierarchy, root.getQualifiedName(), states.naming())
-                            .explaining(explain);
+                            .explaining(explain)
+                            .withInstallation(c.installation());
             for (Transition t : te.extract(root, model)) {
                 machine.addTransition(t);
             }
@@ -238,7 +246,7 @@ public final class Analyzer {
                 result.info(root.getQualifiedName(),
                         "TIER 2 (dispatch present, commit proven via "
                                 + machine.commitEvidence() + ", no successor resolved) — the "
-                                + machine.allStates().size() + " states are exact regardless; "
+                                + levels(machine) + " are exact regardless; "
                                 + (machine.transitions().isEmpty()
                                         // F27: the total loss. Marked, because a bare 0/0 reads
                                         // as a machine that simply has no transitions.
@@ -252,7 +260,7 @@ public final class Analyzer {
             long viaUnread = machine.transitionsViaUnreadDeclaration();
             result.info(root.getQualifiedName(),
                     "extracted — " + c.reason() + "; "
-                            + machine.allStates().size() + " states, "
+                            + levels(machine) + ", "
                             + machine.resolvedTransitionCount() + "/"
                             + machine.transitions().size() + " transitions resolved"
                             + (viaUnread > 0
@@ -261,8 +269,57 @@ public final class Analyzer {
                                             + "than the rest"
                                     : ""));
             result.addMachine(machine);
+            result.outcome(root.getQualifiedName(), ExtractionResult.Outcome.MACHINE, c.reason());
         }
         return result;
+    }
+
+    /**
+     * The three state levels thesis Decision 2 separates, in words: the direct
+     * branches, the atomic states they expand to, and the grouping nodes between.
+     * A single "N states" mixed the three, counting a permitted enum once as a
+     * state and once per constant.
+     */
+    static String levels(StateMachine m) {
+        int composites = m.compositeNodes().size();
+        return m.directBranches().size() + " direct branch(es), " + m.atomicStates().size()
+                + " atomic state(s)" + (composites == 0 ? "" : " (" + composites + " grouping node(s))");
+    }
+
+    /** The outcome a rejection records, when it releases no candidate. */
+    private static ExtractionResult.Outcome outcomeOf(Rejection r) {
+        return switch (r) {
+            case VETOED -> ExtractionResult.Outcome.VETOED;
+            case CONVERTED -> ExtractionResult.Outcome.CONVERTED;
+            default -> ExtractionResult.Outcome.ABSTAINED;
+        };
+    }
+
+    /**
+     * Thesis Decision 2's limits on the exact claim, reported where they apply.
+     * Exact enumeration of direct branches is a claim about TYPE BRANCHES. An open
+     * ({@code non-sealed}) branch may have subclasses the {@code permits} clause
+     * never lists, and a type reachable under two direct branches has no single
+     * branch the tool could name without guessing.
+     */
+    private static void reportBranchLimits(CtType<?> root, StateExtractor.Result states,
+                                           ExtractionResult result) {
+        String where = root.getQualifiedName();
+        states.openBranches().forEach((branch, subclasses) -> result.warn(where,
+                "branch " + branch + " is non-sealed: it is counted as ONE state, and the type "
+                        + "system does not close it, so a subclass may behave differently from it"
+                        + (subclasses.isEmpty()
+                                ? " (none is in the source set)"
+                                : ". The source set extends it with " + subclasses + ": they are not "
+                                        + "enumerated as states, and a transition method they "
+                                        + "declare or override is attributed to no state")));
+        states.overlaps().forEach((type, branches) -> result.warn(where,
+                "type " + type + " is reachable under " + branches.size() + " direct branches "
+                        + branches + ": it is ONE atomic state, and which branch an object of it "
+                        + "belongs to is not a question the type system answers, so none is chosen for "
+                        + "the counts. The exported diagram and SCXML nest it under the first branch "
+                        + "only, because a state there has one parent; that placement is a drawing "
+                        + "convention, not a claim"));
     }
 
     /**
@@ -484,7 +541,13 @@ public final class Analyzer {
      */
     private String reoffer(CtType<?> root, Classification c,
                            Deque<CtType<?>> pending, Set<String> claimed) {
-        if (c.rejection() != Rejection.ABSTAINED) return "";
+        // F36: an established conversion is a verdict about how the hierarchy's
+        // values are USED, not about what its members are, so a machine nested
+        // inside still gets its own look. Judged against the child's own hierarchy,
+        // a conversion between the parent's members cannot become invisible the way
+        // a composition can. The child's producers are asked the same installation
+        // question, of the same callers.
+        if (c.rejection() != Rejection.ABSTAINED && c.rejection() != Rejection.CONVERTED) return "";
         List<CtType<?>> nested = detector.permittedSealedSubtypes(root).stream()
                 .filter(t -> !claimed.contains(t.getQualifiedName()))
                 .toList();
@@ -497,58 +560,86 @@ public final class Analyzer {
     }
 
     /**
-     * Tier 3 — record a rejected root as a <em>candidate</em>: not a machine, and
-     * its complete state set reported anyway.
+     * Tier 3: record a rejected root as a PROVISIONAL <em>candidate</em>. It is
+     * not a machine, and its members are listed as would-be states, never as
+     * recovered FSM states (thesis Decisions 1 and 4).
      *
-     * <p>This is where the tool's two claims stop being coupled. State enumeration
-     * is exact by construction ({@code permits} is compiler-checked); the
-     * transition relation is approximate. Until this method existed the analyzer
-     * derived states only on the accepted path, so a hierarchy whose producer no
-     * recognizer matched reported <b>zero states</b> — and "states are exact" had
-     * quietly become "states are exact when transitions resolve", which is a
-     * materially weaker claim and one the tool does not need to make.
+     * <p>Returns whether a candidate was recorded.
      *
-     * <p>Two conditions, both load-bearing.
+     * <p>A candidate is reported only when a supported dispatch pattern supplied
+     * plausible evidence and a transition relation could not be established.
+     * Three kinds of evidence open the channel, and each fails for a different
+     * reason, so each gets its own clause ({@link Candidate.Basis}):
+     * <ul>
+     *   <li>the state is discriminated and no commit is proven there (F26, F32);</li>
+     *   <li>a commit is proven by a Σ-major dispatch, and the state is
+     *       discriminated nowhere (F27);</li>
+     *   <li>a value-returning dispatch produces hierarchy values, and no caller is
+     *       shown installing the result as the current state (F36). Here a
+     *       conversion and a state update cannot be told apart from the source.</li>
+     * </ul>
+     *
+     * <p>Three conditions, all load-bearing.
      *
      * <p><b>Only an ABSTENTION.</b> A veto is a positive verdict about the data
-     * type — its members are composed into one another, so it is a tree and its
-     * "next" is a child — and that verdict binds on the members. Offering a
-     * recursive data type as a candidate would say the tool is undecided about
-     * something it decided, and it is the same distinction that already governs
-     * whether a rejected root re-offers its nested hierarchies ({@link #reoffer}).
+     * type (its members are composed into one another, so it is a tree and its
+     * "next" is a child), and that verdict binds on the members. An established
+     * conversion is a positive verdict too: Decision 4 forbids publishing a known
+     * conversion's members on either channel.
      *
-     * <p><b>Only where a dispatch was actually found.</b> "Dispatch present, commit
-     * not proven" is the definition of the tier, and dropping the first half would
-     * make every sealed type in the model a candidate — at which point the channel
-     * says nothing, because it no longer distinguishes anything. {@code examples/shape}
-     * is the control: a plain sum type nothing switches over stays a plain
-     * rejection with no candidate.
+     * <p><b>Only where a dispatch was actually found.</b> Dropping that would make
+     * every sealed type in the model a candidate, and the channel would then
+     * distinguish nothing. {@code examples/shape} is the control: a plain sum type
+     * nothing switches over stays a plain rejection. A lone uncalled typed converter
+     * ({@code typedhandler.Shape}) is not a dispatch either
+     * ({@link Installation.Report#plausibleDispatch}).
      *
-     * <p>The state set is produced by the SAME {@link StateExtractor} call the
-     * machine path makes, nesting and all, so a candidate's states are the states
-     * the machine would have had — composites hold their children, a permitted enum
-     * holds its constants — rather than a flattened approximation. That equality is
-     * what the completeness test asserts.
+     * <p><b>The members are listed provisionally, never counted.</b> They come from
+     * the same {@link StateExtractor} call the machine path makes, nesting and all,
+     * so they are exact as a statement about the type structure. But the
+     * hierarchy is not a machine, so they are not machine states, and no metric
+     * may count them as recovered.
      */
-    private void recordCandidate(CtType<?> root, CtModel model, Classification c,
-                                 ExtractionResult result) {
-        if (c.rejection() != Rejection.ABSTAINED) return;
+    private boolean recordCandidate(CtType<?> root, CtModel model, Classification c,
+                                    ExtractionResult result) {
+        if (c.rejection() != Rejection.ABSTAINED) return false;
         Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
-        List<DispatchSite> loci = DispatchFinder.locusSites(root, model);
-        // F27 — the transition table written TRANSPOSED. A switch over the event
+        // F36: the value-returning sites whose result no caller was shown
+        // installing. Named under their own clause, and only when they amount to
+        // a dispatch.
+        Installation.Report installation = c.installation();
+        List<Installation.SiteVerdict> uninstalled =
+                installation == null ? List.of() : installation.unestablished();
+        boolean installationGap = !uninstalled.isEmpty() && installation.plausibleDispatch();
+        // A discrimination whose commit IS proven (a producer) and is merely not
+        // installed belongs to the installation clause. CommitGap would describe it
+        // as a value in "a position no commit rule reads", which is false of it.
+        Set<CtElement> producerNodes = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (Installation.SiteVerdict v : uninstalled) {
+            if (v.route() == Installation.Route.PRODUCER) producerNodes.add(v.site().node());
+        }
+        List<DispatchSite> loci = DispatchFinder.locusSites(root, model).stream()
+                .filter(site -> !producerNodes.contains(site.node())).toList();
+        // F27: the transition table written TRANSPOSED. A switch over the event
         // whose arms install a state discriminates Σ, not Q, so every recognizer
         // above answers "no dispatch" and the hierarchy previously reported no
         // states either. That is evidence for the candidate channel and never for
         // a machine: a Σ-major arm establishes no source state, so a relation
         // built from one would be sourced entirely at <unknown>.
         EventMajorDispatch.Result eventMajor = EventMajorDispatch.find(root, model, hierarchy);
-        if (loci.isEmpty() && eventMajor.isEmpty()) return;
+        if (loci.isEmpty() && eventMajor.isEmpty() && !installationGap) return false;
 
-        StateExtractor.Result states = stateExtractor.extract(root);
+        StateExtractor.Result states = stateExtractor.extract(root, model);
         List<String> sites = new ArrayList<>();
         for (DispatchSite site : loci) {
             sites.add(site.locus() + " @ " + (site.hostKey() == null
                     ? String.valueOf(site.host()) : site.hostKey()));
+        }
+        if (installationGap) {
+            for (Installation.SiteVerdict v : uninstalled) {
+                sites.add(v.site().locus() + " @ " + (v.site().hostKey() == null
+                        ? v.hostName() : v.site().hostKey()) + " [" + v.verdict() + "]");
+            }
         }
         for (EventMajorDispatch.Site site : eventMajor.sites()) {
             sites.add(site.describe());
@@ -564,19 +655,30 @@ public final class Analyzer {
                     root.getQualifiedName()).unreadable());
         }
         unreadable.addAll(eventMajor.unreadable());
-        // The two kinds of evidence fail for OPPOSITE reasons and a candidate must
-        // say which: a state-major locus has the discrimination and no commit, a
-        // Σ-major one has the commit and no discrimination of the state. Reporting
-        // either under the other's sentence would misattribute the gap.
-        // F32 — and within the state-major half, one sentence was printed for four
+        // The kinds of evidence fail for DIFFERENT reasons and a candidate must say
+        // which: a state-major locus has the discrimination and no commit, a
+        // Σ-major one has the commit and no discrimination of the state, an
+        // uninstalled producer has both and no store-back. Reporting one under
+        // another's sentence would misattribute the gap.
+        // F32: within the state-major half, one sentence was printed for four
         // different gaps. CommitGap names, site by site, which evidence was missing.
         List<String> reasons = new ArrayList<>();
+        Set<Candidate.Basis> basis = java.util.EnumSet.noneOf(Candidate.Basis.class);
         if (!loci.isEmpty()) {
+            basis.add(Candidate.Basis.COMMIT_UNPROVEN);
             reasons.add("the state is discriminated at " + loci.size()
                     + " site(s), but no commit is proven: "
                     + CommitGap.summarize(loci, hierarchy, root.getQualifiedName()));
         }
+        if (installationGap) {
+            basis.add(Candidate.Basis.INSTALLATION_UNSHOWN);
+            reasons.add(uninstalled.size() + " value-returning dispatch site(s) produce hierarchy "
+                    + "values, but no caller in the source set is shown installing the result as "
+                    + "the current state, so a conversion and a state update cannot be told apart "
+                    + "(F36, thesis Decision 4): " + describeInstallationGap(uninstalled));
+        }
         if (!eventMajor.isEmpty()) {
+            basis.add(Candidate.Basis.SOURCE_UNATTRIBUTED);
             reasons.add("a hierarchy value IS committed at " + eventMajor.sites().size()
                     + " Σ-major site(s) — a switch over the event alphabet whose arms install a "
                     + "state — but the state itself is discriminated nowhere, so no successor can "
@@ -588,12 +690,39 @@ public final class Analyzer {
                                 + "and an unread body is not evidence of a commit (F11)");
 
         Candidate candidate = new Candidate(root.getSimpleName(), root.getQualifiedName(),
-                states.topLevelStates(), sites, reason);
+                states.topLevelStates(), sites, reason, basis);
         result.addCandidate(candidate);
         result.info(root.getQualifiedName(),
-                "CANDIDATE (Tier 3), not a machine — " + candidate.allStates().size()
-                        + " state(s) enumerated from permits " + stateIds(candidate)
-                        + ": " + reason);
+                "CANDIDATE (Tier 3, PROVISIONAL), not a machine — its members are listed as would-be "
+                        + "states, not recovered FSM states: " + candidate.directBranches().size()
+                        + " direct branch(es), " + candidate.atomicStates().size() + " atomic member(s) "
+                        + stateIds(candidate) + ": " + reason);
+        return true;
+    }
+
+    /**
+     * The uninstalled sites grouped by verdict, each group naming its hosts and the
+     * first piece of evidence. Text only.
+     */
+    private static String describeInstallationGap(List<Installation.SiteVerdict> uninstalled) {
+        java.util.Map<Installation.Verdict, List<Installation.SiteVerdict>> byVerdict =
+                new java.util.EnumMap<>(Installation.Verdict.class);
+        for (Installation.SiteVerdict v : uninstalled) {
+            byVerdict.computeIfAbsent(v.verdict(), k -> new ArrayList<>()).add(v);
+        }
+        List<String> parts = new ArrayList<>();
+        byVerdict.forEach((verdict, vs) -> {
+            Set<String> hosts = new LinkedHashSet<>();
+            for (Installation.SiteVerdict v : vs) hosts.add(v.hostName());
+            String head = switch (verdict) {
+                case NO_CALLER -> "no caller in the source set";
+                case OPAQUE -> "the result is handed somewhere the analysis does not follow";
+                case CONVERTED -> "the result is used as data";
+                default -> verdict.toString();
+            };
+            parts.add(head + " " + hosts + " (" + vs.get(0).detail() + ")");
+        });
+        return String.join("; ", parts);
     }
 
     /** The arm bodies of a site, which is what the commit probe is asked about. */
@@ -606,7 +735,7 @@ public final class Analyzer {
     }
 
     private static List<String> stateIds(Candidate c) {
-        return c.allStates().stream().map(State::id).toList();
+        return c.atomicStates().stream().map(State::id).toList();
     }
 
     /**

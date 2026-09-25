@@ -1837,3 +1837,144 @@ the case where every production is `this`.
 **Cell table update.** `POLYMORPHIC_OVERRIDE × FIELD_MUTATION` and
 `× MUTATOR_ARGUMENT` go from `R*` to **R**: `examples/gofstate`, and
 `gofcontext.Portal` without relying on its marker.
+
+## F36 — a returned successor is a transition only where a caller installs it (thesis Decision 4)
+
+**Defect.** A value-returning host (a per-state `next()`, a centralized
+`transition(H, E)`, a typed handler, a functional callable, a carrier) was
+committed by its **codomain alone**: returning H *was* the `VALUE_RETURN` commit.
+A conversion within a sum type has the same codomain and the same body shape, so
+a family of converters was published as a machine. `LIMITATIONS.md` L3 recorded
+this and pinned `typedhandler.Length` (`toFeet(Meters)` + `toMeters(Feet)`) as
+a wrong answer on purpose. F35's family threshold removed only the
+one-converter case, and it cost a real one-handler machine (`typedhandler.Lamp`).
+Thesis Decision 4 ("converters are not FSMs") requires the fix L3 specified,
+applied at every locus, with missing caller evidence read as uncertainty.
+
+**Fix.** New `detect/dispatch/Installation`. For every site whose successor
+leaves its host by `return` (`VALUE_RETURN`, `CARRIER_RETURN`, `POLY_CARRIER`,
+and a `LOCAL_ACCUMULATOR` that is returned), it follows the returned value to
+where it goes. The value passes through conditionals, switch-expression arms,
+locals (flow-insensitively), returns (to the host's callers, including callers
+of a method the host overrides) and arguments (into a unique in-model callee's
+parameter), for up to `MAX_DEPTH` = 6 call boundaries. It stops at one of four
+sinks:
+
+1. a write to a field declared with the root (`CommitProbe.isRootFieldWrite`, the
+   probe's own clause);
+2. a write back into the variable the call read its state from (`s = step(s)`,
+   `current = current.next()`);
+3. the argument of a recognised mutator (`MutatorRecognizer`);
+4. the selector argument of a run-to-completion driver (`RunToCompletion`, F34's
+   predicate, now shared with the extractor rather than private to it).
+
+A carrier is followed until its hierarchy-typed component is read out
+(`t.next()`, `opt.orElse(h)`). Each site gets one verdict:
+
+| verdict | meaning | established? |
+|---|---|---|
+| `IN_HOST` | installed inside the site: field mutation, mutator, probed callee, context commit, a stored accumulator, or a stateful driver's own dispatch (its return is a read-back, F19) | yes |
+| `REENTRY` | a run-to-completion driver | yes |
+| `INSTALLED` | a caller stores it back (`CommitEvidence.VIA_CALLER`) | yes |
+| `NO_CALLER` | no call exists in the source set | no, uncertain |
+| `OPAQUE` | a caller hands it somewhere not followed (library, collection, lambda, non-unique target, budget) | no, uncertain |
+| `CONVERTED` | callers exist and every one uses it as data | no, **established conversion** |
+
+The classifier accepts on established sites only, and the extractor walks
+exactly those sites. The report travels with the `Classification`, so the two
+cannot disagree. Outcomes:
+
+- some site established: a **machine**. Unestablished sites are not walked, and
+  a diagnostic names them;
+- every unestablished site `CONVERTED`: `Rejection.CONVERTED`. This releases no
+  candidate (Decision 4 forbids publishing a known conversion on either channel)
+  and still re-offers nested roots;
+- otherwise: an **abstention**. It is a provisional candidate with basis
+  `INSTALLATION_UNSHOWN` when the sites amount to a dispatch (a discrimination,
+  or per-state sites fixing ≥2 source states; F35's threshold, now a
+  plausibility test) and a plain abstention otherwise.
+
+`findCentralizedTransitionMethods` admits every typed handler: F35's acceptance
+threshold is retired, and installation decides. `CommitEvidence` gains
+`VIA_CALLER` and `weaker()`. The DOT/SCXML evidence comment stays reserved for
+the probe's `VIA_CALLEE`, which qualifies edges rather than the classification.
+
+**Fixtures.**
+
+| fixture | role | before | after |
+|---|---|---|---|
+| `typedhandler.Length` | Decision 4's named example: two converters, no caller | machine 2/2 (pinned wrong) | provisional candidate |
+| `typedhandler.Lamp` + `LampPanel` | demonstrated state update, one handler | rejected (F35 cost) | machine 1/1, `VIA_CALLER` |
+| `typedhandler.Temperature` (new) | converter use: results switched over into a `String` | — | rejected as a conversion, no candidate |
+| `typedhandler.Shape` | one uncalled converter | rejected | abstained, no candidate |
+| `typedhandler.OrderState` | a pipeline without its driver | machine 5/5 | provisional candidate (missing caller) |
+| `converters.Tint` (new) | switch converter, stored back | — | machine 2/2 |
+| `converters.Shade` (new) | the same, result used as data | — | rejected as a conversion |
+| `converters.Hue` (new) | the same, never called | — | provisional candidate |
+| `converters.Currency` (new) | per-state converter, used as data | — | rejected as a conversion |
+| `functionaldriver` (new) | `cancellation`'s callables, installed in-model | — | machine 6/6, identical relation |
+| `cancellation` | installs through `AtomicReference.accumulateAndGet` (L2) | machine 6/6 | provisional candidate |
+| `nestedroots.Rebuilder` (new) | `branch = branch.replaceChild(child)`: a persistent-tree update is a store-back | — | keeps the veto control meaningful |
+
+**Re-baselining, measured.** 22 corpus machines had no installing caller,
+because their fixtures were written without a driver (the `@Fsm`-marked `Vend`
+needs no evidence and is not counted). The 19 whose purpose is extraction, in
+14 directories, received a minimal, **unseeded** store-back class, so the initial-state heuristics
+are handed nothing new: `enumbodies.Panel`, `errorhandling.JobDriver`,
+`eventalphabet.PlayerDriver`, `factory.BoltDriver`, `guardforms.SignalDriver`,
+`localvar.GateDriver`, `nonreturning.LatchDriver`, `opaquesuccessor.LatchDriver`,
+`opaquepolymorphic.RotorDriver`, `plumbing.ConveyorBelt`,
+`staticfactory.Console`, `turnstile.TurnstileDriver`, `valueforms.SignalDriver`,
+`typedhandler.HatchPanel`, and `press`/`run` on the two F19 stateful drivers. The
+test resources received `Installers`/`KnobPanel`/`Lantern` for the same reason.
+Every `.dot` and `.scxml` of every re-driven fixture is **byte-identical** to
+`master`. That is the check that the drivers added evidence and changed nothing
+else.
+
+**Regression gate.** 57 fixtures. DOT and SCXML are byte-identical to `master`
+except the intended changes (cancellation out, `Length`/`OrderState` out, `Lamp`
+in, two new fixtures) and F37's SCXML header counts. 67 machines before and after
+(16 `DIRECT`, 50 `VIA_CALLER`, 1 `VIA_CALLEE`). Candidates 17 → 21, all four new
+ones `INSTALLATION_UNSHOWN` (`CANDIDATES.md`). Tests: `InstallationEvidenceTest`,
+plus updated `ExtractionIntegrationTest` and `StateCompletenessTest`.
+
+**Residuals, stated.** A converted value cached in a root-typed field reads as
+installed (the decision's own clause, "an assignment to a state field"). Local
+flow is flow-insensitive, which errs toward installation. A library container
+(L2) and a store-back outside the source set both read as uncertain: a real
+machine whose driver lives in client code abstains, and the evaluation protocol
+counts that as a miss.
+
+## F37 — direct branches, grouping nodes and atomic states are three levels (thesis Decision 2)
+
+**Defect.** One number, `allStates().size()`, stood for "states". It was the
+flattened node list, in which a permitted enum counted once as a state and again
+per constant: `valueforms.Signal` read as 6 states for a 4-member `permits`
+clause with 5 leaves. Nested sealed members were mixed into the same count. A
+`non-sealed` branch was silently treated as closed. A type permitted by two sealed
+branches appeared twice in the tree, was reported as "two states share the id",
+and was declared twice in SCXML.
+
+**Fix.** `State` gains `origin()` (`TYPE` / `ENUM_CONSTANT`), `isAtomic()`,
+`isGrouping()` and `isOpenBranch()`. `StateMachine` and `Candidate` gain
+`directBranches()`, `atomicStates()` (leaves, each counted once) and
+`compositeNodes()`. `StateExtractor.extract(root, model)` also returns
+`openBranches` (each `non-sealed` node with the subclasses the model contains) and
+`overlaps` (types reachable under ≥2 direct branches). The analyzer warns on both.
+`duplicateStateIds()` counts distinct types only. The serializers declare an
+overlapping type once and comment its other placement, so SCXML stays valid. The
+summary table has `BRANCH` and `ATOMIC` columns, the INFO lines name all three
+levels, and the SCXML header count names its level wherever grouping nodes exist.
+
+**Decided and documented:** the exported machine keeps the full hierarchical
+expansion, because a successor may name a node at any depth. The direct-branch
+count never absorbs it (`SCOPE.md` §2).
+
+**Fixture** `src/test/resources/statelevels`: the decision's own `Phase`/`Speed`
+example, a nested sealed branch (`Mode`/`On`), an open branch with a subclass
+(`Hatch`/`Ajar`/`WideAjar`), and an overlap (`Signal`/`Red`/`Amber`/`Blink`). Test
+`StateLevelsTest`.
+
+**Corpus.** DOT byte-identical. SCXML changed only in the header comment of the
+six machines with grouping nodes (`valueforms.Signal`, `namecollision.Link`, and
+the four `enumbodies` machines). Summary tables changed format everywhere.

@@ -70,6 +70,15 @@ public final class SashDriver {
         }
     }
 
+    /**
+     * F36 (thesis Decision 4): the store-back. {@code step} PRODUCES the successor.
+     * Only installing it as the current state makes it a transition rather than a
+     * conversion, and without this method the hierarchy is a provisional candidate.
+     */
+    public void press(Nudge nudge) {
+        state = step(nudge);
+    }
+
     /** NEGATIVE CONTROL: returns Sash, takes no Sash, discriminates nothing. */
     public Sash state() {
         return state;

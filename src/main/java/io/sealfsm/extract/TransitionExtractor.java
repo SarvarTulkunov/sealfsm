@@ -14,6 +14,8 @@ import io.sealfsm.detect.dispatch.MutatorRecognizer;
 import io.sealfsm.detect.dispatch.DispatchFinder;
 import io.sealfsm.detect.dispatch.DispatchLocus;
 import io.sealfsm.detect.dispatch.DispatchSite;
+import io.sealfsm.detect.dispatch.Installation;
+import io.sealfsm.detect.dispatch.RunToCompletion;
 import io.sealfsm.detect.SpoonCompat;
 import io.sealfsm.detect.StateMachineClassifier;
 import io.sealfsm.model.CommitEvidence;
@@ -432,6 +434,15 @@ public final class TransitionExtractor {
     // recording it at all is that a gap in an inference must not hide behind an
     // observation made elsewhere in the same machine.
     private final Set<CommitEvidence> commitEvidence = new LinkedHashSet<>();
+    // F36, thesis Decision 4: which sites' successors are shown to become the
+    // current state. Null when the classification did not rest on it (an @Fsm
+    // marker), and then every recognised site is walked, as before. Otherwise a
+    // site the report does not establish is NOT walked: its arms may be
+    // conversions, and Decision 4 forbids emitting a conversion as a transition.
+    private Installation.Report installation;
+    // The sites skipped for that reason, by host, with the verdict that kept them
+    // out. Reported, never silent.
+    private final Set<String> unclaimedSites = new LinkedHashSet<>();
     // How many arms were recorded as unresolved because their commit lives inside
     // a callee the probe opened. Reported, so a Tier 2 relation reads as a stated
     // scope boundary rather than as an unexplained row of question marks.
@@ -616,6 +627,41 @@ public final class TransitionExtractor {
         return this;
     }
 
+    /**
+     * Walk only the sites {@code report} establishes (F36). {@code null} keeps the
+     * pre-F36 behaviour of walking every recognised site. That is right only where
+     * no installation analysis stands behind the acceptance, which is an
+     * {@code @Fsm} marker's case.
+     */
+    public TransitionExtractor withInstallation(Installation.Report report) {
+        this.installation = report;
+        return this;
+    }
+
+    /** {@link #claimed} without recording a refusal, for decisions taken before any walk. */
+    private boolean isClaimed(Installation.Route route, DispatchSite site) {
+        return installation == null || site == null || installation.established(route, site);
+    }
+
+    /**
+     * Is {@code site} one whose arms may be claimed as transitions? Records the
+     * refusal otherwise.
+     */
+    private boolean claimed(Installation.Route route, DispatchSite site) {
+        if (isClaimed(route, site)) return true;
+        Installation.SiteVerdict v = installation.verdict(route, site);
+        unclaimedSites.add((v == null ? String.valueOf(site.hostKey()) : v.hostName())
+                + " — " + (v == null ? "not judged" : v.verdict() + ": " + v.detail()));
+        return false;
+    }
+
+    /** The evidence an established site adds: VIA_CALLER when a caller installed it. */
+    private CommitEvidence installationEvidence(Installation.Route route, DispatchSite site) {
+        if (installation == null || site == null) return CommitEvidence.DIRECT;
+        Installation.SiteVerdict v = installation.verdict(route, site);
+        return v == null ? CommitEvidence.DIRECT : v.verdict().evidence();
+    }
+
     /** The binding trace collected when {@link #explaining} is on, in walk order. */
     public List<String> bindingTrace() {
         return new ArrayList<>(bindingTrace);
@@ -645,8 +691,11 @@ public final class TransitionExtractor {
      * found.
      */
     public CommitEvidence commitEvidence() {
-        return commitEvidence.contains(CommitEvidence.VIA_CALLEE)
-                ? CommitEvidence.VIA_CALLEE : CommitEvidence.DIRECT;
+        CommitEvidence weakest = CommitEvidence.DIRECT;
+        for (CommitEvidence e : commitEvidence) {
+            if (e != CommitEvidence.UNPROVEN) weakest = weakest.weaker(e);
+        }
+        return weakest;
     }
 
     /**
@@ -700,17 +749,24 @@ public final class TransitionExtractor {
         // F22: a transition method's NAME is an input symbol only when it
         // DISCRIMINATES — see eventName. Decided here, once per hierarchy and
         // before any body is walked, over the methods each walk will actually own.
+        // "Will actually own" includes F36: a site whose successor is not shown to be
+        // installed is not walked, so its name is not one of the hierarchy's inputs.
         Set<String> distributedNames = new LinkedHashSet<>();
-        for (CtMethod<?> m : distributed) {
-            if (!helperSignatures.contains(m.getSignature())) distributedNames.add(m.getSimpleName());
+        for (DispatchSite site : sites.overrides()) {
+            CtMethod<?> m = (CtMethod<?>) site.host();
+            if (!helperSignatures.contains(m.getSignature())
+                    && isClaimed(Installation.Route.OVERRIDE, site)) {
+                distributedNames.add(m.getSimpleName());
+            }
         }
         // F33: context-committing per-state methods are the same locus, so their
         // names belong to the same question. `pay` beside `cancel` is the input.
         for (CtMethod<?> m : methodHosts(sites.contextCommits())) distributedNames.add(m.getSimpleName());
         this.distributedNamesDiscriminate = distributedNames.size() > 1;
         Set<String> functionalNames = new LinkedHashSet<>();
-        for (CtElement callable : functional) {
-            String enclosing = enclosingMethodName(callable);
+        for (DispatchSite site : sites.functional()) {
+            if (!isClaimed(Installation.Route.FUNCTIONAL, site)) continue;
+            String enclosing = enclosingMethodName(site.host());
             if (enclosing != null) functionalNames.add(enclosing);
         }
         this.functionalNamesDiscriminate = functionalNames.size() > 1;
@@ -722,6 +778,7 @@ public final class TransitionExtractor {
         for (DispatchSite site : sites.centralized()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
             if (m.getBody() != null && !helperSignatures.contains(m.getSignature())
+                    && isClaimed(Installation.Route.CENTRALIZED, site)
                     && typedSourceState(m) != null) {
                 typedNames.add(m.getSimpleName());
             }
@@ -730,8 +787,11 @@ public final class TransitionExtractor {
 
         for (DispatchSite site : sites.overrides()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
-            if (!helperSignatures.contains(m.getSignature())) {
-                walkAt(site, Route.OVERRIDE, CommitForm.VALUE_RETURN, () -> extractDistributed(m, out));
+            if (!helperSignatures.contains(m.getSignature())
+                    && claimed(Installation.Route.OVERRIDE, site)) {
+                walkAt(site, Route.OVERRIDE, CommitForm.VALUE_RETURN,
+                        installationEvidence(Installation.Route.OVERRIDE, site),
+                        () -> extractDistributed(m, out));
             }
         }
         List<DispatchCommitDetector.Producer> producers = DispatchCommitDetector.find(root, model);
@@ -750,7 +810,10 @@ public final class TransitionExtractor {
         // manufactured out of a context it already held.
         for (DispatchSite site : sites.overrides()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
-            if (!helperSignatures.contains(m.getSignature())) walkedMethods.add(methodKey(m));
+            if (!helperSignatures.contains(m.getSignature())
+                    && isClaimed(Installation.Route.OVERRIDE, site)) {
+                walkedMethods.add(methodKey(m));
+            }
         }
         for (DispatchSite site : sites.centralized()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
@@ -773,13 +836,17 @@ public final class TransitionExtractor {
                     && !StateMachineClassifier.takesHierarchyParameter(m, hierarchyQualifiedNames)) {
                 continue;
             }
+            if (!claimed(Installation.Route.CENTRALIZED, site)) continue;
             walkAt(site, Route.CENTRALIZED_METHOD, CommitForm.VALUE_RETURN,
+                    installationEvidence(Installation.Route.CENTRALIZED, site),
                     () -> extractCentralized(m, out));
             walkedMethods.add(methodKey(m));
             walkedHosts.add(methodKey(m));
         }
         for (DispatchSite site : sites.functional()) {
+            if (!claimed(Installation.Route.FUNCTIONAL, site)) continue;
             walkAt(site, Route.FUNCTIONAL, CommitForm.VALUE_RETURN,
+                    installationEvidence(Installation.Route.FUNCTIONAL, site),
                     () -> extractFunctional(site.host(), out));
         }
         // The widened centralized recognizer: a switch over the hierarchy whose
@@ -790,19 +857,26 @@ public final class TransitionExtractor {
         List<DispatchSite> producerSites = sites.producers();
         for (int i = 0; i < producers.size(); i++) {
             DispatchCommitDetector.Producer p = producers.get(i);
-            if (walkedMethods.contains(methodKey(p.host()))
-                    || helperSignatures.contains(p.host().getSignature())) {
-                commitForms.add(p.commit());
-                commitEvidence.add(p.evidence());
-                continue;
-            }
             // The site and the producer are the two halves of one dispatch: the
             // site is the LOCUS, the producer carries the COMMIT the classifier
             // recognised. They are built from the same scan in the same order, so
             // index i pairs them; the site is what the walker is told it is inside.
             DispatchSite site = i < producerSites.size() ? producerSites.get(i) : null;
+            CommitEvidence evidence =
+                    p.evidence().weaker(installationEvidence(Installation.Route.PRODUCER, site));
+            if (walkedMethods.contains(methodKey(p.host()))
+                    || helperSignatures.contains(p.host().getSignature())) {
+                // Another walk owns the host. The commit still describes the
+                // machine, but only if it is one the machine's acceptance rests on.
+                if (isClaimed(Installation.Route.PRODUCER, site)) {
+                    commitForms.add(p.commit());
+                    commitEvidence.add(evidence);
+                }
+                continue;
+            }
+            if (!claimed(Installation.Route.PRODUCER, site)) continue;
             walkedHosts.add(methodKey(p.host()));
-            walkAt(site, Route.COMMIT_DISPATCH, p.commit(), p.evidence(),
+            walkAt(site, Route.COMMIT_DISPATCH, p.commit(), evidence,
                     () -> extractCommitDispatch(p, out));
         }
         // F8: per-state methods that return a *carrier* wrapping the successor.
@@ -814,7 +888,10 @@ public final class TransitionExtractor {
         // walker above already owns those — so the two paths never share a body.
         for (DispatchSite site : sites.carriers()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
-            walkAt(site, Route.CARRIER, CommitForm.POLY_CARRIER, () -> extractCarrier(m, out));
+            if (!claimed(Installation.Route.CARRIER, site)) continue;
+            walkAt(site, Route.CARRIER, CommitForm.POLY_CARRIER,
+                    installationEvidence(Installation.Route.CARRIER, site),
+                    () -> extractCarrier(m, out));
         }
         // F33: the GoF State pattern — per-state methods committing through a
         // context. The source state is exact (the states the body runs in), the
@@ -896,6 +973,11 @@ public final class TransitionExtractor {
             diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
                     + "(always throws or diverges) contributed no transition — the arms holding "
                     + "them are undefined inputs, not unresolved targets");
+        }
+        if (!unclaimedSites.isEmpty()) {
+            diagnostics.add(unclaimedSites.size() + " value-returning site(s) were NOT walked, because "
+                    + "their result is not shown to become the current state, and their arms are not "
+                    + "claimed as transitions (F36, thesis Decision 4): " + String.join("; ", unclaimedSites));
         }
         if (reentryArms > 0) {
             diagnostics.add(reentryArms + " arm(s) re-enter their own dispatch with the successor "
@@ -1218,39 +1300,24 @@ public final class TransitionExtractor {
 
     /**
      * The parameter position through which {@code method} re-enters ITSELF, or
-     * {@code -1}. A host is a run-to-completion driver when it discriminates the
-     * state handed to it and some call in its body — outside a lambda or local
-     * class, whose calls run on another schedule — has this very method as its
-     * unique runtime target ({@link CallTarget}, so an override elsewhere in the
-     * model refuses rather than guesses) and passes a hierarchy value in the
-     * selector's position. That is the tail-recursive spelling of
-     * {@code while (!done) s = step(s);}, and it is decided on the declaration's
-     * identity, never on a name.
+     * {@code -1}: F34's run-to-completion driver. Asked of the one shared
+     * predicate, {@link RunToCompletion#reentryIndex}, because the installation
+     * analysis (F36) asks the same question of the same method and reads the
+     * re-entry as the place the successor becomes the current state. Two notions
+     * of "driver" would let a method be walked as one and installed as the other.
      */
     private int reentryIndex(CtMethod<?> method) {
-        if (!(selector instanceof CtParameter<?> sel) || !containsStateDispatch(method)) return -1;
-        int index = method.getParameters().indexOf(sel);
-        if (index < 0) return -1;
-        for (CtInvocation<?> inv : method.getBody().getElements(new TypeFilter<>(CtInvocation.class))) {
-            if (inv.getParent(CtExecutable.class) != method) continue;
-            if (runsHost(inv, method) && inv.getArguments().size() > index
-                    && isHierarchyTyped(inv.getArguments().get(index))) {
-                return index;
-            }
-        }
-        return -1;
+        return RunToCompletion.reentryIndex(method, hierarchyQualifiedNames, rootQualifiedName,
+                callTargets());
     }
 
     /** The successor a re-entering call hands back to {@link #reentryHost}, or {@code null}. */
     private CtExpression<?> reentryArgument(CtInvocation<?> inv) {
-        if (!runsHost(inv, reentryHost) || inv.getArguments().size() <= reentryIndex) return null;
+        if (!RunToCompletion.runs(inv, reentryHost, callTargets())
+                || inv.getArguments().size() <= reentryIndex) {
+            return null;
+        }
         return inv.getArguments().get(reentryIndex);
-    }
-
-    private boolean runsHost(CtInvocation<?> inv, CtMethod<?> host) {
-        if (CallTarget.boundDeclaration(inv) != host) return false;
-        CallTarget.Result target = CallTarget.of(inv, callTargets());
-        return target.unique() && target.method() == host;
     }
 
     /**

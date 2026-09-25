@@ -1,0 +1,15 @@
+{
+  "id": "selftest-typedhandler",
+  "split": "development",
+  "repository": "(this repository)",
+  "commit": "(working tree)",
+  "module": "examples/typedhandler",
+  "sourceRoots": ["examples/typedhandler"],
+  "javaVersion": "21",
+  "classpath": [],
+  "sourceCompleteness": "complete",
+  "command": "java -jar target/sealfsm.jar --src examples/typedhandler --json --out target/eval-selftest/typedhandler",
+  "selection": "MECHANICS CHECK of score.py on a fixture written for SealFSM: not evidence of accuracy (Decision 3)",
+  "labels": "typedhandler.labels.json",
+  "outcome": "../../../target/eval-selftest/typedhandler/sealfsm-result.json"
+}

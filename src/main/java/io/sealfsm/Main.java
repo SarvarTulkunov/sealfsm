@@ -8,6 +8,7 @@ import io.sealfsm.model.StateMachine;
 import io.sealfsm.model.SuccessorForm;
 import io.sealfsm.model.Transition;
 import io.sealfsm.serialize.DotSerializer;
+import io.sealfsm.serialize.JsonResultSerializer;
 import io.sealfsm.serialize.ScxmlSerializer;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
@@ -41,6 +42,7 @@ public final class Main {
         Format format = Format.BOTH;
         boolean quiet = false;
         boolean explain = false;
+        boolean json = false;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -51,6 +53,7 @@ public final class Main {
                         classpath.addAll(splitClasspath(require(args, ++i, "--classpath")));
                 case "--quiet" -> quiet = true;
                 case "--explain" -> explain = true;
+                case "--json" -> json = true;
                 case "-h", "--help" -> { printUsage(); return; }
                 default -> { System.err.println("Unknown argument: " + args[i]); printUsage(); System.exit(2); }
             }
@@ -103,6 +106,17 @@ public final class Main {
                 System.err.println("error writing " + m.name() + ": " + e.getMessage());
             }
         }
+        // Thesis Decision 3: the whole run, rejections and candidates included, in
+        // a form a scorer can compare with labels made before the run. Opt-in,
+        // because the DOT/SCXML set is the golden contract and this file is not.
+        if (json) {
+            try {
+                Files.writeString(out.resolve("sealfsm-result.json"), new JsonResultSerializer().serialize(result));
+                written++;
+            } catch (IOException e) {
+                System.err.println("error writing sealfsm-result.json: " + e.getMessage());
+            }
+        }
 
         printSummary(result, out, written, quiet);
         if (result.isEmpty()) System.exit(1);
@@ -112,16 +126,24 @@ public final class Main {
         System.out.println();
         System.out.printf("Found %d state machine(s); wrote %d file(s) to %s%n",
                 result.machines().size(), written, out.toAbsolutePath());
-        System.out.println("-".repeat(112));
-        System.out.printf("%-22s %-20s %6s %6s %9s  %-28s %s%n",
-                "MACHINE", "DISPATCH", "STATES", "TRANS", "RESOLVED", "COMMIT", "SUCCESSOR FORMS");
+        System.out.println("-".repeat(124));
+        // BRANCH and ATOMIC are thesis Decision 2's two measured levels: the root's
+        // own permits clause, and the leaves it expands to. A grouping node (a
+        // sealed member, a permitted enum) is counted in neither twice. EVIDENCE is
+        // how much the analysis had to open to see the commit (F36: a returned
+        // successor is committed only once a caller installs it).
+        System.out.printf("%-22s %-20s %6s %6s %6s %9s  %-10s  %-28s %s%n",
+                "MACHINE", "DISPATCH", "BRANCH", "ATOMIC", "TRANS", "RESOLVED", "EVIDENCE",
+                "COMMIT", "SUCCESSOR FORMS");
         for (StateMachine m : result.machines()) {
-            System.out.printf("%-22s %-20s %6d %6d %9s  %-28s %s%n",
+            System.out.printf("%-22s %-20s %6d %6d %6d %9s  %-10s  %-28s %s%n",
                     truncate(m.name(), 22),
                     m.encoding(),
-                    m.allStates().size(),
+                    m.directBranches().size(),
+                    m.atomicStates().size(),
                     m.transitions().size(),
                     m.resolvedTransitionCount() + "/" + m.transitions().size(),
+                    m.commitEvidence(),
                     commitList(m),
                     formList(m));
         }
@@ -150,7 +172,7 @@ public final class Main {
     private static void printExplanations(ExtractionResult result) {
         if (result.explanations().isEmpty()) return;
         System.out.println();
-        System.out.println("-".repeat(112));
+        System.out.println("-".repeat(124));
         System.out.println("Why each rejected sealed root was rejected (--explain):");
         for (ExtractionResult.Explanation e : result.explanations()) {
             System.out.println();
@@ -172,7 +194,7 @@ public final class Main {
     private static void printBindingTraces(ExtractionResult result) {
         if (result.bindingTraces().isEmpty()) return;
         System.out.println();
-        System.out.println("-".repeat(112));
+        System.out.println("-".repeat(124));
         System.out.println("How inter-procedural values were bound, and why some were not (--explain):");
         for (ExtractionResult.BindingTrace t : result.bindingTraces()) {
             System.out.println();
@@ -215,8 +237,11 @@ public final class Main {
      */
     private static void printTierNote(ExtractionResult result) {
         var tier2 = result.machines().stream().filter(StateMachine::isDetectedEmpty).toList();
+        // VIA_CALLER is in the table's EVIDENCE column and needs no footnote. The
+        // probe's VIA_CALLEE gets one, because it chases no successor, so its
+        // machines carry unresolved edges by construction.
         var viaCallee = result.machines().stream()
-                .filter(m -> m.commitEvidence() != CommitEvidence.DIRECT).toList();
+                .filter(m -> m.commitEvidence() == CommitEvidence.VIA_CALLEE).toList();
         if (tier2.isEmpty() && viaCallee.isEmpty()) return;
         System.out.println();
         for (StateMachine m : tier2) {
@@ -224,15 +249,15 @@ public final class Main {
                             + "resolved.%n", m.name(), m.commitEvidence());
             if (m.transitions().isEmpty()) {
                 // F27 — the total-loss case, and the one that used to print as 0/0.
-                System.out.printf("    Its %d state(s) are exact; NO arm could be attributed to a "
-                        + "source state,%n", m.allStates().size());
+                System.out.printf("    Its %d atomic state(s) are exact; NO arm could be attributed "
+                        + "to a source state,%n", m.atomicStates().size());
                 System.out.println("    so not even an unresolved edge could be recorded. The "
                         + "relation is entirely");
                 System.out.println("    unrecovered — read 0/0 as a total loss, never as a "
                         + "machine without transitions.");
             } else {
-                System.out.printf("    Its %d state(s) are exact; each of the %d dispatched arm(s) "
-                        + "is recorded as an%n", m.allStates().size(), m.transitions().size());
+                System.out.printf("    Its %d atomic state(s) are exact; each of the %d dispatched "
+                        + "arm(s) is recorded as an%n", m.atomicStates().size(), m.transitions().size());
                 System.out.println("    unresolved edge with a known source state, never as an "
                         + "empty relation.");
             }
@@ -275,20 +300,23 @@ public final class Main {
     private static void printCandidates(ExtractionResult result) {
         if (result.candidates().isEmpty()) return;
         System.out.println();
-        System.out.println("-".repeat(112));
-        System.out.printf("Candidate hierarchies — states enumerated exactly, no transition "
-                + "relation claimed (%d):%n", result.candidates().size());
-        System.out.println("    States come from the permits clause and are compiler-checked. "
-                + "These are NOT machines and");
-        System.out.println("    are counted as none; each entry names the half of the evidence "
-                + "that was missing.");
+        System.out.println("-".repeat(124));
+        System.out.printf("Candidate hierarchies — PROVISIONAL, no transition relation claimed "
+                + "(%d):%n", result.candidates().size());
+        System.out.println("    A candidate is an uncertain classification, NOT a detected machine. "
+                + "Its members are listed as");
+        System.out.println("    would-be states under its own evidence, not as recovered FSM states, "
+                + "and no count includes them.");
+        System.out.println("    Each entry names which evidence was missing.");
         for (Candidate c : result.candidates()) {
             System.out.println();
-            System.out.printf("  %-52s %2d state(s)  %s%n",
+            System.out.printf("  %-52s %2d branch(es), %2d atomic member(s): %s%n",
                     truncate(c.qualifiedName(), 52),
-                    c.allStates().size(),
-                    c.allStates().stream().map(State::id).collect(Collectors.joining(", ")));
-            System.out.println(wrap(c.reason(), 106, "      "));
+                    c.directBranches().size(),
+                    c.atomicStates().size(),
+                    c.atomicStates().stream().map(State::id).collect(Collectors.joining(", ")));
+            System.out.println("      missing: " + c.basis());
+            System.out.println(wrap(c.reason(), 118, "      "));
         }
     }
 
@@ -354,7 +382,7 @@ public final class Main {
                 if (t.form() != null) byForm.merge(t.form(), 1, Integer::sum);
             }
         }
-        System.out.println("-".repeat(112));
+        System.out.println("-".repeat(124));
         System.out.printf("%-22s %-20s %6s %6s %9s%n",
                 "BY DISPATCH", "", "MACHINES", "TRANS", "RESOLVED");
         byDispatch.forEach((enc, acc) ->
@@ -427,6 +455,11 @@ public final class Main {
                                 every machine, print the binding chain each
                                 inter-procedural value travelled, and the rule
                                 that stopped each one that did not resolve
+              --json            Also write <out>/sealfsm-result.json: every
+                                examined root's outcome, every machine (direct
+                                branches, atomic states, transitions) and every
+                                provisional candidate, for scoring against
+                                labels (evaluation/PROTOCOL.md)
               -h, --help        Show this help
             """);
     }

@@ -13,8 +13,12 @@ import java.util.Set;
  * one sealed hierarchy that was classified as a state machine.
  *
  * <p>{@link #topLevelStates()} preserves the nesting hierarchy (composite
- * states hold children); {@link #allStates()} is the flattened view used for
- * completeness checks and DOT emission.
+ * states hold children); {@link #allStates()} is the flattened node view used
+ * for completeness checks and DOT emission. The three levels thesis Decision 2
+ * separates are {@link #directBranches()}, {@link #atomicStates()} and
+ * {@link #compositeNodes()}. The exported DOT and SCXML contain the full
+ * hierarchical expansion, grouping nodes included, because a successor may name
+ * a node at any depth ({@code return Phase.RAMP;}).
  */
 public final class StateMachine {
 
@@ -106,10 +110,14 @@ public final class StateMachine {
      * thrown — a wrong diagram on someone's repository is bad, a crash is worse.
      */
     public Set<String> duplicateStateIds() {
-        Set<String> seen = new LinkedHashSet<>();
+        // Distinct TYPES sharing an id. The same type reached under two branches
+        // (an overlap, thesis Decision 2) is one state appearing twice in the tree,
+        // not two states colliding, and is reported as an overlap instead.
+        java.util.Map<String, String> qualifiedById = new java.util.LinkedHashMap<>();
         Set<String> duplicates = new LinkedHashSet<>();
         for (State s : allStates()) {
-            if (!seen.add(s.id())) duplicates.add(s.id());
+            String prev = qualifiedById.putIfAbsent(s.id(), s.qualifiedName());
+            if (prev != null && !prev.equals(s.qualifiedName())) duplicates.add(s.id());
         }
         return duplicates;
     }
@@ -233,9 +241,39 @@ public final class StateMachine {
         allStates().forEach(s -> s.setInitial(s.id().equals(id)));
     }
 
-    /** Depth-first flattening of the state hierarchy. */
+    /**
+     * Depth-first flattening of the state hierarchy: every NODE, grouping nodes
+     * included. This is the structural view that DOT, SCXML and id lookup need. It
+     * is deliberately not a state count: a permitted enum appears here once as a
+     * grouping node and once per constant (thesis Decision 2). Count
+     * {@link #atomicStates()} or {@link #directBranches()} instead, and say which.
+     */
     public List<State> allStates() {
         return State.flatten(topLevelStates);
+    }
+
+    /**
+     * The direct branches: exactly the types the root's own {@code permits}
+     * clause names, whatever they expand to. A permitted sealed subtype and a
+     * permitted enum each count once here, and a {@code non-sealed} member counts
+     * once however many subclasses it has.
+     */
+    public List<State> directBranches() {
+        return topLevelStates();
+    }
+
+    /**
+     * The atomic states: the leaves of the hierarchical expansion, each counted
+     * once. This is the measured state set. An enum constant is atomic and its enum
+     * is not, and a nested sealed member contributes its own leaves.
+     */
+    public List<State> atomicStates() {
+        return State.atomic(topLevelStates);
+    }
+
+    /** The grouping nodes: sealed members and enums with constants, each counted once. */
+    public List<State> compositeNodes() {
+        return State.composites(topLevelStates);
     }
 
     /**

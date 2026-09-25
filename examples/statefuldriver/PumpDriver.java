@@ -17,6 +17,14 @@ public final class PumpDriver {
         };
     }
 
+    /**
+     * F36 (thesis Decision 4): the store-back that makes {@code step} a transition
+     * rather than a conversion. Its helpers are installed through it.
+     */
+    public void run(Command command) {
+        state = step(command);
+    }
+
     private static Pump fromIdle(Idle current, Command command) {
         return switch (command) {
             case START -> new Priming();

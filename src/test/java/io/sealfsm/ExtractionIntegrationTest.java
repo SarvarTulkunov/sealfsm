@@ -733,7 +733,22 @@ class ExtractionIntegrationTest {
         // walker must discover the callables by signature, attribute from-states
         // through the instanceof test, treat the residual as machine entry, label
         // edges with the enclosing method, and skip side-effecting actions.
-        ExtractionResult r = new Analyzer().analyze(modelOf("examples/cancellation"));
+        //
+        // F36: asked of examples/functionaldriver, the same two callables applied by
+        // an in-model accumulator that installs each result. examples/cancellation
+        // hands them to AtomicReference.accumulateAndGet, whose body the tool never
+        // reads, so no store-back is visible there and it is a provisional
+        // candidate (LIMITATIONS.md L2). Asserted below, so the twin cannot drift
+        // into testing a different shape.
+        ExtractionResult legacy = new Analyzer().analyze(modelOf("examples/cancellation"));
+        assertTrue(legacy.machines().isEmpty(),
+                "a result installed only by a library container is not shown to become a state");
+        assertEquals(List.of("CancellationState"),
+                legacy.candidates().stream().map(io.sealfsm.model.Candidate::name).toList());
+        assertTrue(legacy.candidates().get(0).basis()
+                .contains(io.sealfsm.model.Candidate.Basis.INSTALLATION_UNSHOWN));
+
+        ExtractionResult r = new Analyzer().analyze(modelOf("examples/functionaldriver"));
         StateMachine m = single(r);
 
         assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
@@ -1019,36 +1034,54 @@ class ExtractionIntegrationTest {
 
     /**
      * F34: a pipeline of per-state handlers declared on an interface and
-     * implemented once, optionally driven by a run-to-completion method that
-     * re-enters itself with the successor. Written twice — with the driver and an
-     * inferred {@code permits}, without it and an explicit one — and both
-     * spellings must report the same machine.
+     * implemented once, driven by a run-to-completion method that re-enters itself
+     * with the successor.
+     *
+     * <p>F36 (thesis Decision 4) changed what the driverless twin is.
+     * {@code examples/typedhandler} writes the same handlers with no driver, and
+     * there they have exactly the signature of a converter family, while nothing
+     * in the source shows a result becoming a current state. Decision 4 reads that
+     * as missing caller evidence: uncertainty, so no machine and a provisional
+     * candidate. The driver's re-entry IS the store-back, which is why
+     * {@code examples/orchestrator} is still the machine. Before F36 both
+     * spellings reported the same machine. That was the codomain-alone commit the
+     * decision retires.
      */
     @Test
-    void aPipelineOfTypedHandlersIsTheSameMachineWithOrWithoutItsDriver() {
+    void aPipelineOfTypedHandlersIsAMachineOnlyWhereItsDriverInstallsTheResult() {
         Set<String> chain = Set.of("Placed->Validated", "Validated->Priced", "Priced->Invoiced",
                 "Invoiced->Shipped", "Shipped->Fulfilled");
         ExtractionResult driven = new Analyzer().analyze(modelOf("examples/orchestrator"));
         ExtractionResult bare = new Analyzer().analyze(modelOf("examples/typedhandler"));
-        for (ExtractionResult r : List.of(driven, bare)) {
-            StateMachine m = machine(r, "OrderState");
-            assertEquals(6, m.allStates().size(), "states exact, permits inferred or written");
-            // The driver's value is where the run ENDS; read as the successor it
-            // sourced `Fulfilled` at every state (five fabricated resolved edges).
-            assertEquals(chain, resolvedPairs(m));
-            assertEquals(5, m.transitions().size(), "no unresolved arm, no self-loop");
-            assertEquals("Placed", m.initialState().orElse(null));
-            // Only the driver EXAMINES Fulfilled (its halting arm), so only there is
-            // it provably absorbing. Without it no handler takes Fulfilled, and a
-            // state nothing examined is not promoted to terminal — that would dress
-            // a recall gap as a result.
-            assertEquals(r == driven ? Set.of("Fulfilled") : Set.of(),
-                    m.allStates().stream().filter(State::isTerminal)
-                            .map(State::id).collect(Collectors.toSet()),
-                    "the arm returning the matched state halts the run; it is not a self-loop");
-            assertTrue(m.transitions().stream().allMatch(t -> t.event() == null),
-                    "one handler name across every state names the function (F22)");
-        }
+
+        StateMachine m = machine(driven, "OrderState");
+        assertEquals(6, m.allStates().size(), "states exact, permits inferred");
+        assertEquals(6, m.atomicStates().size());
+        // The driver's value is where the run ENDS; read as the successor it
+        // sourced `Fulfilled` at every state (five fabricated resolved edges).
+        assertEquals(chain, resolvedPairs(m));
+        assertEquals(5, m.transitions().size(), "no unresolved arm, no self-loop");
+        assertEquals("Placed", m.initialState().orElse(null));
+        // Only the driver EXAMINES Fulfilled (its halting arm), so only there is it
+        // provably absorbing.
+        assertEquals(Set.of("Fulfilled"), m.allStates().stream().filter(State::isTerminal)
+                        .map(State::id).collect(Collectors.toSet()),
+                "the arm returning the matched state halts the run; it is not a self-loop");
+        assertTrue(m.transitions().stream().allMatch(t -> t.event() == null),
+                "one handler name across every state names the function (F22)");
+        assertEquals(io.sealfsm.model.CommitEvidence.DIRECT, m.commitEvidence(),
+                "the re-entry that installs each successor is inside the driver itself");
+
+        // The driverless twin: not a machine, and its six would-be states listed
+        // provisionally with the evidence that is missing.
+        assertTrue(bare.machines().stream().noneMatch(x -> x.name().equals("OrderState")),
+                "no store-back, so a conversion and a state update cannot be told apart");
+        io.sealfsm.model.Candidate twin = bare.candidates().stream()
+                .filter(c -> c.name().equals("OrderState")).findFirst().orElseThrow();
+        assertTrue(twin.isProvisional());
+        assertEquals(Set.of(io.sealfsm.model.Candidate.Basis.INSTALLATION_UNSHOWN), twin.basis());
+        assertEquals(Set.of("Placed", "Validated", "Priced", "Invoiced", "Shipped", "Fulfilled"),
+                twin.atomicStates().stream().map(State::id).collect(Collectors.toSet()));
 
         // Control: two implementations of the abstract handler disagree, so the
         // driver's successor is not decidable. Recorded, with known sources — never
@@ -1059,8 +1092,9 @@ class ExtractionIntegrationTest {
                 .map(Transition::from).collect(Collectors.toSet()));
         assertTrue(job.transitions().stream().noneMatch(Transition::isResolved));
 
-        // Controls on the typed-source rule. Several handler names on one state
-        // make the method the input; two state-typed parameters fix no source.
+        // Controls on the typed-source rule, on a driven family (HatchPanel installs
+        // every handler's result). Several handler names on one state make the
+        // method the input; two state-typed parameters fix no source.
         StateMachine hatch = machine(bare, "Hatch");
         assertEquals(Set.of("Open->Shut", "Shut->Open", "Shut->Jammed"), resolvedPairs(hatch));
         assertEquals(Set.of("close", "open", "jam"), hatch.transitions().stream()
@@ -1071,38 +1105,26 @@ class ExtractionIntegrationTest {
     }
 
     /**
-     * F35: a typed handler has the signature of a converter, and a value-returning
-     * host is committed by its codomain alone, so one handler is a conversion and
-     * a family covering two or more source states is a dispatch — the threshold an
-     * instanceof chain already applies.
+     * F35 → F36: a typed handler has the signature of a converter. F35 separated
+     * them by the size of the family (one source state is a conversion, two or
+     * more a dispatch). That was a proxy, and it got both directions wrong on
+     * this very fixture: it published {@code Length}, a converter pair, and it
+     * rejected {@code Lamp}, a real machine. Thesis Decision 4 replaces the proxy
+     * with the evidence it stood in for, and the acceptance examples it names are
+     * asserted in {@code InstallationEvidenceTest}. What stays here is the
+     * recognizer-level fact the change rests on: every typed handler is now a
+     * site, whatever the size of its family, and installation decides.
      */
     @Test
-    void oneTypedHandlerIsAConversionAndAFamilyIsADispatch() {
+    void everyTypedHandlerIsASiteAndInstallationDecides() {
         CtModel model = modelOf("examples/typedhandler");
-        ExtractionResult r = new Analyzer().analyze(model);
-
-        // The control: a sum type with one converter. Was 0/1 before F34 and a
-        // clean 1/1 `Circle -> Square` after. Nothing discriminates it, so it is a
-        // plain rejection and not a candidate either.
-        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Shape")));
-        assertTrue(r.candidates().stream().noneMatch(c -> c.name().equals("Shape")));
-
-        // The documented cost: a real machine with one handler goes with it.
-        assertTrue(r.machines().stream().noneMatch(m -> m.name().equals("Lamp")),
-                "one discriminated state is too weak a signal, as for a chain");
-
-        // The standing probe, pinned as WRONG: two converters from two states clear
-        // the threshold. Flip this if a stored-back commit is ever required.
-        assertEquals(Set.of("Meters->Feet", "Feet->Meters"), resolvedPairs(machine(r, "Length")));
-
-        // The family the threshold exists to keep.
-        assertEquals(5, resolvedPairs(machine(r, "OrderState")).size());
-        assertEquals(Set.of("Open->Shut", "Shut->Open", "Shut->Jammed"),
-                resolvedPairs(machine(r, "Hatch")));
-
-        // And the recognizer agrees on WHY.
-        assertTrue(StateMachineClassifier.findCentralizedTransitionMethods(
-                typeNamed(model, "typedhandler.Shape"), model).isEmpty());
+        assertEquals(Set.of("boundingBox"), StateMachineClassifier.findCentralizedTransitionMethods(
+                        typeNamed(model, "typedhandler.Shape"), model).stream()
+                .map(spoon.reflect.declaration.CtMethod::getSimpleName).collect(Collectors.toSet()),
+                "a lone handler is a site; it is its missing store-back that keeps it out");
+        assertEquals(Set.of("press"), StateMachineClassifier.findCentralizedTransitionMethods(
+                        typeNamed(model, "typedhandler.Lamp"), model).stream()
+                .map(spoon.reflect.declaration.CtMethod::getSimpleName).collect(Collectors.toSet()));
     }
 
     private static CtType<?> typeNamed(CtModel model, String qualifiedName) {
@@ -2730,7 +2752,11 @@ class ExtractionIntegrationTest {
         assertTrue(r.diagnostics().stream().noneMatch(d -> d.where().equals("nestedroots.Branch")),
                 "a vetoed root must not re-offer anything, so Branch is never classified");
 
-        // The control bites only if Branch WOULD be accepted on its own.
+        // The control bites only if Branch WOULD be accepted on its own. Since F36
+        // that needs a store-back as well as a codomain: nestedroots.Rebuilder's
+        // `branch = branch.replaceChild(child)` is one. It is the ordinary
+        // persistent-tree update, and it shows that the store-back rule does not
+        // make the veto redundant.
         CtType<?> branch = model.getAllTypes().stream()
                 .filter(t -> t.getQualifiedName().equals("nestedroots.Branch"))
                 .findFirst().orElseThrow();
@@ -3234,11 +3260,12 @@ class ExtractionIntegrationTest {
      * {@code retrystate}'s two machines was labelled with the transition function's
      * own name while the real input sat in the guard beside it.
      *
-     * <p>{@code examples/cancellation} is the control that keeps the rule from
+     * <p>{@code examples/functionaldriver} is the control that keeps the rule from
      * becoming "never label anything": its two callables are supplied by
-     * {@code add} and {@code subscribe}, so there the name really is the input.
-     * {@code examples/traffic} pins the answer the deleted list happened to get
-     * right, which must not change.
+     * {@code add} and {@code subscribe}, so there the name really is the input. (It
+     * was {@code examples/cancellation} until F36 made that one a provisional
+     * candidate. Same callables, library-installed.) {@code examples/traffic} pins
+     * the answer the deleted list happened to get right, which must not change.
      */
     @Test
     void aTransitionMethodNameIsAnEventSymbolOnlyWhenItDiscriminates() {
@@ -3256,7 +3283,7 @@ class ExtractionIntegrationTest {
                         && d.message().contains("discriminates nothing")),
                 "the un-recovered alphabet is a gap, and is reported as one");
 
-        StateMachine cancel = single(new Analyzer().analyze(modelOf("examples/cancellation")));
+        StateMachine cancel = single(new Analyzer().analyze(modelOf("examples/functionaldriver")));
         Set<String> events = cancel.transitions().stream()
                 .map(Transition::event).filter(e -> e != null).collect(Collectors.toSet());
         assertEquals(Set.of("add", "subscribe"), events,

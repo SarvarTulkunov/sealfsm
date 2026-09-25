@@ -158,6 +158,14 @@ also calls it a "sum type". Recognising atomic containers as commit channels
 would mean giving specific library methods a known meaning. That is a modelling
 decision, and not one the thesis takes.
 
+**Since F36 the same boundary applies to a returned successor.** A transition
+function whose result is installed only by a library container is not shown to
+install anything, so its hierarchy is a provisional candidate
+(`INSTALLATION_UNSHOWN`), not a machine. `examples/cancellation` is that case:
+its callables are applied by `AtomicReference.accumulateAndGet`.
+`examples/functionaldriver` is the same code with an in-model accumulator, and it
+is a machine.
+
 This hierarchy was also the source of **F30** (see `FIXLOG.md`). Before that fix,
 its `static empty()` factory was read as a per-state transition method, and the
 hierarchy was published as a one-edge machine sourced at the root interface. That
@@ -166,14 +174,18 @@ once the false positive is gone.
 
 ---
 
-## L3. A value-returning function is committed by its return type alone
+## L3. A value-returning function was committed by its return type alone (CLOSED by F36)
+
+**Status: closed** on branch `thesis-decisions` by F36, which implements thesis
+Decision 4 ("converters are not FSMs"). The fix below, "a stored-back commit found
+at the caller, tool-wide", is the one this section specified. What it changed and
+what it costs are recorded at the end of the section. The original text is kept
+because it states the problem the thesis decision answers.
 
 **Observed on:** constructed fixtures, not yet on a harvested project:
 `examples/typedhandler` (`Shape`, `Lamp`, `Length`), which F35 added, plus a
 switch-spelled converter measured by hand. Unlike L1 and L2, this is a
 **precision** limitation (a sum type published as a machine), not a recall one.
-It is recorded here because it is a deliberate boundary with a known fix
-that has not been taken yet.
 
 ### The shape
 
@@ -247,16 +259,63 @@ codomain while its typed-parameter twin was rejected. A rule about what a commit
    re-examined, a switch-spelled converter is added as a control, and at least one
    machine with no in-model caller pins the Tier 3 outcome.
 
+### How F36 closed it
+
+`detect/dispatch/Installation` asks, for every site whose successor leaves its
+host by `return` (`VALUE_RETURN`, `CARRIER_RETURN`, `POLY_CARRIER`, and a
+returned `LOCAL_ACCUMULATOR`), where the returned value goes. It follows the value
+through conditionals, switch-expression arms, locals, returns and arguments,
+across up to six call boundaries, to one of four sinks: a write to a field
+declared with the root, a write back into the variable the call read its state
+from, a recognised mutator, or a run-to-completion driver's selector. The
+classifier accepts only sites where the value reaches a sink. The extractor walks
+only those sites, from the same report.
+
+| Source | Before F36 | After F36 | Correct? |
+|---|---|---|---|
+| switch converter, result used as data (`converters.Shade`) | machine, 2/2 | **rejected as a conversion**, no candidate | yes |
+| the same code, stored back (`converters.Tint`) | machine, 2/2 | machine, 2/2, `VIA_CALLER` | yes |
+| the same code, never called (`converters.Hue`) | machine, 2/2 | provisional **candidate** (`INSTALLATION_UNSHOWN`) | yes: uncertain |
+| per-state converter used as data (`converters.Currency`) | machine | **rejected as a conversion** | yes |
+| `Shape boundingBox(Circle c)`, uncalled (`typedhandler.Shape`) | rejected (F35) | abstained, no candidate | yes |
+| `Lamp press(Dark d)`, driven (`typedhandler.Lamp`) | rejected (F35) | **machine, 1/1** | yes |
+| `toFeet` + `toMeters`, uncalled (`typedhandler.Length`) | machine, 2/2 | provisional **candidate** | yes: uncertain |
+| two converters used as data (`typedhandler.Temperature`) | (new) | **rejected as a conversion** | yes |
+
+Point 3 above was decided the strict way, as Decision 4 requires: missing caller
+evidence is uncertainty, so a host with no caller in the source set is not a
+machine. It is a provisional candidate where its sites amount to a dispatch, and
+a plain abstention otherwise.
+
+**What it cost, measured.** On the corpus, 22 value-returning machines had no
+caller in the source set: their fixtures had been written without a driver.
+19 of them, the ones whose purpose is extraction, were given a minimal,
+unseeded store-back driver. Every one of those fixtures' `.dot` and `.scxml` files is
+byte-identical to before, which is the check that the drivers changed nothing
+but the evidence. Two became what the decision says they should be.
+`typedhandler.OrderState` (the pipeline without its driver) is now a
+provisional candidate, and `examples/cancellation` (commits through
+`AtomicReference.accumulateAndGet`, i.e. L2) is too. Its F7 walk is kept on a
+machine by `examples/functionaldriver`, the same callables installed in-model.
+
+**What it cannot see.** A real machine whose store-back is outside the source
+set is an abstention by design. A library's public transition function used only
+by client code is the typical case, and the evaluation protocol counts such an
+abstention as a missed machine. A converted value cached in a root-typed field
+reads as installed, because that is the decision's own clause ("an assignment to
+a state field").
+
 ### Suggested thesis wording
 
-> A value-returning transition function is recognised by its signature: it maps
-> a state to a state. A conversion within a sum type has the same signature, and
-> the tool does not examine whether a result replaces its input, so a sum type
-> equipped with a family of converters is reported as a state machine. A
-> single converter is rejected by requiring that handlers discriminate at least
-> two source states. Closing the gap in general requires recognising the commit
-> at the call site of the function, an inter-procedural analysis from callee to
-> caller that is left as future work.
+> A value-returning function that maps a state to a state is a transition only
+> if its result replaces the current state. A conversion within a sum type has the
+> same signature, and only its use separates the two. SealFSM therefore follows a
+> returned successor from the function to its callers, and accepts the function
+> only when the value is stored back into state storage, handed to a state
+> mutator, or re-entered into a run-to-completion driver. When every caller uses
+> the value as data, the hierarchy is rejected as a conversion. When no caller
+> exists in the analysed source, the tool abstains, because missing caller
+> evidence is uncertainty rather than proof of a conversion.
 
 ---
 

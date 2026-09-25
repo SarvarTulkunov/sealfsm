@@ -2,16 +2,17 @@
 
 **Automated extraction of finite state machines from sealed class hierarchies in modern Java — a static-analysis approach.**
 
-SealFSM reads Java source, finds `sealed` type hierarchies that encode state machines, and emits the recovered FSM as **DOT** (for visualisation) and **SCXML** (for model-based testing tools).
+SealFSM reads Java source, finds `sealed` type hierarchies, decides which of them encode a state machine in a supported pattern, and emits each recovered FSM as **DOT** (for visualisation) and **SCXML** (for model-based testing tools). It can also write the whole run as **JSON** (`--json`), for scoring against labelled ground truth (`evaluation/PROTOCOL.md`).
 
-## The core idea — and the one distinction that matters
+## The core idea, and the distinctions that matter
 
-A `sealed` interface lists its implementations in a compiler-checked `permits` clause. That makes the set of subtypes **closed and exhaustive**. SealFSM exploits this in two steps that make claims of *different strength* — keeping them separate is the whole point:
+A `sealed` interface lists its implementations in a compiler-checked `permits` clause. That makes the set of subtypes **closed and exhaustive**. SealFSM makes claims of *different strength*, and keeping them separate is the whole point (see `SCOPE.md`):
 
-1. **State enumeration is provably complete.** Every permitted subtype is a state; the `permits` clause guarantees there are no others. This is exact, not heuristic. When the *event* type is itself a sealed hierarchy or an enum, the input alphabet Σ is recovered the same exact way (finding F4) — so both the state set Q *and* Σ come soundly from the closed-world structure.
-2. **Transition extraction is approximate.** Transitions — the transition relation δ connecting states over events — are recovered by intra-procedural data-flow analysis over the transition code. This is empirical and is reported with precision/recall, never presented as complete.
+1. **Classification is conditional on evidence.** Locating a sealed declaration is not deciding it is a machine. A hierarchy is reported as a machine only when the code shows a supported dispatch over its states **and** shows the chosen successor becoming the current state (for a returned successor, that means a caller stores it back; thesis Decision 4). A hierarchy with plausible dispatch evidence and no established relation is a provisional **candidate**, which is not a detected FSM. Anything else is rejected. No claim is made that every real sealed FSM is recognised.
+2. **State enumeration is exact over the type structure, for machines.** A machine's states come from the `permits` clauses and from the constants of permitted enums, so they are complete by construction. Counts name their level (thesis Decision 2): **direct branches** (the root's own `permits`), **atomic states** (the leaves of the expansion), and **grouping nodes** (sealed members and enums between them). When the *event* type is a sealed hierarchy or an enum, the input alphabet Σ is recovered the same way (F4).
+3. **Transition extraction is approximate.** The transition relation δ is recovered by intra-procedural data-flow analysis, with a bounded inter-procedural fold. It is reported with precision and recall, never presented as complete.
 
-The tool is built around that asymmetry. Anything it cannot resolve on the transition side is **recorded as an explicit unresolved edge** (a dashed red arrow in DOT, an XML comment in SCXML) rather than silently dropped, so gaps depress recall visibly instead of masquerading as a complete model.
+Anything the tool cannot resolve on the transition side is **recorded as an explicit unresolved edge** (a dashed red arrow in DOT, an XML comment in SCXML) rather than silently dropped, so gaps depress recall visibly instead of masquerading as a complete model.
 
 ## Pipeline
 
@@ -30,10 +31,14 @@ The tool is built around that asymmetry. Anything it cannot resolve on the trans
  │              │                                      │
  │              ▼                                      │
  │  StateMachineClassifier                             │
- │    ├─ dispatch? commit? ───────────▶ rejected       │
+ │    ├─ no dispatch ─────────────────▶ rejected       │
  │    │                                 (e.g. Shape)   │
  │    ├─ dispatch, no commit ─────────▶ CANDIDATE      │
- │    │                                 (states only)  │
+ │    │                                 (provisional)  │
+ │    ├─ returned value never stored ─▶ CANDIDATE      │
+ │    │  back (Installation, F36)       (provisional)  │
+ │    ├─ returned value only used ────▶ rejected as a  │
+ │    │  as data                        conversion     │
  │              │                                      │
  │              ▼                                      │
  │     ┌────────┴────────┐                             │
@@ -63,20 +68,24 @@ The tool is built around that asymmetry. Anything it cannot resolve on the trans
 | Package | Class | Role |
 |---------|-------|------|
 | `detect` | `SealedHierarchyDetector` | Finds sealed root types, filters out nested sealed (those become composite states) |
-| `detect` | `StateMachineClassifier` | Rejects plain sum types; detects encoding (distributed/centralized/mixed); exposes shared method-discovery helpers |
-| `detect` | `SpoonCompat` | Isolates version-sensitive Spoon API calls (`isSealed`, `permittedTypes`) with reflective fallbacks |
-| `extract` | `StateExtractor` | `permits` → `State` objects; recursive for nested sealed (composite states) |
+| `detect` | `StateMachineClassifier` | Rejects plain sum types and established conversions; detects encoding (distributed/centralized/mixed); exposes shared method-discovery helpers |
+| `detect.dispatch` | `Installation` | F36 / Decision 4: follows a returned successor to its callers; installed, uncalled, not followed, or used as data |
+| `detect.dispatch` | `RunToCompletion` | F34's self-re-entering driver, one predicate shared by the extractor and `Installation` |
+| `detect` | `SpoonCompat` | Isolates version-sensitive Spoon API calls (`isSealed`, `isNonSealed`, `permittedTypes`) with reflective fallbacks |
+| `extract` | `StateExtractor` | `permits` → `State` nodes; recursive for nested sealed and permitted enums; reports open (`non-sealed`) branches and types reachable under two branches |
 | `extract` | `TransitionExtractor` | Orchestrates both encodings: distributed (per-state methods) and centralized (switch dispatch) |
 | `extract` | `TransitionResolver` | Intra-procedural data-flow: resolves return expressions to target states (`new X()`, `this`, ternary, variable reads) |
-| `model` | `State` | State IR; `id`, `qualifiedName`, `composite`, `initial`, `children` |
+| `model` | `State` | State node; `id`, `qualifiedName`, `origin` (type or enum constant), `isAtomic`/`isGrouping`, `isOpenBranch`, `initial`, `children` |
 | `model` | `Transition` | Transition IR; first-class `resolved` flag; `from`, `to`, `event`, `guard`, `note` |
-| `model` | `StateMachine` | Aggregate: states, transitions, encoding, alphabet, initial state |
-| `model` | `ExtractionResult` | All machines + `Diagnostic` records (INFO/WARN) |
+| `model` | `StateMachine` | Aggregate: `directBranches()`, `atomicStates()`, `compositeNodes()`, transitions, encoding, alphabet, initial state, commit evidence |
+| `model` | `Candidate` | A PROVISIONAL Tier 3 classification: provisional members, the dispatch sites, and the missing evidence (`basis`) |
+| `model` | `ExtractionResult` | Machines, candidates, every examined root's `outcome`, and `Diagnostic` records (INFO/WARN) |
 | `serialize` | `DotSerializer` | Graphviz DOT; composite → `subgraph cluster_*`; unresolved → dashed red edge |
 | `serialize` | `ScxmlSerializer` | W3C SCXML; composite → nested `<state>`; unresolved → XML comment |
+| `serialize` | `JsonResultSerializer` | The whole run for scoring (`--json`): outcomes, machines at three state levels, provisional candidates |
 | `annotation` | `@Fsm` | Optional marker annotation to force classification; matches by simple name |
 | root | `Analyzer` | Orchestrates the full pipeline + initial-state heuristics |
-| root | `Main` | CLI entry point (`--src`, `--out`, `--format`, `--quiet`) |
+| root | `Main` | CLI entry point (`--src`, `--out`, `--format`, `--classpath`, `--quiet`, `--explain`, `--json`) |
 | root | `DebugHarness` | Runs each pipeline stage individually with verbose printed output; breakpoint-friendly |
 | root | `DebugAst` | Dumps the Spoon AST after parsing; `--returns` shows expression types, `--full` shows reconstructed source |
 
@@ -96,7 +105,7 @@ A single recursive, guard-carrying traversal handles both encodings. It descends
 
 | Control-flow shape | Handling |
 |--------------------|----------|
-| **Distributed method** (`Red.next()` on a state class) | `from` = declaring state class; `event` = method name (neutral names like `next`/`transition`/`step`/`advance`/`tick` → no label) |
+| **Distributed method** (`Red.next()` on a state class) | `from` = declaring state class; `event` = method name only when the hierarchy spells more than one such name (one name names the function, F22) |
 | **Centralized method** (`transition(State, Event)`) | `from` = matched type-pattern per switch arm; `event` = `null` (v1 scope line) |
 | **Type-pattern switch arm** (`case Locked l -> …`) | Arm's matched type becomes the `from`-state |
 | **Switch-over-event arm** (`case Lock l -> …` inside a `switch (event)`) | Arm's matched event becomes the transition's event label; the alphabet Σ is enumerated from the sealed/enum event type (finding F4) |
@@ -147,11 +156,14 @@ The `spoon.version` property in `pom.xml` is pinned to `10.4.2` (known to suppor
 ```bash
 java -jar target/sealfsm.jar --src <path> [--src <path> ...] [options]
 
-  --src <path>     Source file or directory to analyse (repeatable, required)
-  --out <dir>      Output directory (default: ./out)
-  --format <fmt>   dot | scxml | both   (default: both)
-  --quiet          Suppress the diagnostics listing
-  -h, --help       Show help
+  --src <path>      Source file or directory to analyse (repeatable, required)
+  --out <dir>       Output directory (default: ./out)
+  --format <fmt>    dot | scxml | both   (default: both)
+  --classpath <cp>  Classpath for types not in --src (analysis stays noClasspath)
+  --quiet           Suppress the diagnostics listing
+  --explain         Print each rejected root's predicates, and each machine's bindings
+  --json            Also write <out>/sealfsm-result.json for scoring (evaluation/PROTOCOL.md)
+  -h, --help        Show help
 ```
 
 ### Quick start with bundled examples
@@ -241,7 +253,14 @@ The `--returns` flag is especially useful: it shows the exact `CtExpression` sub
 | `examples/eventalphabet` | centralized | 3 states; nested `switch (event)` — recovers Σ = {Play, Pause, Stop, Skip} from the sealed event type and labels each edge with its event (finding F4) |
 | `examples/shape` | — (negative) | **rejected** as a plain sum type; nothing discriminates it, so not even a candidate |
 | `examples/voidcommit` | centralized | 4 states; the arms are bare calls and the commit is an H-typed field write **inside the callee** — recovered by the k = 1 commit-existence probe, 0/4 resolved by design (Tier 2, finding F26) |
-| `examples/voidfold` | — (negative) | **rejected**; indistinguishable from `voidcommit` at the call site, differing only in that its callee writes a `String`. Reported as a **candidate** with all 4 states |
+| `examples/voidfold` | — (negative) | **rejected**; indistinguishable from `voidcommit` at the call site, differing only in that its callee writes a `String`. Reported as a **provisional candidate** listing its 4 would-be states |
+| `examples/converters` | Decision 4 controls | one converter shape, varied only in what happens to its result: stored back (`Tint`, a machine), used as data (`Shade`, and the per-state `Currency`: **rejected as conversions**), never called (`Hue`, a provisional candidate) |
+| `examples/typedhandler` | Decision 4 acceptance examples | `Length` (two uncalled converters) is **not** a machine; `Lamp` (one handler, driven) **is**; `Temperature` (converters used as data) is rejected; `Shape` (one uncalled converter) abstains; `OrderState` (a pipeline without its driver) is a provisional candidate |
+| `examples/functionaldriver` | functional (F7) | `examples/cancellation`'s callables installed by an in-model accumulator: 2 states, 6/6. `cancellation` itself installs through `AtomicReference`, which the tool does not read, so it is a provisional candidate (L2) |
+
+Every value-returning fixture carries a small, unseeded store-back driver (F36).
+A returned successor is a transition only once a caller installs it. Without the
+driver, a fixture is indistinguishable from a converter family.
 
 The `examples/door` case deliberately exercises the hardest patterns: type-pattern `from`-states, constructor-call targets, a guarded ternary transition, and a `return current;` self-loop.
 
@@ -249,19 +268,24 @@ The `examples/turnstile` case targets the control-flow walker directly: each swi
 
 The `examples/gofcontext` case is the GoF State pattern: the `PortalContext` holds a state field and each state's `handle(ctx, event)` method transitions by calling `ctx.setState(new …())`. It proves the mutation encoding converges on the same FSM as the return-based `examples/door`. (It carries an `@Fsm` marker because a hierarchy whose transitions are pure field mutations is not recognised by the structural classifier — detecting that family automatically is future work.)
 
-### Three outcomes, not two
+### The outcomes
 
-State enumeration is exact by construction and does **not** depend on transition
-recovery, so the classifier has three positions rather than two:
+State enumeration is exact over the type structure and does **not** depend on
+transition recovery, so the classifier has more positions than "machine" and
+"not a machine":
 
-| tier | dispatch | commit | successors | reported as |
+| outcome | dispatch | commit | successors | reported as |
 |---|---|---|---|---|
-| **1** | present | proven | ≥ 1 resolved | a machine, with a transition relation |
-| **2** | present | proven | none resolved | a machine; complete states, one unresolved edge per dispatched arm, each with a known source |
-| **3** | present | **not** proven | — | a **candidate** on `ExtractionResult.candidates()`: complete states, dispatch sites named, no relation claimed, no `.dot`/`.scxml` |
+| **Tier 1** | present | established | ≥ 1 resolved | a machine, with a transition relation |
+| **Tier 2** | present | established | none resolved | a machine; exact states, one unresolved edge per dispatched arm, each with a known source |
+| **Tier 3** | plausible | **not** established | — | a **provisional candidate** on `ExtractionResult.candidates()`: members listed provisionally, dispatch sites and missing evidence named, no relation claimed, no `.dot`/`.scxml` |
+| **conversion** | present | every caller uses the result as data | — | rejected; on neither channel (Decision 4) |
+| **abstention** | none | — | — | rejected, with a diagnostic |
 
-A candidate is never counted as a machine. The line between tiers 2 and 3 is the
-commit requirement, which is the tool's whole precision guard — see `SCOPE.md`.
+A candidate is an uncertain classification, never counted as a machine, and its
+members are never counted as recovered states. For a returned successor,
+"established" means a caller is seen storing it back (F36). The commit
+requirement is the tool's precision guard; see `SCOPE.md`.
 
 `sample-output/` contains the reference DOT/SCXML that the tool should produce. After building, `diff` your output against these to verify correctness.
 
@@ -273,15 +297,26 @@ mvn test
 
 - `serialize/DotSerializerTest` — pure IR/serializer checks; no Spoon dependency.
 - `serialize/ScxmlSerializerTest` — SCXML well-formedness + composite nesting; no Spoon dependency.
-- `ExtractionIntegrationTest` — full Spoon-based extraction over all three examples: verifies state sets, transition edges, guards, self-loops, initial states, and rejection of `Shape`.
+- `serialize/JsonResultSerializerTest` — the `--json` result is valid JSON carrying outcomes, three state levels and provisional candidates.
+- `ExtractionIntegrationTest` — full Spoon-based extraction over the example corpus: state sets, transition edges, guards, self-loops, initial states, rejections.
+- `InstallationEvidenceTest` — thesis Decision 4: the acceptance examples (`Length`, `Lamp`), the converter-use, demonstrated-update and missing-caller controls at every locus, and the corpus-wide invariant that a conversion is published on neither channel.
+- `StateLevelsTest` — thesis Decision 2: direct branches, atomic states and grouping nodes; open (`non-sealed`) branches; a type under two branches.
+- `StateCompletenessTest`, `InterproceduralBindingTest`, and the `detect/`, `extract/`, `model/` unit tests.
 
 ## Validation methodology (for the thesis)
 
-1. **States — exact.** For each labelled example, assert the extracted state set equals the `permits` set. Expect 100% by construction; any miss is a parser/model bug.
-2. **Transitions — precision/recall.** Hand-label the true transition relation for 20–50 real hierarchies; compare against extracted **resolved** transitions. Report precision, recall, and unresolved-rate separately.
-3. **Classifier — confusion matrix.** Mix real FSMs with plain sum types; report false-positive / false-negative rates.
+The protocol is in `evaluation/PROTOCOL.md` (thesis Decision 3). In short: pin
+each repository to an exact commit; label every sealed hierarchy of the sample
+**before** looking at the tool's output, including negatives such as converters
+and plain data types; keep a held-out split; then score with
+`scripts/evaluation/score.py`. It reports classification TP/FP/FN, abstentions
+and coverage, state accuracy at each level, and transition precision and recall,
+with unresolved edges as their own figure. Conditional accuracy over recognised
+machines is always reported next to overall recall, never in place of it. The
+bundled examples are regression tests, not evidence of accuracy on independent
+projects.
 
-**Corpus tip:** the scarcity of labelled real-world sealed FSMs is the main practical risk. Harvest GitHub for `sealed interface ... permits` with a self-returning method or a `T f(T, …)` function.
+**Corpus tip:** the scarcity of labelled real-world sealed FSMs is the main practical risk. Record the search procedure and report the scarcity rather than filling the corpus with generated code.
 
 ## Known limitations (v1 scope)
 
@@ -296,41 +331,22 @@ mvn test
 ```
 pom.xml
 src/main/java/io/sealfsm/
-├── Analyzer.java              # pipeline orchestrator
-├── Main.java                  # CLI entry point
-├── DebugHarness.java          # step-by-step pipeline runner
-├── DebugAst.java              # Spoon AST inspector
-├── annotation/
-│   └── Fsm.java               # optional @Fsm marker
-├── detect/
-│   ├── SealedHierarchyDetector.java
-│   ├── SpoonCompat.java
-│   └── StateMachineClassifier.java
-├── extract/
-│   ├── StateExtractor.java
-│   ├── TransitionExtractor.java
-│   └── TransitionResolver.java
-├── model/
-│   ├── State.java
-│   ├── Transition.java
-│   ├── StateMachine.java
-│   └── ExtractionResult.java
-└── serialize/
-    ├── DotSerializer.java
-    └── ScxmlSerializer.java
-src/test/java/io/sealfsm/
-├── ExtractionIntegrationTest.java
-└── serialize/
-    ├── DotSerializerTest.java
-    └── ScxmlSerializerTest.java
-examples/
-├── traffic/    # distributed State pattern (TrafficLight)
-├── door/       # centralized switch (Door + sealed Event)
-├── turnstile/  # centralized switch with if-guarded arms + fall-through
-├── localvar/   # reassigned root-typed local (reaching-definitions, F1)
-├── gofcontext/ # GoF State pattern: setState field mutation (F2)
-├── factory/    # inter-procedural delegate + factory helpers (F3)
-├── eventalphabet/ # switch-over-event: recovers Σ + labels edges (F4)
-└── shape/      # negative control (plain sum type)
-sample-output/  # reference DOT/SCXML for diffing
+├── Analyzer.java, Main.java          # pipeline orchestrator, CLI
+├── DebugHarness.java, DebugAst.java  # step-by-step runner, Spoon AST inspector
+├── annotation/Fsm.java               # optional @Fsm marker
+├── analyze/                          # guard analysis over recovered edges (F5)
+├── detect/                           # classification: roots, recognizers, veto, audit
+│   └── dispatch/                     # locus, commit, installation (F36), probe, call targets
+├── extract/                          # StateExtractor (exact), TransitionExtractor + Resolver (approximate)
+├── model/                            # State, Transition, StateMachine, Candidate, ExtractionResult, ...
+└── serialize/                        # DOT, SCXML, JSON
+src/test/java/io/sealfsm/             # unit + integration tests
+src/test/resources/                   # unit fixtures (some deliberately do not compile)
+examples/                             # the regression corpus, one package per directory
+evaluation/                           # PROTOCOL.md, templates, corpus manifests, labels, outcomes
+scripts/                              # build-run-render, golden capture, census, depth sweep, evaluation scorer
+sample-output/                        # reference DOT/SCXML for diffing
 ```
+
+`CLAUDE.md` holds the per-class map and the finding-by-finding design notes;
+`FIXLOG.md` records each finding's fixture, ablation and regression gate.

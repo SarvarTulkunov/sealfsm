@@ -42,14 +42,46 @@ public final class ExtractionResult {
      */
     public record BindingTrace(String where, List<String> lines) { }
 
+    /**
+     * What happened to one examined sealed root. Thesis Decision 1 separates
+     * locating a sealed declaration from deciding that it is a machine, and
+     * Decision 3 scores the decision against labels made before the run. That
+     * needs every examined root's outcome in machine-readable form, the
+     * rejections included. Diagnostics carry the same information only as
+     * prose.
+     */
+    public enum Outcome {
+        /** Classified as a state machine: on {@link #machines()}. */
+        MACHINE,
+        /** A provisional candidate: on {@link #candidates()}, never counted as a machine. */
+        CANDIDATE,
+        /** Nothing was established and nothing is claimed. */
+        ABSTAINED,
+        /** The compositional veto: a recursive data type. */
+        VETOED,
+        /** Every value-returning producer's result is used as data: an established conversion (F36). */
+        CONVERTED
+    }
+
+    /** One examined root's outcome, with the reason the classifier gave. */
+    public record RootOutcome(String qualifiedName, Outcome outcome, String reason) { }
+
     private final List<StateMachine> machines = new ArrayList<>();
     private final List<Candidate> candidates = new ArrayList<>();
     private final List<Diagnostic> diagnostics = new ArrayList<>();
     private final List<Explanation> explanations = new ArrayList<>();
     private final List<BindingTrace> bindingTraces = new ArrayList<>();
+    private final List<RootOutcome> outcomes = new ArrayList<>();
 
     public void addMachine(StateMachine m) { machines.add(m); }
     public void addCandidate(Candidate c) { candidates.add(c); }
+
+    public void outcome(String qualifiedName, Outcome outcome, String reason) {
+        outcomes.add(new RootOutcome(qualifiedName, outcome, reason));
+    }
+
+    /** Every examined root, in the order it was decided, with what became of it. */
+    public List<RootOutcome> outcomes() { return Collections.unmodifiableList(outcomes); }
     public void info(String where, String message) {
         diagnostics.add(new Diagnostic(Severity.INFO, where, message));
     }

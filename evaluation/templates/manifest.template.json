@@ -1,0 +1,22 @@
+{
+  "id": "REPLACE-short-unique-id",
+  "split": "development | heldout",
+  "repository": "https://github.com/OWNER/REPO",
+  "commit": "REPLACE-full-40-character-sha",
+  "module": "REPLACE-module-or-subproject, or . for the whole repository",
+  "sourceRoots": [
+    "REPLACE/src/main/java"
+  ],
+  "javaVersion": "21",
+  "classpath": [],
+  "sourceCompleteness": "complete | partial",
+  "sealfsmRevision": "REPLACE-sealfsm-git-sha-the-run-used",
+  "command": "java -jar target/sealfsm.jar --src REPLACE/src/main/java --json --out evaluation/outcomes/REPLACE-short-unique-id",
+  "missingSourceDiagnostics": [
+    "copy every resolution INFO/WARN line the run printed that touches a labelled hierarchy, or leave empty"
+  ],
+  "selection": "how this repository and module were found (query, date, site) and why they were included",
+  "labels": "evaluation/labels/REPLACE-short-unique-id.json",
+  "outcome": "evaluation/outcomes/REPLACE-short-unique-id/sealfsm-result.json",
+  "notes": ""
+}

@@ -1,0 +1,37 @@
+{
+  "corpusEntry": "selftest-typedhandler",
+  "labelledBy": "fixture intent (examples/typedhandler javadoc), for a MECHANICS check of score.py only",
+  "labelledOn": "2026-09-25",
+  "labelledBeforeToolOutput": false,
+  "hierarchies": [
+    {
+      "root": "typedhandler.Lamp",
+      "label": "FSM",
+      "codingPattern": "typed-handler",
+      "evidence": ["Lamp.java: LampPanel.press stores LampSwitch.press(dark) in the lamp field"],
+      "directBranches": ["typedhandler.Lamp.Dark", "typedhandler.Lamp.Lit"],
+      "atomicStates": ["typedhandler.Lamp.Dark", "typedhandler.Lamp.Lit"],
+      "transitions": [{"from": "Dark", "to": "Lit", "event": null, "evidence": "Lamp.java LampSwitch.press"}]
+    },
+    {
+      "root": "typedhandler.OrderState",
+      "label": "FSM",
+      "codingPattern": "typed-handler",
+      "evidence": ["OrderState.java: a real order pipeline, per the fixture's intent; no driver in this module"],
+      "directBranches": ["Placed", "Validated", "Priced", "Invoiced", "Shipped", "Fulfilled"],
+      "atomicStates": ["Placed", "Validated", "Priced", "Invoiced", "Shipped", "Fulfilled"],
+      "transitions": [
+        {"from": "Placed", "to": "Validated"}, {"from": "Validated", "to": "Priced"},
+        {"from": "Priced", "to": "Invoiced"}, {"from": "Invoiced", "to": "Shipped"},
+        {"from": "Shipped", "to": "Fulfilled"}
+      ],
+      "notes": "A real machine the tool abstains on (missing caller evidence): scored as FN and as an abstention."
+    },
+    {"root": "typedhandler.Length", "label": "NON_FSM", "codingPattern": "none",
+     "evidence": ["Length.java: unit converters"]},
+    {"root": "typedhandler.Temperature", "label": "NON_FSM", "codingPattern": "none",
+     "evidence": ["Temperature.java: Display.label switches over the converted value"]},
+    {"root": "typedhandler.Shape", "label": "NON_FSM", "codingPattern": "none",
+     "evidence": ["Shape.java: one converter"]}
+  ]
+}

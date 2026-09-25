@@ -101,8 +101,17 @@ public class DebugHarness {
                     root.getSimpleName(), c.isStateMachine(), c.encoding());
             System.out.printf("  %25s  reason: %s%n", "", c.reason());
 
+            // F36: where each value-returning site's successor goes, which is what
+            // decided the classification above.
+            if (c.installation() != null) {
+                for (var v : c.installation().all()) {
+                    System.out.printf("    installation %-11s %-40s %-10s %s%n", v.route(),
+                            v.hostName(), v.verdict(), v.detail());
+                }
+            }
+
             if (!c.isStateMachine()) {
-                if (c.rejection() == Rejection.ABSTAINED) {
+                if (c.rejection() == Rejection.ABSTAINED || c.rejection() == Rejection.CONVERTED) {
                     for (CtType<?> nested : detector.permittedSealedSubtypes(root)) {
                         if (claimed.contains(nested.getQualifiedName())) continue;
                         pending.addLast(nested);
@@ -148,8 +157,14 @@ public class DebugHarness {
             // The naming is carried into stage 5 rather than rebuilt: the debug view
             // must show the same ids the pipeline assigns, or a name collision would
             // be invisible in exactly the tool used to diagnose one.
-            StateExtractor.Result extracted = stateExtractor.extract(root);
+            StateExtractor.Result extracted = stateExtractor.extract(root, model);
             List<State> states = extracted.topLevelStates();
+            System.out.printf("    %d direct branch(es), %d atomic state(s), %d grouping node(s)%n",
+                    states.size(), State.atomic(states).size(), State.composites(states).size());
+            extracted.openBranches().forEach((b, subs) ->
+                    System.out.printf("    open (non-sealed) branch %s, subclasses in model: %s%n", b, subs));
+            extracted.overlaps().forEach((t, bs) ->
+                    System.out.printf("    %s is reachable under several branches: %s%n", t, bs));
 
             for (State s : states) {
                 printState(s, "    ");
@@ -160,7 +175,8 @@ public class DebugHarness {
             System.out.println("  ▸ STAGE 5: Extract transitions");
             Set<String> hierarchy = StateMachineClassifier.hierarchyQualifiedNames(root);
             TransitionExtractor te =
-                    new TransitionExtractor(hierarchy, root.getQualifiedName(), extracted.naming());
+                    new TransitionExtractor(hierarchy, root.getQualifiedName(), extracted.naming())
+                            .withInstallation(c.installation());
             List<Transition> transitions = te.extract(root, model);
 
             for (Transition t : transitions) {
@@ -193,8 +209,9 @@ public class DebugHarness {
                 System.out.printf("    name=%s  encoding=%s  initial=%s%n",
                         machine.name(), machine.encoding(),
                         machine.initialState().orElse("(not detected)"));
-                System.out.printf("    states=%d  transitions=%d  resolved=%d  unresolved=%d%n",
-                        machine.allStates().size(),
+                System.out.printf("    branches=%d  atomic=%d  transitions=%d  resolved=%d  unresolved=%d%n",
+                        machine.directBranches().size(),
+                        machine.atomicStates().size(),
                         machine.transitions().size(),
                         machine.resolvedTransitionCount(),
                         machine.unresolvedTransitionCount());

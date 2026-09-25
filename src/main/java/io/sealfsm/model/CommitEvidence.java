@@ -13,6 +13,9 @@ package io.sealfsm.model;
  * reading of the callee's body. This axis carries the same distinction one level
  * up, where it applies to every commit form at once.
  *
+ * <p>F36 (thesis Decision 4) adds {@link #VIA_CALLER}: a returned successor
+ * counts as committed only once a caller is seen installing it.
+ *
  * <p>It is deliberately <b>not</b> a fourth position on the three-axis taxonomy
  * (encoding / successor form / commit form). Those three classify how a machine
  * is <em>written</em>; this records how much the analysis had to open in order to
@@ -22,14 +25,29 @@ package io.sealfsm.model;
 public enum CommitEvidence {
 
     /**
-     * Observed in the dispatch's own syntactic context: the switch is returned
-     * from a method whose codomain is in H, assigned to an H-typed field or local,
-     * or handed to a recognised mutator. Nothing outside the host method was read.
+     * Observed inside the host itself: the successor is assigned to an H-typed
+     * field, handed to a recognised mutator, installed into a context (F33),
+     * accumulated in a local that the host then stores, or re-entered as the
+     * selector of a run-to-completion driver (F34). Nothing outside the host method
+     * was needed to see the installation.
      *
-     * <p>This is the evidence every machine in the corpus rests on, and it is the
-     * strongest of the three.
+     * <p>The strongest of the four.
      */
     DIRECT,
+
+    /**
+     * The host RETURNS its successor, and a caller was read to see it installed
+     * (F36, thesis Decision 4): stored back into the variable or root-typed field
+     * the state is read from, handed to a mutator, or re-entered into a
+     * run-to-completion driver. The codomain proves only that a hierarchy value is
+     * <em>produced</em>. A conversion within a sum type has the same codomain, and
+     * only the caller's store-back separates a transition from it.
+     *
+     * <p>Before F36 every value-returning machine was reported {@link #DIRECT}, on
+     * its codomain alone. That was the precision gap {@code LIMITATIONS.md} L3
+     * recorded.
+     */
+    VIA_CALLER,
 
     /**
      * Established by opening exactly one callee body — the k = 1 commit-existence
@@ -46,9 +64,20 @@ public enum CommitEvidence {
     VIA_CALLEE,
 
     /**
-     * Not established. The hierarchy is a {@link Candidate}, not a machine: its
-     * states are reported (they come from {@code permits} and are exact regardless)
-     * and its dispatch sites are named, but no transition relation is claimed.
+     * Not established. The hierarchy is a {@link Candidate}, not a machine. Its
+     * members are listed provisionally and its dispatch sites are named, but no
+     * transition relation is claimed and the members are not recovered FSM states.
      */
-    UNPROVEN
+    UNPROVEN;
+
+    /**
+     * The weaker of two pieces of evidence: the one a reader of a recall table
+     * must not overstate. The declaration order is the strength order.
+     * {@link #VIA_CALLER} ranks above {@link #VIA_CALLEE} because the probe never
+     * chases a successor, so a machine it proves carries unresolved edges by
+     * construction.
+     */
+    public CommitEvidence weaker(CommitEvidence other) {
+        return other != null && other.ordinal() > ordinal() ? other : this;
+    }
 }

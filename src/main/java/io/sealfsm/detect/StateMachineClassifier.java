@@ -4,6 +4,7 @@ import io.sealfsm.detect.dispatch.CommitGap;
 import io.sealfsm.detect.dispatch.DispatchFinder;
 import io.sealfsm.detect.dispatch.DispatchSite;
 import io.sealfsm.detect.dispatch.EventMajorDispatch;
+import io.sealfsm.detect.dispatch.Installation;
 import io.sealfsm.model.StateMachine.Encoding;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.CtLambda;
@@ -71,24 +72,63 @@ public final class StateMachineClassifier {
     public enum Rejection {
         /** Not a rejection: the hierarchy was accepted as a state machine. */
         NONE,
-        /** No transition producer was found — an abstention, not a verdict. */
+        /**
+         * No commit was established, and nothing is claimed about the hierarchy.
+         * Either no transition producer was found, or value-returning producers were
+         * found and no caller is shown installing their result (F36). An abstention,
+         * not a verdict.
+         */
         ABSTAINED,
         /** The compositional veto: a verdict about the data type itself. */
-        VETOED
+        VETOED,
+        /**
+         * F36, thesis Decision 4: every value-returning producer has callers, and
+         * every caller uses the result as data. The hierarchy is an established
+         * conversion within the source set. It is a verdict about how the
+         * hierarchy's values are USED, not about its members, so a nested sealed
+         * hierarchy is still re-offered as a root. Unlike an abstention it releases
+         * no candidate: Decision 4 forbids publishing a known conversion's members
+         * on either channel.
+         */
+        CONVERTED
     }
 
+    /**
+     * @param installation the F36 verdict for every site the decision weighed, or
+     *                     {@code null} where the decision did not rest on one: an
+     *                     {@code @Fsm} marker, or the compositional veto. The
+     *                     extractor walks only the sites this report establishes, so
+     *                     the sites the classifier accepted and the sites the
+     *                     extractor walks cannot drift apart
+     */
     public record Classification(boolean isStateMachine, Encoding encoding, String reason,
-                                 Rejection rejection) {
+                                 Rejection rejection, Installation.Report installation) {
         /** Rejection by abstention: nothing was recognised, and nothing is claimed. */
         public static Classification no(String reason) {
-            return new Classification(false, Encoding.MIXED, reason, Rejection.ABSTAINED);
+            return new Classification(false, Encoding.MIXED, reason, Rejection.ABSTAINED, null);
         }
         /** Rejection by verdict: a statement about the data type, binding on its members. */
         public static Classification veto(String reason) {
-            return new Classification(false, Encoding.MIXED, reason, Rejection.VETOED);
+            return new Classification(false, Encoding.MIXED, reason, Rejection.VETOED, null);
         }
+        /** Accepted on a marker, with no installation analysis behind it. */
         public static Classification yes(Encoding enc, String reason) {
-            return new Classification(true, enc, reason, Rejection.NONE);
+            return new Classification(true, enc, reason, Rejection.NONE, null);
+        }
+        /** Accepted on the sites {@code installation} establishes. */
+        public static Classification yes(Encoding enc, String reason, Installation.Report installation) {
+            return new Classification(true, enc, reason, Rejection.NONE, installation);
+        }
+        /**
+         * F36: producers were found and their result is not shown to be installed.
+         * An abstention, carrying the report so a candidate can name the sites.
+         */
+        public static Classification uninstalled(String reason, Installation.Report installation) {
+            return new Classification(false, Encoding.MIXED, reason, Rejection.ABSTAINED, installation);
+        }
+        /** F36: every producer's result is used as data. An established conversion. */
+        public static Classification converted(String reason, Installation.Report installation) {
+            return new Classification(false, Encoding.MIXED, reason, Rejection.CONVERTED, installation);
         }
     }
 
@@ -140,22 +180,19 @@ public final class StateMachineClassifier {
         // only place recognition happens: the classifier no longer knows how a
         // locus is found, only that some site's arms commit a hierarchy value.
         DispatchFinder.Sites sites = DispatchFinder.find(root, model);
+        // F36, thesis Decision 4: a value-returning site PRODUCES a hierarchy value,
+        // and only a caller installing it as the current state separates a
+        // transition from a conversion. Judged once per site, here, and handed to the
+        // extractor with the classification, so the sites accepted and the sites
+        // walked are one list.
+        List<DispatchCommitDetector.Producer> producers = DispatchCommitDetector.find(root, model);
+        Installation.Report installation = Installation.analyze(root, model, sites, producers);
 
         trace.accept("per-state transition method (declared on a member, returns the hierarchy "
                 + "type): " + verdict(sites.overrides().size()) + describeHosts(sites.overrides()));
         trace.accept("centralized transition function (produces a hierarchy value AND "
-                + "discriminates one): " + verdict(sites.centralized().size())
-                + describeHosts(sites.centralized()));
-        if (sites.centralized().isEmpty()) {
-            CentralizedScan scan = centralizedScan(root, model);
-            if (!scan.typedHandlers().isEmpty()) {
-                trace.accept("per-state handler outside the hierarchy (a parameter typed with a "
-                        + "member fixes the source): HELD BACK — " + scan.typedHandlers().size()
-                        + " handler(s)" + describeMethods(scan.typedHandlers()) + " fix "
-                        + scan.typedSources().size() + " distinct source state(s); a dispatch must "
-                        + "separate at least two, and one is a conversion (F35)");
-            }
-        }
+                + "discriminates one, takes the state, or is a typed per-state handler): "
+                + verdict(sites.centralized().size()) + describeHosts(sites.centralized()));
         trace.accept("functional transition callable (lambda / anonymous-class method with that "
                 + "signature): " + verdict(sites.functional().size()));
         // The LOCUS half, reported on its own. Without this line the reader cannot
@@ -172,22 +209,39 @@ public final class StateMachineClassifier {
                 + "the hierarchy whose result is installed as a hierarchy value): "
                 + commitVerdict(sites.producers().size(), loci, root)
                 + describeCommits(root, model));
+        for (Installation.SiteVerdict v : installation.all()) {
+            trace.accept("installation (F36) of " + v.route() + " site " + v.hostName() + " ["
+                    + (v.form() == null ? "?" : v.form()) + "]: " + v.verdict()
+                    + (v.verdict().established() ? " — established" : " — NOT established")
+                    + " — " + v.detail());
+        }
 
-        boolean hasDist = !sites.overrides().isEmpty();
-        boolean hasCentral = !sites.centralized().isEmpty() || !sites.functional().isEmpty()
-                || !sites.producers().isEmpty();
+        // Only an ESTABLISHED site counts toward acceptance. Before F36 every site
+        // counted, because a value-returning host was committed by its codomain alone.
+        List<DispatchSite> overrides = established(sites.overrides(), Installation.Route.OVERRIDE, installation);
+        List<DispatchSite> centralized =
+                established(sites.centralized(), Installation.Route.CENTRALIZED, installation);
+        List<DispatchSite> functional =
+                established(sites.functional(), Installation.Route.FUNCTIONAL, installation);
+        List<DispatchSite> producerSites =
+                established(sites.producers(), Installation.Route.PRODUCER, installation);
+        List<DispatchSite> carrierSites = established(sites.carriers(), Installation.Route.CARRIER, installation);
+
+        boolean hasDist = !overrides.isEmpty();
+        boolean hasCentral = !centralized.isEmpty() || !functional.isEmpty() || !producerSites.isEmpty();
 
         if (hasDist && hasCentral) {
             return Classification.yes(Encoding.MIXED,
-                    "both per-state and centralized transition methods present");
+                    "both per-state and centralized transition methods present", installation);
         }
         if (hasCentral) {
             return Classification.yes(Encoding.CENTRALIZED_DISPATCH,
-                    centralizedReason(sites, DispatchCommitDetector.find(root, model)));
+                    centralizedReason(centralized, functional, producers, producerSites, sites.producers()),
+                    installation);
         }
         if (hasDist) {
             return Classification.yes(Encoding.POLYMORPHIC,
-                    sites.overrides().size() + " per-state transition method(s)");
+                    overrides.size() + " per-state transition method(s)", installation);
         }
         // F8: nothing returns the hierarchy type, but each permitted subtype may
         // still own its transition logic and hand the successor to a *carrier*
@@ -199,14 +253,16 @@ public final class StateMachineClassifier {
         // a per-state method either way, and only the *spelling* of the successor
         // differs — which is the orthogonal SuccessorForm axis, recorded per edge.
         List<CtMethod<?>> carriers = CarrierTransitionDetector.findCarrierTransitionMethods(root);
-        if (CarrierTransitionDetector.qualifies(root)) {
+        if (CarrierTransitionDetector.qualifies(root) && !carrierSites.isEmpty()) {
             trace.accept("carrier-based per-state transition (successor handed to a "
-                    + "non-hierarchy wrapper): " + verdict(sites.carriers().size())
-                    + describeHosts(sites.carriers()));
-            return Classification.yes(Encoding.POLYMORPHIC, carrierReason(root));
+                    + "non-hierarchy wrapper): " + verdict(carrierSites.size())
+                    + describeHosts(carrierSites));
+            return Classification.yes(Encoding.POLYMORPHIC, carrierReason(root), installation);
         }
         trace.accept("carrier-based per-state transition (successor handed to a non-hierarchy "
-                + "wrapper): FAILED — " + describeCarrierGap(carriers));
+                + "wrapper): FAILED — " + (CarrierTransitionDetector.qualifies(root)
+                        ? "the carriers are not shown to be installed (F36)"
+                        : describeCarrierGap(carriers)));
         // F33: the GoF State pattern — per-state methods installing the successor
         // into a context outside the hierarchy (`order.changeState(new Paid())`).
         // Asked after every codomain-keyed recognizer, so it only adds machines.
@@ -215,7 +271,36 @@ public final class StateMachineClassifier {
                     + "a holder outside the hierarchy): " + verdict(sites.contextCommits().size())
                     + describeHosts(sites.contextCommits()));
             return Classification.yes(Encoding.POLYMORPHIC, sites.contextCommits().size()
-                    + " per-state method(s) committing through a context (GoF State pattern)");
+                    + " per-state method(s) committing through a context (GoF State pattern)",
+                    installation);
+        }
+        // F36, thesis Decision 4: value-returning producers were found, and none is
+        // shown installing its result. The verdict depends on WHY. If every caller
+        // uses the result as data, the hierarchy is an established conversion and
+        // is rejected outright. If there is no caller, or a caller hands the value
+        // somewhere the analysis does not follow, the source cannot tell a
+        // conversion from a state update, and the tool abstains.
+        if (!installation.unestablished().isEmpty()) {
+            String sitesText = describeUninstalled(installation);
+            if (installation.allConverted()) {
+                trace.accept("OUTCOME: REJECTED AS A CONVERSION (F36) — every value-returning site's "
+                        + "result is used as data by its callers" + sitesText + ". Decision 4: a "
+                        + "conversion is neither a machine nor a candidate");
+                return Classification.converted("every value-returning transition site's result is "
+                        + "used as data by its callers" + sitesText + " — an established conversion, "
+                        + "not a state update (F36); no machine and no candidate", installation);
+            }
+            trace.accept("OUTCOME: ABSTAINED (F36) — value-returning site(s) produce hierarchy values, "
+                    + "but no caller is shown installing the result as the current state"
+                    + sitesText + (installation.plausibleDispatch()
+                            ? ". The sites amount to a dispatch, so the hierarchy is a provisional "
+                                    + "CANDIDATE"
+                            : ". A lone handler fixing one source state is not a dispatch, so there is "
+                                    + "no candidate either"));
+            return Classification.uninstalled("value-returning transition site(s) produce hierarchy "
+                    + "values, but no caller in the source set is shown installing the result as the "
+                    + "current state" + sitesText + " — a conversion and a state update cannot be "
+                    + "told apart here, so no machine is claimed (F36)", installation);
         }
         trace.accept("context-committing per-state method (installs a hierarchy value into a "
                 + "holder outside the hierarchy): FAILED — "
@@ -377,28 +462,71 @@ public final class StateMachineClassifier {
      * deduped on {@code declaringType#signature}, and this uses the same key so
      * the reported number and the walked set cannot drift apart.
      */
-    private static String centralizedReason(DispatchFinder.Sites sites,
-                                            List<DispatchCommitDetector.Producer> producers) {
+    private static String centralizedReason(List<DispatchSite> centralized, List<DispatchSite> functional,
+                                            List<DispatchCommitDetector.Producer> producers,
+                                            List<DispatchSite> establishedProducerSites,
+                                            List<DispatchSite> allProducerSites) {
         Set<String> hosts = new LinkedHashSet<>();
-        for (DispatchSite site : sites.centralized()) hosts.add(site.hostKey());
+        for (DispatchSite site : centralized) hosts.add(site.hostKey());
         // A functional site (a lambda, an anonymous-class SAM) has no CtMethod to
         // key on, so each counts as its own host.
-        int functionalCount = sites.functional().size();
+        int functionalCount = functional.size();
 
-        if (producers.isEmpty()) {
-            return (hosts.size() + functionalCount) + " centralized transition function(s)";
-        }
         // The commit forms come from the producers rather than from the sites,
         // because a site is the LOCUS half by construction and does not carry a
         // commit; asking CommitClassifier again here would be a second evaluation
-        // of a question already answered, and the two could disagree.
+        // of a question already answered, and the two could disagree. Only the
+        // producers whose site is established count (F36); they pair with the
+        // sites by index, as the extractor pairs them.
         Set<String> commits = new LinkedHashSet<>();
-        for (DispatchCommitDetector.Producer p : producers) {
+        for (int i = 0; i < allProducerSites.size() && i < producers.size(); i++) {
+            if (!containsIdentity(establishedProducerSites, allProducerSites.get(i))) continue;
+            DispatchCommitDetector.Producer p = producers.get(i);
             commits.add(p.commit().name());
             hosts.add(methodKey(p.host()));
         }
+        if (commits.isEmpty()) {
+            return (hosts.size() + functionalCount) + " centralized transition function(s)";
+        }
         return (hosts.size() + functionalCount) + " centralized transition function(s), committing via "
                 + String.join("/", commits);
+    }
+
+    /** The sites on {@code route} whose commit the report establishes, in order. */
+    private static List<DispatchSite> established(List<DispatchSite> sites, Installation.Route route,
+                                                  Installation.Report report) {
+        List<DispatchSite> out = new ArrayList<>();
+        for (DispatchSite site : sites) {
+            if (report.established(route, site)) out.add(site);
+        }
+        return out;
+    }
+
+    private static boolean containsIdentity(List<DispatchSite> sites, DispatchSite site) {
+        for (DispatchSite s : sites) {
+            if (s == site) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The unestablished sites, grouped by verdict, for a reason text. Rendered
+     * only: it names what was weighed, and no decision reads it.
+     */
+    private static String describeUninstalled(Installation.Report report) {
+        java.util.Map<Installation.Verdict, Set<String>> byVerdict =
+                new java.util.EnumMap<>(Installation.Verdict.class);
+        for (Installation.SiteVerdict v : report.unestablished()) {
+            byVerdict.computeIfAbsent(v.verdict(), k -> new LinkedHashSet<>()).add(v.hostName());
+        }
+        List<String> parts = new ArrayList<>();
+        byVerdict.forEach((verdict, hosts) -> parts.add(switch (verdict) {
+            case NO_CALLER -> "no caller in the source set " + hosts;
+            case OPAQUE -> "the result is handed somewhere the analysis does not follow " + hosts;
+            case CONVERTED -> "the result is used as data " + hosts;
+            default -> verdict + " " + hosts;
+        }));
+        return parts.isEmpty() ? "" : " (" + String.join("; ", parts) + ")";
     }
 
     /** Declaring type + signature: unique across the model, unlike a bare signature. */
@@ -504,28 +632,12 @@ public final class StateMachineClassifier {
      * widening to methods that are transition functions.
      */
     public static List<CtMethod<?>> findCentralizedTransitionMethods(CtType<?> root, CtModel model) {
-        return centralizedScan(root, model).admitted();
-    }
-
-    /**
-     * The centralized scan, with what F35 held back kept visible: the typed
-     * handlers, and the distinct source states they fix. {@code admitted} is the
-     * decision; the other two exist so {@code --explain} can name why a lone
-     * handler was not enough, off the same scan rather than a second one.
-     */
-    record CentralizedScan(List<CtMethod<?>> admitted, List<CtMethod<?>> typedHandlers,
-                           Set<String> typedSources) {
-    }
-
-    private static CentralizedScan centralizedScan(CtType<?> root, CtModel model) {
         Set<String> hierarchy = hierarchyQualifiedNames(root);
         String rootQn = root.getQualifiedName();
         Set<String> hierarchyTypeNames = new LinkedHashSet<>();
         for (CtType<?> t : hierarchyTypes(root)) hierarchyTypeNames.add(t.getQualifiedName());
 
         List<CtMethod<?>> out = new ArrayList<>();
-        List<CtMethod<?>> typedOnly = new ArrayList<>();
-        Set<String> typedSources = new LinkedHashSet<>();
         for (CtMethod<?> method : model.getElements(new TypeFilter<>(CtMethod.class))) {
             CtTypeReference<?> ret = method.getType();
             if (ret == null || !hierarchy.contains(ret.getQualifiedName())) continue;
@@ -548,28 +660,27 @@ public final class StateMachineClassifier {
             boolean declaredInsideHierarchy =
                     declaring != null && hierarchyTypeNames.contains(declaring.getQualifiedName());
             if (declaredInsideHierarchy && !method.isStatic()) continue;
+            // Either the state is an input (a discrimination, or a root-typed
+            // parameter), or the method is a per-state handler written outside the
+            // hierarchy, handed only a PROPER member (F34).
             if (DispatchCommitDetector.discriminatesState(method, hierarchy, rootQn)
-                    || takesRootParameter(method, rootQn)) {
+                    || takesRootParameter(method, rootQn)
+                    || takesHierarchyParameter(method, hierarchy)) {
                 out.add(method);
-            } else if (takesHierarchyParameter(method, hierarchy)) {
-                // Handed only PROPER members: a per-state handler written outside
-                // the hierarchy (F34). Held back until the family is known.
-                typedOnly.add(method);
-                CtParameter<?> source = typedSourceParameter(method, hierarchy, rootQn);
-                if (source != null) typedSources.add(source.getType().getQualifiedName());
             }
         }
-        // F35 — one typed handler is a CONVERSION, a family of them is a dispatch.
-        // `Shape boundingBox(Circle c)` and `OrderState handle(Placed p)` have the
-        // same signature, and a value-returning host is committed by its codomain
-        // alone, so nothing else separates them. The separating evidence is the one
-        // the instanceof-chain recognizer already demands for the same reason: a
-        // discrimination distinguishes at least TWO states. The overloads of
-        // `handle` do (five source states); `boundingBox` alone does not. Asked of
-        // the family, not the method, so `merge(Open, Shut)` — which fixes no
-        // source of its own — rides on its hierarchy's handlers as it did before.
-        if (typedSources.size() >= 2) out.addAll(typedOnly);
-        return new CentralizedScan(out, typedOnly, typedSources);
+        // F35 used to hold typed handlers back until their family fixed at least two
+        // source states, because `Shape boundingBox(Circle c)` and
+        // `OrderState handle(Placed p)` have the same signature and a value-returning
+        // host was committed by its codomain alone. F36 (thesis Decision 4) replaces
+        // that proxy with the evidence it stood in for: a handler is a transition
+        // when a caller installs its result, whatever the size of its family. A
+        // genuine one-handler machine (`typedhandler.Lamp`, driven) is recovered, and
+        // a two-converter family (`typedhandler.Length`) is not. The threshold
+        // survives only as the candidate channel's plausibility test
+        // (Installation.Report#plausibleDispatch): a lone uncalled converter is not
+        // evidence of a dispatch.
+        return out;
     }
 
     /**

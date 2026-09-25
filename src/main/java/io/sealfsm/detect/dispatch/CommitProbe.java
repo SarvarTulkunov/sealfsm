@@ -4,6 +4,7 @@ import io.sealfsm.model.CommitForm;
 import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtBlock;
 import spoon.reflect.code.CtCase;
+import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtIf;
 import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtLoop;
@@ -285,7 +286,7 @@ public final class CommitProbe {
         return out;
     }
 
-    private static boolean isStatementPosition(CtInvocation<?> inv) {
+    static boolean isStatementPosition(CtExpression<?> inv) {
         try {
             CtElement parent = inv.isParentInitialized() ? inv.getParent() : null;
             if (parent == null) return false;

@@ -64,7 +64,11 @@ public final class DotSerializer {
         // commit is observed in the dispatch's own syntactic context, so an
         // unconditional line would print "DIRECT" on every diagram in the corpus
         // and say nothing. A line that appears is a line that carries information.
-        if (m.commitEvidence() != CommitEvidence.DIRECT) {
+        // Only the probe's evidence is drawn. It qualifies the EDGES, because the
+        // probe never chases a successor. VIA_CALLER (F36) qualifies the
+        // classification and not a single edge, so it is reported where
+        // classifications are reported: the summary table and --json.
+        if (m.commitEvidence() == CommitEvidence.VIA_CALLEE) {
             sb.append("  // commit evidence: ").append(m.commitEvidence())
               .append(" — established by opening one callee body (k = 1 probe), not observed at ")
               .append("the dispatch. Successor identity was deliberately not attempted; the two ")
@@ -108,8 +112,9 @@ public final class DotSerializer {
             sb.append('\n');
         }
 
+        Set<String> emitted = new java.util.HashSet<>();
         for (State s : m.topLevelStates()) {
-            emitState(s, sb, "  ");
+            emitState(s, sb, "  ", emitted);
         }
         sb.append('\n');
 
@@ -178,7 +183,16 @@ public final class DotSerializer {
         return "cluster_" + safe(stateId);
     }
 
-    private void emitState(State s, StringBuilder sb, String indent) {
+    private void emitState(State s, StringBuilder sb, String indent, Set<String> emitted) {
+        // Thesis Decision 2: a type permitted by two sealed branches is ONE state
+        // reachable under both. Graphviz would silently keep the first cluster's
+        // copy of a node declared twice, so it is declared once, and the second
+        // placement is a comment rather than a guess that goes unannounced.
+        if (!emitted.add(s.qualifiedName())) {
+            sb.append(indent).append("// ").append(s.id())
+              .append(": also permitted by this branch; drawn once, where first permitted\n");
+            return;
+        }
         if (s.isComposite() && !s.children().isEmpty()) {
             sb.append(indent).append("subgraph ").append(cluster(s.id())).append(" {\n");
             sb.append(indent).append("  label=").append(q(s.id())).append(";\n");
@@ -188,7 +202,7 @@ public final class DotSerializer {
             sb.append(indent).append("  ").append(q(anchor(s.id())))
               .append(" [shape=point, style=invis, width=0.01, label=\"\"];\n");
             for (State child : s.children()) {
-                emitState(child, sb, indent + "  ");
+                emitState(child, sb, indent + "  ", emitted);
             }
             sb.append(indent).append("}\n");
         } else {

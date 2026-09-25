@@ -1,0 +1,15 @@
+{
+  "id": "selftest-converters",
+  "split": "development",
+  "repository": "(this repository)",
+  "commit": "(working tree)",
+  "module": "examples/converters",
+  "sourceRoots": ["examples/converters"],
+  "javaVersion": "21",
+  "classpath": [],
+  "sourceCompleteness": "complete",
+  "command": "java -jar target/sealfsm.jar --src examples/converters --json --out target/eval-selftest/converters",
+  "selection": "MECHANICS CHECK of score.py on a fixture written for SealFSM: not evidence of accuracy (Decision 3)",
+  "labels": "converters.labels.json",
+  "outcome": "../../../target/eval-selftest/converters/sealfsm-result.json"
+}

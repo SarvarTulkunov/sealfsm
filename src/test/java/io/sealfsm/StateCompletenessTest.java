@@ -128,8 +128,11 @@ class StateCompletenessTest {
         assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertEquals(Set.of("Idle", "Armed", "Fired", "Spent"), ids(m.allStates()),
                 "the permits clause is exact whatever the transitions do");
-        assertEquals(CommitEvidence.DIRECT, m.commitEvidence(),
-                "the codomain proves this commit; the k = 1 probe is not involved");
+        // F36: the codomain proves a hierarchy value is PRODUCED, and the caller
+        // that stores it back (LatchDriver.signal) proves it is installed. The
+        // k = 1 probe is not involved.
+        assertEquals(CommitEvidence.VIA_CALLER, m.commitEvidence(),
+                "installed by a caller; the k = 1 probe is not involved");
         assertEquals(0, m.resolvedTransitionCount());
         assertTrue(m.isDetectedEmpty());
         assertEquals(4, m.transitions().size(), "one unresolved edge per dispatched arm");
@@ -175,8 +178,8 @@ class StateCompletenessTest {
         StateMachine m = single(new Analyzer().analyze(modelOf("examples/opaquepolymorphic")));
         assertEquals(StateMachine.Encoding.POLYMORPHIC, m.encoding());
         assertEquals(Set.of("Parked", "Spinning", "Braking"), ids(m.allStates()));
-        assertEquals(CommitEvidence.DIRECT, m.commitEvidence(),
-                "a per-state method returning H proves its commit by codomain");
+        assertEquals(CommitEvidence.VIA_CALLER, m.commitEvidence(),
+                "a per-state method returning H produces a successor; RotorDriver.nudge installs it (F36)");
         assertEquals(0, m.resolvedTransitionCount());
         assertTrue(m.isDetectedEmpty());
         assertEquals(3, m.transitions().size(), "one unresolved edge per dispatched state");
@@ -204,8 +207,10 @@ class StateCompletenessTest {
                         + "different refusals");
         assertFalse(c.dispatchSites().isEmpty(), "the dispatch it was rejected for is named");
         assertTrue(diagnosticsFor(r, "voidfold.Hopper").stream()
-                        .anyMatch(d -> d.contains("CANDIDATE") && d.contains("4 state(s)")),
-                "a user asking what the states are gets an answer");
+                        .anyMatch(d -> d.contains("CANDIDATE") && d.contains("PROVISIONAL")
+                                && d.contains("4 atomic member(s)")),
+                "a user asking what the states would be gets an answer, marked provisional "
+                        + "(thesis Decision 1)");
     }
 
     /**
@@ -386,23 +391,29 @@ class StateCompletenessTest {
      */
     @Test
     void everyExistingGoldenIsUnchanged() {
+        // F36 changed one thing about these oracles, and nothing about their
+        // relations: each value-returning machine's commit is now EVIDENCED by the
+        // caller that stores its successor back (VIA_CALLER), where the codomain
+        // alone used to count as the commit (DIRECT).
         StateMachine traffic = single(new Analyzer().analyze(modelOf("examples/traffic")));
         assertEquals(3, traffic.allStates().size());
         assertEquals(3, traffic.transitions().size());
         assertEquals(0, traffic.unresolvedTransitionCount(), "traffic: 3 states, 0 unresolved");
-        assertEquals(CommitEvidence.DIRECT, traffic.commitEvidence());
+        assertEquals(CommitEvidence.VIA_CALLER, traffic.commitEvidence(),
+                "TrafficController.tick: current = current.next()");
 
         StateMachine tcp = single(new Analyzer().analyze(modelOf("examples/tcp")));
         assertEquals(11, tcp.allStates().size());
         assertTrue(tcp.commitForms().contains(CommitForm.POLY_CARRIER), "tcp: POLY_CARRIER");
         assertEquals(44, tcp.resolvedTransitionCount());
-        assertEquals(CommitEvidence.DIRECT, tcp.commitEvidence());
+        assertEquals(CommitEvidence.VIA_CALLER, tcp.commitEvidence(),
+                "TcpConnection.apply unwraps the carrier and stores its state");
 
         StateMachine lcp = single(new Analyzer().analyze(modelOf("examples/lcp_automation")));
         assertEquals(10, lcp.allStates().size());
         assertEquals(113, lcp.transitions().size());
         assertEquals(113, lcp.resolvedTransitionCount(), "lcp_automation: 113/113");
-        assertEquals(CommitEvidence.DIRECT, lcp.commitEvidence());
+        assertEquals(CommitEvidence.VIA_CALLER, lcp.commitEvidence());
 
         StateMachine gpt = single(new Analyzer().analyze(modelOf("examples/lcp_automation_chatgpt")));
         assertEquals(10, gpt.allStates().size());
@@ -411,7 +422,7 @@ class StateCompletenessTest {
         assertFalse(gpt.successorForms().contains(SuccessorForm.SELF),
                 "SELF absent is the fingerprint that separates F25's 111/111 from the "
                         + "fabricated one it replaced");
-        assertEquals(CommitEvidence.DIRECT, gpt.commitEvidence());
+        assertEquals(CommitEvidence.VIA_CALLER, gpt.commitEvidence());
 
         assertTrue(new Analyzer().analyze(modelOf("examples/shape")).machines().isEmpty(),
                 "shape stays rejected");

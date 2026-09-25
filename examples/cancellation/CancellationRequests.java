@@ -27,6 +27,15 @@ import java.util.function.BiFunction;
  *   <li><b>Enclosing-method event labels.</b> The anonymous callables are named
  *       by the methods that supply them: {@code add} and {@code subscribe}.</li>
  * </ul>
+ *
+ * <p><b>Since F36 (thesis Decision 4) this is a provisional CANDIDATE, not a
+ * machine</b>, and that is the correct reading of what the tool can see. The
+ * callables' results are installed by {@code AtomicReference.accumulateAndGet}, a
+ * JDK method whose body the tool never reads (F11). Nothing in the source set
+ * shows a result becoming the current state, and giving that library method a
+ * known meaning is the modelling decision {@code LIMITATIONS.md} L2 declines. The
+ * F7 walk is still exercised on a machine by {@code examples/functionaldriver},
+ * the same two callables applied by an in-model accumulator.
  */
 public final class CancellationRequests {
 

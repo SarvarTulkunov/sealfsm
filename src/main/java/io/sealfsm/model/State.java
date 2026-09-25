@@ -6,33 +6,95 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * A single state in an extracted finite state machine.
+ * One node of an extracted state hierarchy.
  *
- * <p>Each state corresponds to exactly one permitted subtype of a sealed
- * hierarchy. Because the set of permitted subtypes is closed and compiler
- * verified, the set of {@code State} objects produced for a machine is
- * <em>provably complete</em> — this is the central correctness guarantee of
- * the tool and is distinct from the (approximate) transition extraction.
+ * <p>The nodes come from the compiler-checked {@code permits} clauses, so for a
+ * hierarchy <em>classified as a machine</em> the node set is <em>complete by
+ * construction</em>. That is the tool's exact claim, and it is distinct from the
+ * approximate transition extraction. It is a claim about <b>type branches</b>,
+ * not about every class an object may have at run time: a {@code non-sealed}
+ * branch ({@link #isOpenBranch()}) can be extended anywhere.
  *
- * <p>A state is {@link #isComposite() composite} when its own type is itself
- * sealed. In that case it acts as a super-state and its {@link #children()}
- * hold the nested sub-states, which maps directly onto SCXML's nested
- * {@code <state>} elements.
+ * <p>Thesis Decision 2 separates three levels, and every metric must say which
+ * one it counts:
+ * <ul>
+ *   <li>a <b>direct branch</b> is a type the root's own {@code permits} clause
+ *       names: a machine's {@link StateMachine#topLevelStates()};</li>
+ *   <li>a <b>grouping node</b> ({@link #isGrouping()}) has children. It is a
+ *       permitted type that is itself sealed, or a permitted {@code enum} whose
+ *       constants are its children. It maps onto SCXML's compound {@code <state>}
+ *       and a DOT cluster;</li>
+ *   <li>an <b>atomic state</b> ({@link #isAtomic()}) is a leaf of that
+ *       expansion: a final or {@code non-sealed} type, or an enum constant
+ *       ({@link #origin()}).</li>
+ * </ul>
+ * For {@code sealed interface Phase permits Idle, Speed} with
+ * {@code enum Speed { SLOW, FAST }}, the direct branches are {@code {Idle, Speed}},
+ * the atomic states are {@code {Idle, Speed.SLOW, Speed.FAST}}, and {@code Speed}
+ * is a grouping node that is not counted a second time as an atomic state.
  */
 public final class State {
+
+    /** What a node was enumerated from. */
+    public enum Origin {
+        /** A type named by a {@code permits} clause. */
+        TYPE,
+        /** A constant of a permitted {@code enum}, closed in exactly the way a {@code permits} clause is. */
+        ENUM_CONSTANT
+    }
 
     private final String id;            // simple type name; unique within a machine
     private final String qualifiedName; // fully-qualified type name
     private boolean initial;
     private boolean terminal;
     private boolean declarationUnread;
+    private boolean openBranch;
     private final boolean composite;
+    private final Origin origin;
     private final List<State> children = new ArrayList<>();
 
     public State(String id, String qualifiedName, boolean composite) {
+        this(id, qualifiedName, composite, Origin.TYPE);
+    }
+
+    public State(String id, String qualifiedName, boolean composite, Origin origin) {
         this.id = Objects.requireNonNull(id, "id");
         this.qualifiedName = Objects.requireNonNull(qualifiedName, "qualifiedName");
         this.composite = composite;
+        this.origin = Objects.requireNonNull(origin, "origin");
+    }
+
+    /** Whether this node is a permitted type or a constant of a permitted enum. */
+    public Origin origin() {
+        return origin;
+    }
+
+    /**
+     * A leaf of the hierarchical expansion: an atomic state. A grouping node is
+     * never also counted as one.
+     */
+    public boolean isAtomic() {
+        return children.isEmpty();
+    }
+
+    /** A node with children: a sealed member, or an enum with constants. */
+    public boolean isGrouping() {
+        return !children.isEmpty();
+    }
+
+    /**
+     * True for a {@code non-sealed} member. It is one branch, and its own
+     * subclasses are not enumerated as separate states: the {@code permits}
+     * clause stops at it and the type system does not close it. The exact claim is
+     * about the branch, and a subclass with different behaviour is reported as a
+     * diagnostic rather than silently merged or dropped.
+     */
+    public boolean isOpenBranch() {
+        return openBranch;
+    }
+
+    public void setOpenBranch(boolean openBranch) {
+        this.openBranch = openBranch;
     }
 
     public String id() {
@@ -123,6 +185,25 @@ public final class State {
         return out;
     }
 
+    /**
+     * The atomic states of a hierarchy: the leaves of the expansion, each
+     * counted once. A type permitted by two sealed branches appears under both of
+     * them in the tree, and it is one state, not two (see
+     * {@code StateExtractor.Result#overlaps}).
+     */
+    public static List<State> atomic(List<State> topLevel) {
+        return distinct(flatten(topLevel).stream().filter(State::isAtomic).toList());
+    }
+
+    /** The grouping nodes of a hierarchy, each counted once. */
+    public static List<State> composites(List<State> topLevel) {
+        return distinct(flatten(topLevel).stream().filter(State::isGrouping).toList());
+    }
+
+    private static List<State> distinct(List<State> states) {
+        return List.copyOf(new java.util.LinkedHashSet<>(states));
+    }
+
     private static void collectInto(State s, List<State> out) {
         out.add(s);
         for (State c : s.children()) collectInto(c, out);
@@ -144,6 +225,8 @@ public final class State {
     public String toString() {
         return "State{" + id + (composite ? ", composite" : "") + (initial ? ", initial" : "")
                 + (terminal ? ", terminal" : "")
+                + (origin == Origin.ENUM_CONSTANT ? ", enum-constant" : "")
+                + (openBranch ? ", open-branch" : "")
                 + (declarationUnread ? ", declaration-unread" : "") + '}';
     }
 }

@@ -194,6 +194,23 @@ public final class SpoonCompat {
     }
 
     /**
+     * Is {@code type} declared {@code non-sealed}? Such a permitted member is one
+     * direct branch of its hierarchy, and it is OPEN: any class in the program, or
+     * outside it, may extend it, so its subclasses are not enumerable the way a
+     * {@code permits} clause is (thesis Decision 2). Answers {@code false} when the
+     * Spoon version cannot tell, which is the direction that reports nothing rather
+     * than a condition that may not hold.
+     */
+    public static boolean isNonSealed(CtType<?> type) {
+        if (type == null) return false;
+        try {
+            return type.hasModifier(ModifierKind.valueOf("NON_SEALED"));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
      * The {@code enum} constant whose body {@code type} is, or {@code null} when
      * {@code type} is not an enum constant body.
      *
