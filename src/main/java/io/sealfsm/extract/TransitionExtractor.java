@@ -1749,7 +1749,7 @@ public final class TransitionExtractor {
                 out.add(Transition.resolved(StateMachine.INITIAL_PSEUDO_STATE,
                         cand.targetSimpleName(), event, g).withForm(cand.form()));
             } else {
-                out.add(Transition.unresolved(StateMachine.INITIAL_PSEUDO_STATE, event, g, cand.raw()));
+                out.add(Transition.unresolved(StateMachine.INITIAL_PSEUDO_STATE, event, g, cand.raw(), originOf(value)));
             }
         }
     }
@@ -2135,7 +2135,7 @@ public final class TransitionExtractor {
                 explainRefusal((CtInvocation<?>) value, from, event,
                         String.valueOf(target.refusal()), target.detail());
                 out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from,
-                        event, guard, safeText(value)), event));
+                        event, guard, safeText(value), originOf(value)), event));
             }
             return;
         }
@@ -2173,7 +2173,7 @@ public final class TransitionExtractor {
         // (3) the successor is computed elsewhere (`Transition.to(nextFor(event))`)
         // or the shape is unrecognised. Record the gap honestly.
         out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from,
-                event, guard, safeText(value)), event));
+                event, guard, safeText(value), originOf(value)), event));
     }
 
     /** Is {@code e} a hierarchy value — {@code this}, {@code new S(...)}, or an H-typed read? */
@@ -3032,7 +3032,7 @@ public final class TransitionExtractor {
             if (accounted.contains(r)) continue;
             unreadableReturns++;
             out.add(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
-                    truncate(safeText(r))));
+                    truncate(safeText(r)), originOf(r)));
         }
         return true;
     }
@@ -3252,7 +3252,7 @@ public final class TransitionExtractor {
             if (fold.accounted.contains(w)) continue;
             unreached++;
             local.add(mark(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
-                    truncate(safeText(w))), event));
+                    truncate(safeText(w)), originOf(w)), event));
         }
         if (local.stream().noneMatch(Transition::isResolved)) {
             if (explaining) {
@@ -3268,7 +3268,7 @@ public final class TransitionExtractor {
         out.addAll(local);
         if (fold.incomplete) {
             out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
-                    probeMarker(inv)), event));
+                    probeMarker(inv), originOf(inv)), event));
         }
         voidFoldedArms++;
         return true;
@@ -3635,7 +3635,7 @@ public final class TransitionExtractor {
             if (foldVoidCommit(inv, from, event, guard, out)) return;
             probedCommitEdges++;
             out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
-                    probeMarker(inv)), event));
+                    probeMarker(inv), originOf(inv)), event));
         } else if (node instanceof CtTry tryStmt) {
             // F6: descend exceptional flow. The try body runs under the normal
             // guard; each catch under a synthetic "exception" guard (carrying the
@@ -4184,7 +4184,8 @@ public final class TransitionExtractor {
         if (CarrierTransitionDetector.nestsHierarchyValue(value, hierarchyQualifiedNames)) {
             nestedProductions++;
             out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from, event, guard,
-                    safeText(value) + " [composes a hierarchy value; not a successor]"), event));
+                    safeText(value) + " [composes a hierarchy value; not a successor]",
+                    originOf(value)), event));
             return;
         }
         for (TransitionResolver.Candidate cand : resolver.resolve(value, from)) {
@@ -4192,7 +4193,7 @@ public final class TransitionExtractor {
             if (cand.deferred() != null && evaluateInWrittenFrame(cand.deferred(), from, event, g, out)) {
                 continue;
             }
-            emit(from, event, g, cand, out);
+            emit(from, event, g, cand, value, out);
         }
     }
 
@@ -4276,7 +4277,8 @@ public final class TransitionExtractor {
         CtBlock<?> scope = decl == null ? null : decl.getParent(CtBlock.class);
         List<Def> defs = scope == null ? null : reachingDefs(scope, va, decl, new ArrayList<>());
         if (defs == null || defs.isEmpty()) {
-            out.add(Transition.unresolved(from == null ? "<unknown>" : from, event, guard, safeText(va)));
+            out.add(Transition.unresolved(from == null ? "<unknown>" : from, event, guard, safeText(va),
+                    originOf(va)));
             return;
         }
         for (Def d : defs) {
@@ -4809,19 +4811,20 @@ public final class TransitionExtractor {
     }
 
     private void emit(String from, String event, String guard,
-                      TransitionResolver.Candidate cand, Set<Transition> out) {
+                      TransitionResolver.Candidate cand, CtElement site, Set<Transition> out) {
         if (explaining) explainEdge(from, event, cand);
         if (cand.resolved()) {
             if (from == null) {
                 out.add(mark(Transition.unresolved("<entry>", event, guard,
-                        "target " + cand.targetSimpleName() + " with undetermined source state"), event));
+                        "target " + cand.targetSimpleName() + " with undetermined source state",
+                        originOf(site)), event));
             } else {
                 out.add(mark(Transition.resolved(from, cand.targetSimpleName(), event, guard)
                         .withForm(cand.form()), event));
             }
         } else {
             out.add(mark(Transition.unresolved(from == null ? "<unknown>" : from,
-                    event, guard, cand.raw()), event));
+                    event, guard, cand.raw(), originOf(site)), event));
         }
     }
 
@@ -4855,6 +4858,23 @@ public final class TransitionExtractor {
      * no event selected it. An else branch under an event test still fires on that
      * event and is not a default edge.
      */
+    /**
+     * A stable key for the program point {@code e} occupies: its file and source
+     * character range. {@code null} when Spoon gives it no valid position, which
+     * leaves the gap identified as before, by source, event, guard and text.
+     */
+    private static String originOf(CtElement e) {
+        if (e == null) return null;
+        try {
+            spoon.reflect.cu.SourcePosition pos = e.getPosition();
+            if (pos == null || !pos.isValidPosition()) return null;
+            java.io.File file = pos.getFile();
+            return (file == null ? "?" : file.getPath()) + ":" + pos.getSourceStart() + "-" + pos.getSourceEnd();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     private Transition mark(Transition t, String event) {
         return otherwisePath && event == null ? t.asOtherwise() : t;
     }

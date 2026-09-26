@@ -2167,7 +2167,39 @@ this defect. Initial state `Queued` now follows from rule 2.
 - `Job`'s driver arms `run(advance(q))` still record `Queued -> ?`: the call
   there has a known source, so the delegation rule (source-less walks only)
   does not apply. Conservative, not fabricated.
-- Two distinct unresolved gaps with the same `(from, event, guard)` collapse to
-  one edge in the transition set. Pre-existing; it is why the two delegation
-  controls are separate hierarchies, so each is visible in the count.
+- Two distinct unresolved gaps with the same `(from, event, guard)` collapsed
+  to one edge in the transition set; it is why the two delegation controls are
+  separate hierarchies. Closed by F40.
 
+## F40 — a gap is identified by where its successor is computed
+
+**Defect.** `Transition.equals` compared `(from, to, event, guard, resolved)`.
+For an unresolved edge `to` is null, so two DIFFERENT unknown successors out of
+one state, under one event and one guard, compared equal, and the extractor's
+transition `LinkedHashSet` kept one. A recorded gap dropped with no marker — the
+outcome the record-everything invariant forbids, and the same mechanism as
+`examples/namecollision`'s lost edge, one level over. Found while building
+F39's controls (`Lever`'s composed call and `Crank`'s drew as one edge).
+
+**Rule.** A resolved edge is still the relation tuple: any number of code paths
+spelling `A --e--> B` are one transition. An unresolved one additionally carries
+an `origin` — the source file and character range of the node that computes the
+unknown successor — and its identity is `(from, event, guard, origin, note)`.
+The note is included because one program point may yield several distinct
+unresolved candidates (the branches of a conditional); the origin is needed
+because identical text at two places (`s.onPull()` in two methods) is two gaps.
+Every construction site in `TransitionExtractor` passes its node
+(`originOf`); a node with no valid position falls back to the old identity.
+`Analyzer`'s unread-declaration gaps are one per state and keep it.
+
+**Fixture** `examples/twingaps`: `Vault permits Locked, Open, Alarmed`, whose
+`Locked` arm folds a helper returning twice from inside `synchronized` (the
+walker's standing probe). Before: **2/3**, one gap for two unknown successors.
+After: **2/4**, both recorded, each note naming its own return; DOT draws two
+dashed edges, SCXML two comments. `TransitionIdentityTest` pins the rule on
+`Transition` directly (two paths → one resolved edge; two program points → two
+gaps, including identical text; one program point reached twice → one gap).
+
+**Corpus.** Byte-identical: no existing fixture lost a gap this way. The
+defect needs two unknown successors in one state with one label, which the
+corpus's single-probe fixtures never write.
