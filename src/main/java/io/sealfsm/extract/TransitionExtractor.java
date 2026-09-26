@@ -316,6 +316,10 @@ public final class TransitionExtractor {
     // noClasspath, or an unresolved receiver). Each is recorded unresolved by the
     // caller exactly as any other unsummarisable call is; the count is reported.
     private final Set<String> nonUniqueCallees = new LinkedHashSet<>();
+    // F39: per-state methods this machine walks as sites of their own, and the
+    // calls that merely delegate to them (see delegatesToWalkedOverrides).
+    private final Set<String> walkedOverrideKeys = new HashSet<>();
+    private final Set<String> delegatedCalls = new LinkedHashSet<>();
     // F29: bound expressions currently being evaluated in their caller's frame.
     // The cycle guard for deferral — each one is a distinct source node, so a chain
     // of deferrals is finite — identity-keyed, the F13 rule.
@@ -776,7 +780,7 @@ public final class TransitionExtractor {
         // function is an inter-procedural helper — its return values are folded
         // into the caller at the call site, so extracting it standalone would
         // double-count and emit spurious undetermined-origin edges. Exclude those.
-        Set<String> helperSignatures = interproceduralHelperSignatures(distributed, centralized);
+        Set<String> helperSignatures = interproceduralHelperKeys(sites);
 
         // F22: a transition method's NAME is an input symbol only when it
         // DISCRIMINATES — see eventName. Decided here, once per hierarchy and
@@ -786,7 +790,7 @@ public final class TransitionExtractor {
         Set<String> distributedNames = new LinkedHashSet<>();
         for (DispatchSite site : sites.overrides()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
-            if (!helperSignatures.contains(m.getSignature())
+            if (!helperSignatures.contains(methodKey(m))
                     && isClaimed(Installation.Route.OVERRIDE, site)) {
                 distributedNames.add(m.getSimpleName());
             }
@@ -809,7 +813,7 @@ public final class TransitionExtractor {
         Set<String> typedNames = new LinkedHashSet<>();
         for (DispatchSite site : sites.centralized()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
-            if (m.getBody() != null && !helperSignatures.contains(m.getSignature())
+            if (m.getBody() != null && !helperSignatures.contains(methodKey(m))
                     && isClaimed(Installation.Route.CENTRALIZED, site)
                     && typedSourceState(m) != null) {
                 typedNames.add(m.getSimpleName());
@@ -819,8 +823,9 @@ public final class TransitionExtractor {
 
         for (DispatchSite site : sites.overrides()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
-            if (!helperSignatures.contains(m.getSignature())
+            if (!helperSignatures.contains(methodKey(m))
                     && claimed(Installation.Route.OVERRIDE, site)) {
+                walkedOverrideKeys.add(methodKey(m));
                 walkAt(site, Route.OVERRIDE, CommitForm.VALUE_RETURN,
                         installationEvidence(Installation.Route.OVERRIDE, site),
                         () -> extractDistributed(m, out));
@@ -842,14 +847,14 @@ public final class TransitionExtractor {
         // manufactured out of a context it already held.
         for (DispatchSite site : sites.overrides()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
-            if (!helperSignatures.contains(m.getSignature())
+            if (!helperSignatures.contains(methodKey(m))
                     && isClaimed(Installation.Route.OVERRIDE, site)) {
                 walkedMethods.add(methodKey(m));
             }
         }
         for (DispatchSite site : sites.centralized()) {
             CtMethod<?> m = (CtMethod<?>) site.host();
-            if (helperSignatures.contains(m.getSignature())) continue;
+            if (helperSignatures.contains(methodKey(m))) continue;
             // Which walk owns this host is decided by whether the state is an
             // ARGUMENT of it. A method handed the state computes a successor from it
             // end to end, so its whole body is the transition relation — that is what
@@ -897,7 +902,7 @@ public final class TransitionExtractor {
             CommitEvidence evidence =
                     p.evidence().weaker(installationEvidence(Installation.Route.PRODUCER, site));
             if (walkedMethods.contains(methodKey(p.host()))
-                    || helperSignatures.contains(p.host().getSignature())) {
+                    || helperSignatures.contains(methodKey(p.host()))) {
                 // Another walk owns the host. The commit still describes the
                 // machine, but only if it is one the machine's acceptance rests on.
                 if (isClaimed(Installation.Route.PRODUCER, site)) {
@@ -974,6 +979,12 @@ public final class TransitionExtractor {
                     + "installed successor was resolved by folding it with the arm's argument "
                     + "bindings (F29). The commit is still the one the k = 1 probe proved; only "
                     + "the successor was recovered, on the fold's own budget");
+        }
+        if (!delegatedCalls.isEmpty()) {
+            diagnostics.add(delegatedCalls.size() + " call(s) " + sample(delegatedCalls)
+                    + " hand the site's own state to per-state methods this machine walks on "
+                    + "their own; each such arm's transition is that method's, already recorded "
+                    + "from the state it runs in, so it adds no edge (F39)");
         }
         if (!nonUniqueCallees.isEmpty()) {
             diagnostics.add(nonUniqueCallees.size() + " call(s) " + sample(nonUniqueCallees)
@@ -1116,25 +1127,115 @@ public final class TransitionExtractor {
     }
 
     /**
-     * Signatures of transition methods invoked by another transition method:
-     * inter-procedural helpers whose return values are folded into their callers
-     * (F3), so they must not also be extracted as standalone machine fragments.
+     * F39 — is {@code inv} the site's own state handed to per-state dispatch?
+     * {@code dispatch(Kiosk s, String cmd) { case "order": return s.onOrder(); }}
+     * cannot be folded (three bodies can run), and before F39 each such arm was an
+     * unresolved edge out of {@code <unknown>}. But nothing about it is unknown:
+     * in whichever state {@code s} is, the body that runs is that state's
+     * override, which this machine walks on its own with an exact source. The
+     * arm's transition IS that override's, already recorded. Recording it again
+     * as a gap reports a hole that is not there, and one per arm.
+     *
+     * <p>Exact only under all four conditions, each checked:
+     * <ul>
+     *   <li>the walk has no source state ({@code from == null}) and is at the
+     *       site itself, not inside a fold — with a known source the call is a
+     *       transition OUT of that state, and it stays what it was;</li>
+     *   <li>the receiver is the site's selector, the hierarchy value the site was
+     *       handed, and the site never reassigns it — another H value's
+     *       transition is not this state's;</li>
+     *   <li>the set of bodies the call can run is bounded ({@link
+     *       CallTarget#possibleBodies}) and non-empty;</li>
+     *   <li>every one of them is a per-state method this machine walked as a
+     *       site of its own — so every successor the call can yield is already an
+     *       edge, resolved or recorded unresolved, from the state it runs in.</li>
+     * </ul>
      */
-    private Set<String> interproceduralHelperSignatures(List<CtMethod<?>> distributed,
-                                                        List<CtMethod<?>> centralized) {
+    private boolean delegatesToWalkedOverrides(CtInvocation<?> inv, String from) {
+        if (from != null || resolver.frame() != null || selector == null) return false;
+        if (!(inv.getTarget() instanceof CtVariableAccess<?> read)) return false;
+        CtVariable<?> receiver;
+        try {
+            receiver = read.getVariable() == null ? null : read.getVariable().getDeclaration();
+        } catch (Throwable t) {
+            receiver = null;
+        }
+        if (receiver != selector) return false;
+        if (TransitionResolver.isReassigned(selector, nameOnlyReassignmentChecks::add)) return false;
+        List<CtMethod<?>> bodies = CallTarget.possibleBodies(inv, callTargets());
+        if (bodies == null || bodies.isEmpty()) return false;
+        for (CtMethod<?> body : bodies) {
+            if (!walkedOverrideKeys.contains(methodKey(body))) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Transition methods invoked by another transition method: inter-procedural
+     * helpers whose return values are folded into their callers (F3), so they
+     * must not also be extracted as standalone machine fragments. Keyed by
+     * {@link #methodKey}.
+     *
+     * <p>F39 — "folded into the caller" is a claim about TWO walks, and both must
+     * happen or the helper's arms are walked by neither. So a call makes its
+     * callee a helper only when
+     * <ul>
+     *   <li>the CALLER is walked: a site F36 does not claim is never walked, so a
+     *       table-driven test, or any method whose result is read as data, that
+     *       calls every per-state method used to delete the whole relation; and</li>
+     *   <li>the callee is a body the call can run, and EITHER the call's unique
+     *       runtime target ({@link CallTarget}, the question the fold itself asks
+     *       before it enters a body), so the fold walks it; OR one of several and
+     *       the callee has no source state of its own, so the caller's unresolved
+     *       marker — which does have one — is the honest record of it. A callee
+     *       that HAS its own exact source (an override: its declaring class; a
+     *       typed handler: its parameter's type) and that the call cannot fold is
+     *       walked on its own: a virtual {@code s.onCoin()} with one body per state
+     *       is folded into nothing, and keying on the bare signature made one such
+     *       call silence every override sharing it. A sourceless one walked on its
+     *       own yields only {@code <entry> -> ?}, a gap the caller already records
+     *       with a known source ({@code bindingframes.Pump}'s {@code LoudRouter}).</li>
+     * </ul>
+     */
+    private Set<String> interproceduralHelperKeys(DispatchFinder.Sites sites) {
+        List<CtMethod<?>> callers = new ArrayList<>();
         Set<String> callable = new HashSet<>();
-        for (CtMethod<?> m : distributed) callable.add(m.getSignature());
-        for (CtMethod<?> m : centralized) callable.add(m.getSignature());
+        // Sites whose walk has an exact source state without any caller's help.
+        Set<String> ownSource = new HashSet<>();
+        for (DispatchSite site : sites.overrides()) {
+            CtMethod<?> m = (CtMethod<?>) site.host();
+            callable.add(methodKey(m));
+            ownSource.add(methodKey(m));
+            if (isClaimed(Installation.Route.OVERRIDE, site)) callers.add(m);
+        }
+        for (DispatchSite site : sites.centralized()) {
+            CtMethod<?> m = (CtMethod<?>) site.host();
+            callable.add(methodKey(m));
+            if (typedSourceState(m) != null) ownSource.add(methodKey(m));
+            if (isClaimed(Installation.Route.CENTRALIZED, site)) callers.add(m);
+        }
 
         Set<String> helpers = new HashSet<>();
-        List<CtMethod<?>> all = new ArrayList<>(distributed);
-        all.addAll(centralized);
-        for (CtMethod<?> caller : all) {
+        for (CtMethod<?> caller : callers) {
+            String callerKey = methodKey(caller);
             for (CtInvocation<?> inv : caller.getElements(new TypeFilter<>(CtInvocation.class))) {
-                CtMethod<?> callee = calleeMethod(inv);
-                if (callee != null && callable.contains(callee.getSignature())
-                        && !callee.getSignature().equals(caller.getSignature())) {
-                    helpers.add(callee.getSignature());
+                CtMethod<?> bound = calleeMethod(inv);
+                if (bound == null) continue;
+                CallTarget.Result target = CallTarget.of(inv, callTargets());
+                if (target.unique()) {
+                    String key = methodKey(target.method());
+                    if (callable.contains(key) && !key.equals(callerKey)) helpers.add(key);
+                    continue;
+                }
+                // Not foldable: the caller records the arm unresolved, with its source.
+                // An unbounded body set still names the bound declaration.
+                List<CtMethod<?>> bodies = CallTarget.possibleBodies(inv, callTargets());
+                if (bodies == null) bodies = List.of(bound);
+                for (CtMethod<?> body : bodies) {
+                    String key = methodKey(body);
+                    if (callable.contains(key) && !key.equals(callerKey) && !ownSource.contains(key)) {
+                        helpers.add(key);
+                    }
                 }
             }
         }
@@ -2822,6 +2923,13 @@ public final class TransitionExtractor {
                             + bound.getSignature() + " is abstract or an interface method with no "
                             + "implementation in the source set");
                     return false;
+                }
+                if (delegatesToWalkedOverrides(inv, from)) {
+                    delegatedCalls.add(safeText(inv));
+                    explainRefusal(inv, from, event, "DELEGATED", "every body the call can run "
+                            + "is a per-state method walked on its own, from the state it runs in; "
+                            + "no edge is added here");
+                    return true;
                 }
                 nonUniqueCallees.add(safeText(inv));
                 explainRefusal(inv, from, event, String.valueOf(target.refusal()), target.detail());

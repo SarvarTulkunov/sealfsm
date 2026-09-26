@@ -205,16 +205,7 @@ public final class CallTarget {
             return Result.refused(Refusal.UNRESOLVED_RECEIVER, "the receiver's static type "
                     + receiver.getQualifiedName() + " has no declaration in the model");
         }
-        int arity = bound.getParameters().size();
-        List<CtMethod<?>> bodies = new ArrayList<>();
-        if (bound.getBody() != null) bodies.add(bound);
-        for (CtMethod<?> m : index.named(bound.getSimpleName())) {
-            if (m == bound || m.getBody() == null || m.getParameters().size() != arity) continue;
-            CtType<?> declaring = m.getDeclaringType();
-            if (declaring == null) continue;
-            if (!overrides(m, bound)) continue;
-            if (related(declaring, receiver, receiverDecl)) bodies.add(m);
-        }
+        List<CtMethod<?>> bodies = bodies(bound, receiver, receiverDecl, index);
         // An ABSTRACT bound declaration runs no body of its own, so the set of
         // bodies the call can run is exactly its concrete overrides. One of them
         // is the unique target on the same closed-world bound the bodied case
@@ -232,6 +223,44 @@ public final class CallTarget {
                         ? " is abstract with more than one implementation, e.g. " + describe(other)
                         : " is overridden by " + describe(other))
                 + ", so more than one body can run");
+    }
+
+    /** Every body in the model the bound declaration's call can run on {@code receiver}. */
+    private static List<CtMethod<?>> bodies(CtMethod<?> bound, CtTypeReference<?> receiver,
+                                            CtType<?> receiverDecl, Index index) {
+        int arity = bound.getParameters().size();
+        List<CtMethod<?>> bodies = new ArrayList<>();
+        if (bound.getBody() != null) bodies.add(bound);
+        for (CtMethod<?> m : index.named(bound.getSimpleName())) {
+            if (m == bound || m.getBody() == null || m.getParameters().size() != arity) continue;
+            CtType<?> declaring = m.getDeclaringType();
+            if (declaring == null) continue;
+            if (!overrides(m, bound)) continue;
+            if (related(declaring, receiver, receiverDecl)) bodies.add(m);
+        }
+        return bodies;
+    }
+
+    /**
+     * Every body {@code inv} can run, when that set is BOUNDED — the same closed
+     * world {@link #of} decides on — or {@code null} when it is not: no bound
+     * declaration, an overload Spoon may have guessed, or a receiver type with no
+     * declaration. A non-null answer of size one is {@link #of}'s unique target.
+     */
+    public static List<CtMethod<?>> possibleBodies(CtInvocation<?> inv, Index index) {
+        CtMethod<?> bound = boundDeclaration(inv);
+        if (bound == null || overloadAmbiguity(inv, bound, index) != null) return null;
+        if (bound.getBody() != null && dispatchIsStatic(inv, bound)) return List.of(bound);
+        CtTypeReference<?> receiver = receiverType(inv, bound);
+        if (receiver == null || SpoonCompat.isUnresolved(receiver)) return null;
+        CtType<?> receiverDecl;
+        try {
+            receiverDecl = receiver.getTypeDeclaration();
+        } catch (Throwable t) {
+            receiverDecl = null;
+        }
+        if (receiverDecl == null) return null;
+        return bodies(bound, receiver, receiverDecl, index);
     }
 
     private static boolean overrides(CtMethod<?> m, CtMethod<?> bound) {

@@ -1088,13 +1088,18 @@ class ExtractionIntegrationTest {
                 twin.atomicStates().stream().map(State::id).collect(Collectors.toSet()));
 
         // Control: two implementations of the abstract handler disagree, so the
-        // driver's successor is not decidable. Recorded, with known sources — never
-        // one implementation's answer published as the machine's.
+        // driver's successor is not decidable. The driver's arms are recorded
+        // unresolved, with known sources — never one implementation's answer
+        // folded and published as the machine's. Each implementation is a typed
+        // handler walked in its own right (F39: the driver's call cannot be folded,
+        // so it does not own them), so the relation is the UNION of both, each
+        // edge exact about the body it came from.
         StateMachine job = machine(driven, "Job");
-        assertEquals(0, resolvedPairs(job).size());
+        assertEquals(Set.of("Queued->Done", "Queued->Running", "Running->Done"), resolvedPairs(job),
+                "DirectRunner and SteppedRunner, both, neither chosen");
         assertEquals(Set.of("Queued", "Running"), job.transitions().stream()
-                .map(Transition::from).collect(Collectors.toSet()));
-        assertTrue(job.transitions().stream().noneMatch(Transition::isResolved));
+                .filter(t -> !t.isResolved()).map(Transition::from).collect(Collectors.toSet()),
+                "the driver's undecidable arms stay recorded");
 
         // Controls on the typed-source rule, on a driven family (HatchPanel installs
         // every handler's result). Several handler names on one state make the

@@ -2055,3 +2055,119 @@ are its one unresolved fall-through split per input. Byte-identical:
 `lcp_automation` (113/113), `lcp_automation_chatgpt` (111/111), both http2
 machines, and every nondeterminism and exhaustiveness warning. The F9 diagnostic
 text now says "(arm, input) cell(s)", which is what it counted.
+
+## F39 — a caller that is not walked, or cannot fold, does not own its callees' arms
+
+**Defect.** Found on a harvested project (a Spring vending-machine API) run with
+its test sources in `--src`. `sealed interface MachineState` is a textbook
+POLYMORPHIC machine: four states, six `MachineState onX()` methods each,
+installed by `VendingMachine` (`after = before.onAddToCart(); state = after;`).
+On `src/main/java` alone it is **14/14**. With `src/test/java` added it was
+**0/0**, Tier 2, "NO arm could be attributed to a source state". The cause was
+one method in a table-driven test:
+
+```java
+private static MachineState apply(MachineState state, String operation) {
+  switch (operation) { case "onAddToCart": return state.onAddToCart(); ... }
+}
+```
+
+Three rules, each right alone, composed into a total loss:
+
+1. `apply` takes and returns the root, so it is a centralized site.
+2. F3's `interproceduralHelperSignatures` excluded every transition method some
+   other transition method invokes, on the ground that it is folded into its
+   caller. It keyed on the bare `getSignature()`, which carries no declaring
+   type, so `state.onAddToCart()` — bound to the abstract root declaration —
+   made all four overrides of `onAddToCart()` helpers, and likewise for the
+   other five. No override was walked.
+3. F36 does not walk `apply`: its result is read as data (here OPAQUE, the
+   AssertJ lambdas around it not resolving). So the arms "folded into" `apply`
+   were walked by nothing.
+
+The report was honest (a flagged total loss, no fabricated edge), so this is a
+recall defect. It is not specific to tests: a REPL or CLI command dispatcher, a
+demo `Main`, a replay tool or a benchmark that calls the per-state methods by
+name has the same shape in production code.
+
+**A second half, on an INSTALLED dispatcher.** `state = dispatch(state, cmd)`
+with `dispatch` switching on the command and returning `s.onOrder()` is walked.
+The call has one body per state, so `CallTarget` refuses it (OVERRIDDEN) and the
+fold records `<unknown> -> ?` per arm, while the overrides, being "helpers", are
+walked by nothing — the same loss, with a gap that stands for real edges.
+
+**Rule.** "Folded into the caller" is a claim about two walks, and F3 now asks
+both halves (`interproceduralHelperKeys`, keyed on the declaration, `methodKey`,
+as every other host in the extractor is):
+
+- the caller must be WALKED — a claimed override or centralized site (F36's
+  `isClaimed`, the same filter the F22 name decision already uses);
+- the callee must be a body the call can run, and EITHER the call's unique
+  runtime target (`CallTarget.of`, the question the fold itself asks before it
+  enters a body — so the fold walks it), OR one of several and the callee has
+  no source state of its own. A callee that HAS an exact source of its own (an
+  override: its declaring class; a typed handler: its parameter's type) and that
+  the call cannot fold is walked on its own. A sourceless one walked on its own
+  yields only `<entry> -> ?`, which the caller's unresolved marker already
+  records with a known source — `bindingframes.Pump`'s `LoudRouter.pick` is
+  that control (a version of this fix without the clause took it 1/3 → 1/4).
+
+And at the fold's refusal point, a call is a **delegation** rather than a gap
+(`delegatesToWalkedOverrides`) when all four hold: the walk is at the site with
+no source state (not inside a fold); the receiver is the site's selector,
+matched by declaration identity, and the site never reassigns it; the set of
+bodies the call can run is bounded (`CallTarget.possibleBodies`, new, the same
+closed world `of` decides on); and every one of them is an override this machine
+walks as its own site. Then in whatever state the receiver is, the transition is
+that state's override, already recorded from the state it runs in, so the arm
+adds no edge. The delegated calls are named in a diagnostic.
+
+**Fixture** `examples/sidecaller`, four hierarchies, each with an unseeded
+store-back:
+
+| hierarchy | shape | HEAD | F39 |
+|---|---|---|---|
+| `Barrier` | side table whose result is data (the vending case), calling the overrides (virtual) and `BarrierService.reset` (static, installed by the driver) | 0/0 | **10/10** |
+| `Kiosk` | installed command dispatcher, virtual calls on its selector | 0/1 (`<unknown> -> ?`) | **7/7**, 3 calls delegated |
+| `Lever` | CONTROL (receiver): an installed dispatcher calling a per-state method on a local holding a first transition's result | 0/1 | 4/5 — the composed call stays unresolved; only the `"pull"` arm is delegated |
+| `Crank` | CONTROL (reassignment): the selector, overwritten before the call | 0/1 | 4/5 — nothing delegated |
+
+**Ablations**, each measured by removing the clause and re-running:
+
+| removed | effect |
+|---|---|
+| walked-caller filter | `Barrier` 10/10 → 7/7 (the installed `reset` is lost behind the unwalked table) |
+| own-source exemption | `Kiosk`, `Lever`, `Crank` → 0/1; `orchestrator.Job` → 0/2 |
+| delegation | `Kiosk` 7/7 → 7/8 (`<unknown> -> ?` for arms whose transitions are edges) |
+| receiver = selector | `Lever` 4/5 → 4/4 (a composed transition silenced) |
+| reassignment check | `Crank` 4/5 → 4/4 |
+
+The real project: 0/0 → **14/14** with tests in `--src`, identical to the
+main-only run.
+
+**Corpus.** Byte-identical except `orchestrator.Job`, F34's control for "two
+disagreeing implementations": 0/2 → **3/5**. `JobRunner.run` calls the abstract
+`advance(Queued)`, which has two implementations. Before, the bare signature
+made all four implementations helpers and the fold refused the call (two
+bodies), so they were walked by nobody — the same defect. Now each is walked as
+the typed handler it is: `Queued -> Done` (DirectRunner), `Queued -> Running`
+(SteppedRunner), `Running -> Done` (both). The driver's two unresolved arms stay.
+What the control protects is unchanged — no body is folded and published as
+*the* answer — but the documented expectation "stays 0/2" was an artifact of
+this defect. Initial state `Queued` now follows from rule 2.
+
+**Residuals.**
+- `Kiosk`, `Lever` and `Crank` report `MIXED`: the dispatcher is still a
+  centralized site to the classifier, though it discriminates the input, not
+  the state.
+- `Lever`: `onPush`'s result used only as the receiver of `onPull()` reads to
+  F36 as a CONVERTED use, which is why the fixture carries a direct store-back
+  for it. A chained transition is arguably an installation; an F36 question,
+  not this one.
+- `Job`'s driver arms `run(advance(q))` still record `Queued -> ?`: the call
+  there has a known source, so the delegation rule (source-less walks only)
+  does not apply. Conservative, not fabricated.
+- Two distinct unresolved gaps with the same `(from, event, guard)` collapse to
+  one edge in the transition set. Pre-existing; it is why the two delegation
+  controls are separate hierarchies, so each is visible in the count.
+
