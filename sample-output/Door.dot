@@ -12,9 +12,11 @@ digraph "Door" {
   "Closed" [penwidth=2, color="#1a73e8"];
   "Locked";
 
-  "Closed" -> "Locked" [label="[event instanceof examples.door.Lock]"];
-  "Closed" -> "Open" [label="[!(event instanceof examples.door.Lock)]"];
+  "Closed" -> "Locked" [label="Lock"];
+  "Closed" -> "Open" [label="Push"];
+  "Closed" -> "Open" [label="Unlock"];
   "Open" -> "Closed";
-  "Locked" -> "Closed" [label="[event instanceof examples.door.Unlock]"];
-  "Locked" -> "Locked" [label="[!(event instanceof examples.door.Unlock)]"];
+  "Locked" -> "Closed" [label="Unlock"];
+  "Locked" -> "Locked" [label="Push"];
+  "Locked" -> "Locked" [label="Lock"];
 }

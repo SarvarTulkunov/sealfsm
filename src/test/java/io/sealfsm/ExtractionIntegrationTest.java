@@ -467,11 +467,13 @@ class ExtractionIntegrationTest {
         assertTrue(hasResolved(m, "Locked", "Closed"), "Locked -> Closed (guarded)");
         assertTrue(hasResolved(m, "Locked", "Locked"), "Locked -> Locked (return current self-loop)");
 
-        // The guarded branch must carry a non-null guard.
-        Transition guarded = m.transitions().stream()
-                .filter(t -> t.from().equals("Closed") && "Locked".equals(t.to()))
-                .findFirst().orElseThrow();
-        assertNotNull(guarded.guard(), "guarded transition should record its condition");
+        // F38: the ternary's condition tests the input, so it is the edge's EVENT,
+        // not a guard, and the else-branch is one edge per remaining input of the
+        // closed alphabet Event = {Push, Lock, Unlock}.
+        assertTrue(hasEventEdge(m, "Closed", "Lock", "Locked"), "Closed --Lock--> Locked");
+        assertTrue(hasEventEdge(m, "Closed", "Push", "Open"), "Closed --Push--> Open");
+        assertTrue(hasEventEdge(m, "Closed", "Unlock", "Open"), "Closed --Unlock--> Open");
+        assertEquals(7, m.transitions().size());
 
         assertEquals("Closed", m.initialState().orElse(null));
     }
@@ -495,19 +497,18 @@ class ExtractionIntegrationTest {
         assertTrue(hasResolved(m, "Unlocked", "Locked"), "Unlocked -> Locked (guarded, inside if)");
         assertTrue(hasResolved(m, "Unlocked", "Unlocked"), "Unlocked -> Unlocked (fall-through self-loop)");
 
-        // The value produced inside the `if` must carry the condition as a guard.
-        Transition guarded = m.transitions().stream()
-                .filter(t -> t.from().equals("Locked") && "Unlocked".equals(t.to()))
-                .findFirst().orElseThrow();
-        assertNotNull(guarded.guard(), "if-guarded transition should record its condition");
-        assertTrue(guarded.guard().contains("Coin"), "guard should reference the if-condition");
+        // F38: the `if` tests the input, so it labels the edge it guards and the
+        // fall-through is the remaining input of the closed alphabet.
+        assertTrue(hasEventEdge(m, "Locked", "Coin", "Unlocked"), "Locked --Coin--> Unlocked");
+        assertTrue(hasEventEdge(m, "Locked", "Push", "Locked"), "the fall-through is Push, not !Coin");
 
-        // The fall-through self-loop must carry the negated guard, keeping the
-        // two Locked-origin edges mutually exclusive.
+        // The two Locked-origin edges stay mutually exclusive. Since F38 the
+        // inputs say so (Coin vs Push), so the fall-through needs no negated guard.
         Transition fallThrough = m.transitions().stream()
                 .filter(t -> t.from().equals("Locked") && "Locked".equals(t.to()))
                 .findFirst().orElseThrow();
-        assertNotNull(fallThrough.guard(), "fall-through branch should record the negated condition");
+        assertEquals("Push", fallThrough.event(), "the fall-through fires on the input the test did not take");
+        assertNull(fallThrough.guard(), "and needs no negated guard to say so");
     }
 
     @Test
@@ -597,15 +598,15 @@ class ExtractionIntegrationTest {
 
         // Resolved *through* helper methods.
         assertTrue(hasResolved(m, "Open", "Shut"), "Open -> Shut via delegate shutOnTurn");
-        assertTrue(hasResolved(m, "Open", "Open"), "Open -> Open self-loop via delegate");
+        assertTrue(hasEventEdge(m, "Open", "Kick", "Open"), "Open -> Open self-loop via delegate");
         assertTrue(hasResolved(m, "Shut", "Open"), "Shut -> Open via factory factoryOpen");
 
-        // The guard survives the fold.
+        // The delegate's condition survives the fold. It tests the input, so since
+        // F38 it arrives as the edge's event rather than as a guard.
         Transition guarded = m.transitions().stream()
                 .filter(t -> t.from().equals("Open") && "Shut".equals(t.to()))
                 .findFirst().orElseThrow();
-        assertNotNull(guarded.guard(), "delegated target should keep its guard");
-        assertTrue(guarded.guard().contains("Turn"), "guard should reference the delegate's condition");
+        assertEquals("Turn", guarded.event(), "the delegate's condition labels the folded edge");
 
         // Out-of-budget chain (concrete target 3 hops deep, k = 2): recorded
         // unresolved, never resolved on a guess. This keeps precision honest.
@@ -632,12 +633,15 @@ class ExtractionIntegrationTest {
         // Σ is exact and complete — enumerated from the sealed Event type.
         assertEquals(Set.of("Play", "Pause", "Stop", "Skip"), m.alphabet());
 
-        // `Skip` is in Σ purely by structure: it is folded into every `default`
-        // arm and so appears on no edge. This proves Σ comes from the sealed type,
-        // not merely from the emitted transitions.
+        // `Skip` is in Σ purely by structure: no arm names it, so it reaches every
+        // `default` arm. Since F38 each default arm is one edge per input it
+        // receives, so `Skip` labels exactly the default self-loops — a label that
+        // could only have come from the sealed type, never from a case label.
         assertTrue(m.alphabet().contains("Skip"), "ignored event must still be in Σ");
-        assertFalse(m.transitions().stream().anyMatch(t -> "Skip".equals(t.event())),
-                "the ignored event must not label any edge");
+        assertTrue(m.transitions().stream().filter(t -> "Skip".equals(t.event()))
+                        .allMatch(t -> t.from().equals(t.to())),
+                "the ignored event labels only the default self-loops");
+        assertTrue(hasEventEdge(m, "Stopped", "Skip", "Stopped"));
 
         // Each event-switch arm labels its edge with the matched event.
         assertTrue(hasEventEdge(m, "Playing", "Pause", "Paused"), "Playing --Pause--> Paused");
@@ -1208,12 +1212,23 @@ class ExtractionIntegrationTest {
         ExtractionResult r = new Analyzer().analyze(modelOf("examples/tcp"));
         StateMachine m = single(r);
 
+        // F38: in Established the fall-through follows `if (event == CLOSE) return`,
+        // which partitions the closed alphabet, so it is one self-loop per
+        // remaining input rather than a default edge.
+        assertTrue(hasEventEdge(m, "Established", "Timeout.USER", "Established"));
+        assertTrue(m.transitions().stream()
+                        .filter(t -> t.from().equals("Established") && "Established".equals(t.to()))
+                        .noneMatch(t -> "UserCall.CLOSE".equals(t.event())),
+                "the input the test took does not reach the fall-through");
+
+        // Where no exact per-input split exists the default edge remains: FinWait1's
+        // trailing ignore(this) follows an `if (event instanceof SegmentArrival seg)`
+        // whose body does not always leave, so every input may reach it.
         Transition fallThrough = m.transitions().stream()
-                .filter(t -> t.from().equals("Established") && "Established".equals(t.to()))
+                .filter(t -> t.from().equals("FinWait1") && "FinWait1".equals(t.to()))
                 .findFirst().orElseThrow();
         assertTrue(fallThrough.isOtherwise(), "the trailing ignore(this) is the default edge");
         assertNull(fallThrough.event(), "a default edge carries no event");
-        assertNotNull(fallThrough.guard(), "it still carries the residual of the guards before it");
 
         // An edge an event DID select is not a default edge, even though it also
         // sits on a fall-through path.
@@ -1222,11 +1237,18 @@ class ExtractionIntegrationTest {
                 .findFirst().orElseThrow();
         assertFalse(evented.isOtherwise(), "an event-selected edge is not the default edge");
 
-        // Every state has exactly one way out when nothing matches — no state was
-        // left with its default branch dropped.
+        // No state was left with its default branch dropped. Since F38 that branch
+        // is either still one `otherwise` edge (where no exact per-input split
+        // exists) or has become one edge per input — so every state either keeps
+        // its default edge or has an edge for EVERY input of Σ.
         for (String id : stateIds(m)) {
-            assertTrue(m.transitions().stream().anyMatch(t -> t.from().equals(id) && t.isOtherwise()),
-                    "state " + id + " should keep its default edge");
+            boolean keepsDefault = m.transitions().stream()
+                    .anyMatch(t -> t.from().equals(id) && t.isOtherwise());
+            Set<String> covered = m.transitions().stream().filter(t -> t.from().equals(id))
+                    .map(Transition::event).filter(java.util.Objects::nonNull)
+                    .collect(java.util.stream.Collectors.toSet());
+            assertTrue(keepsDefault || covered.containsAll(m.alphabet()),
+                    "state " + id + " should keep its default edge, or an edge for every input");
         }
     }
 
@@ -1582,7 +1604,7 @@ class ExtractionIntegrationTest {
         assertTrue(m.transitions().stream()
                         .anyMatch(t -> t.isResolved() && "Running".equals(t.from())
                                 && "Halted".equals(t.to())
-                                && t.guard() != null && t.guard().contains("FAULT")),
+                                && "FAULT".equals(t.event())),
                 "a return inside a loop is a real successor, not one to be dropped");
 
         // NEGATIVE CONTROL and standing probe: `fromHalted` returns from inside a
@@ -1599,7 +1621,9 @@ class ExtractionIntegrationTest {
                         .anyMatch(d -> d.message().contains("could not be reached by the walk")),
                 "an unread return is reported, not silently folded away");
 
-        assertEquals(9, m.transitions().size());
+        // 9 before F38, which splits Priming's negated test and fromIdle's
+        // `default` into one edge per remaining input of Signal.
+        assertEquals(14, m.transitions().size());
     }
 
     // ---- F9: a helper that cannot return normally is not a producer ---------
@@ -1678,12 +1702,14 @@ class ExtractionIntegrationTest {
                                 && !t.isResolved()),
                 "a call into an unread (shadow) body is unresolved, never suppressed");
 
-        // The suppression count must track the three `reject` arms only. If the
-        // shadow call were counted too it would read as a fourth proven rejection —
-        // a false claim dressed in the diagnostic that exists to make F9 auditable.
+        // The suppression count must track the `reject` arms only. If the shadow
+        // call were counted too it would read as one more proven rejection — a
+        // false claim dressed in the diagnostic that exists to make F9 auditable.
+        // It counts (arm, input) CELLS: since F38 the rejecting `default` arm is
+        // one cell per input no labelled arm claims, so three arms are seven cells.
         assertTrue(r.diagnostics().stream()
-                        .anyMatch(d -> d.message().startsWith("3 call(s) to a helper")),
-                "only the three provably-throwing arms may be reported as suppressed");
+                        .anyMatch(d -> d.message().startsWith("7 (arm, input) cell(s) end in a call")),
+                "only the provably-throwing cells may be reported as suppressed");
 
         // The suppression is reported, so it is reclassified rather than silent —
         // the "never silently dropped" invariant is about visibility, and this
@@ -1761,7 +1787,11 @@ class ExtractionIntegrationTest {
         assertTrue(hasEventEdge(capstan, "Snagged", "CLEAR", "Snagged"),
                 "a conditionally-throwing helper still returns and keeps its edge");
 
-        assertEquals(5, capstan.transitions().size(),
+        // Since F38, Taut's trailing `stay(this)` is one self-loop per input the
+        // two tests above it did not take: CRANK and CLEAR.
+        assertTrue(hasEventEdge(capstan, "Taut", "CRANK", "Taut"));
+        assertTrue(hasEventEdge(capstan, "Taut", "CLEAR", "Taut"));
+        assertEquals(6, capstan.transitions().size(),
                 "the relation the source actually defines");
         assertEquals(0, capstan.unresolvedTransitionCount(),
                 "a suppressed cell is an undefined input, not an unresolved target");
@@ -1769,9 +1799,10 @@ class ExtractionIntegrationTest {
         // Suppression is counted and reported, so it is reclassified rather than
         // silent — the same treatment F9 already gives it centrally.
         assertTrue(r.diagnostics().stream()
-                        .anyMatch(d -> d.message().startsWith("3 call(s) to a helper")
+                        .anyMatch(d -> d.message().startsWith("6 (arm, input) cell(s) end in a call")
                                 && d.message().contains("cannot return normally")),
-                "the three undefined cells are reported, not merely absent");
+                "the six undefined cells (Slack: PAY_OUT, CLEAR; Taut: SNAG; Snagged: CRANK, "
+                        + "PAY_OUT, SNAG) are reported, not merely absent");
     }
 
     @Test
@@ -1785,7 +1816,7 @@ class ExtractionIntegrationTest {
         // has no `return` because it was never parsed, so its emptiness carries no
         // information — and read as proof it deletes the entire machine.
         //
-        // Ablate the shadow check and this reports 0/0: three states, five edges
+        // Ablate the shadow check and this reports 0/0: three states, every edge
         // gone, no unresolved marker anywhere. It also corrupts the commit axis to
         // FIELD_MUTATION, because the F2 fallback runs once the carrier path finds
         // nothing — so the failure would show up as a machine filed under the
@@ -1802,7 +1833,10 @@ class ExtractionIntegrationTest {
         assertTrue(hasEventEdge(hoist, "Parked", "RAISE", "Raising"));
         assertTrue(hasEventEdge(hoist, "Raising", "HOLD", "Held"));
         assertTrue(hasResolved(hoist, "Held", "Parked"));
-        assertEquals(5, hoist.transitions().size(),
+        // F38: each `otherwise` self-loop is now one edge per remaining input.
+        assertTrue(hasEventEdge(hoist, "Parked", "HOLD", "Parked"));
+        assertTrue(hasEventEdge(hoist, "Raising", "PARK", "Parked"));
+        assertEquals(7, hoist.transitions().size(),
                 "every edge through an unread body survives");
         assertEquals(0, hoist.unresolvedTransitionCount());
 
@@ -1880,8 +1914,10 @@ class ExtractionIntegrationTest {
 
         assertEquals(Set.of("Stopped", "Running", "Jammed"), stateIds(m));
 
-        // Exactly the six edges the two switches encode — two per state.
-        assertEquals(6, m.transitions().size(),
+        // Exactly the edges the two switches encode: per state, the input its test
+        // takes plus (F38) one self-loop for each of the other three inputs of
+        // Command = {START, STOP, JAM, CLEAR}.
+        assertEquals(12, m.transitions().size(),
                 "only the switch arms commit a successor; the plumbing does not");
         assertEquals(0, m.unresolvedTransitionCount(),
                 "nothing in this machine is unrecoverable, so no gap may be reported");
@@ -2316,8 +2352,9 @@ class ExtractionIntegrationTest {
         // The initial-state rules touch nothing else: enumeration stays exact and
         // the recovered relation is unchanged.
         assertEquals(6, m.allStates().size());
-        assertEquals(10, m.transitions().size());
-        assertEquals(9, m.resolvedTransitionCount());
+        // F38 splits each negated tick test into one edge per remaining input.
+        assertEquals(16, m.transitions().size());
+        assertEquals(13, m.resolvedTransitionCount());
     }
 
     @Test
@@ -2353,27 +2390,24 @@ class ExtractionIntegrationTest {
         assertEquals(Set.of(CommitForm.VALUE_RETURN), m.commitForms());
         assertEquals(Set.of("Charged", "Venting", "Faulted", "Bleeding", "Latched", "Purging"),
                 stateIds(m));
-        assertEquals(6, m.transitions().size());
+        assertEquals(10, m.transitions().size());
         assertEquals(0, m.unresolvedTransitionCount());
 
+        // The producer below a throwing branch fires only when the test failed.
+        // Since F38 that is said with inputs rather than a negated guard: the
+        // rejection test partitions Command = {OPEN, CLOSE, PURGE, RESET}, so the
+        // producer's edges are exactly the inputs the rejection did not take.
         // A bare `throw`.
-        assertTrue(guardOf(m, "Charged", "Venting").contains("RESET"),
+        assertEquals(Set.of("OPEN", "CLOSE", "PURGE"), eventsOf(m, "Charged", "Venting"),
                 "the producer below a throwing branch fires only when the test failed");
         // A block whose LAST statement is a throw — the bookkeeping call before
         // it does not change how the block completes.
-        assertTrue(guardOf(m, "Venting", "Charged").contains("PURGE"),
+        assertEquals(Set.of("OPEN", "CLOSE", "RESET"), eventsOf(m, "Venting", "Charged"),
                 "a block ending in a throw completes abruptly too");
         // An exhaustive switch statement, every arm of which throws: no arm and
-        // no `break` can carry control past it.
-        assertTrue(guardOf(m, "Faulted", "Charged").contains("RESET"),
+        // no `break` can carry control past it. Its test is `cmd != RESET`.
+        assertEquals(Set.of("RESET"), eventsOf(m, "Faulted", "Charged"),
                 "an exhaustive all-throwing switch cannot complete normally");
-
-        // Every recovered guard here is a NEGATION of the rejection test, which
-        // is the whole content of the finding.
-        for (String from : List.of("Charged", "Venting", "Faulted")) {
-            assertTrue(guardOf(m, from, null).startsWith("!("),
-                    from + "'s guard must be the negated rejection test");
-        }
 
         // NEGATIVE CONTROL 1 — the Bleeding arm CONTAINS a throw but takes it
         // only conditionally, so it completes normally and its producer is
@@ -2405,6 +2439,13 @@ class ExtractionIntegrationTest {
         assertTrue(hasResolved(m, "Purging", "Charged"),
                 "an empty trailing arm falls out of the switch; the producer after it is live");
         assertNull(guardOrNull(m, "Purging", "Charged"));
+    }
+
+    /** The events of the resolved edges {@code from} → {@code to}. */
+    private static Set<String> eventsOf(StateMachine m, String from, String to) {
+        return m.transitions().stream()
+                .filter(t -> t.isResolved() && from.equals(t.from()) && to.equals(t.to()))
+                .map(Transition::event).collect(java.util.stream.Collectors.toSet());
     }
 
     /** The guard of the one resolved edge out of {@code from} (to {@code to}, or wherever). */
@@ -2832,13 +2873,12 @@ class ExtractionIntegrationTest {
         StateMachine m = named(r, "Shutter");
 
         assertTrue(hasResolved(m, "Shut", "Shut"), "Shut was never tested: it reaches the tail");
-        Transition openLoop = m.transitions().stream()
-                .filter(t -> t.from().equals("Open") && "Open".equals(t.to()))
-                .findFirst().orElseThrow(() ->
-                        new AssertionError("Open stays Open unless the command is LOWER"));
-        assertNotNull(openLoop.guard(), "that edge is conditional and must say so");
-        assertTrue(openLoop.guard().contains("LOWER"));
-        assertEquals(5, m.transitions().size());
+        // Open stays Open unless the command is LOWER. Since F38 the link's extra
+        // condition partitions Command = {LOWER, RAISE, SEAL}, so that conditional
+        // edge is said with the inputs it fires on, and never LOWER.
+        assertEquals(Set.of("RAISE", "SEAL"), eventsOf(m, "Open", "Open"),
+                "Open reaches the tail on exactly the inputs its link did not take");
+        assertEquals(7, m.transitions().size());
     }
 
     /**
@@ -2920,8 +2960,10 @@ class ExtractionIntegrationTest {
         assertTrue(hasResolved(m, "Seated", "Seated"), "the default arm folds back");
         assertTrue(hasResolved(m, "Parted", "Seated"));
         assertTrue(hasResolved(m, "Raised", "Parted"));
+        // F38: each `default` is one edge per input no labelled arm took.
+        assertEquals(Set.of("LIFT", "DROP"), eventsOf(m, "Raised", "Parted"));
 
-        assertEquals(6, m.transitions().size());
+        assertEquals(9, m.transitions().size());
         assertEquals(0, m.unresolvedTransitionCount());
         assertEquals("Seated", m.initialState().orElse(null));
         // Σ is still enumerated from the event parameter of a host with no state
@@ -2972,7 +3014,7 @@ class ExtractionIntegrationTest {
         assertEquals(Set.of(CommitForm.FIELD_MUTATION), m.commitForms(),
                 "the detector established the commit; the walk must not overwrite it");
         assertEquals(Set.of("Dogged", "Cracked", "Gaping"), stateIds(m));
-        assertEquals(6, m.transitions().size());
+        assertEquals(9, m.transitions().size()); // F38: three states, three inputs of Turn each
         assertEquals(0, m.unresolvedTransitionCount());
         assertTrue(hasResolved(m, "Dogged", "Cracked"));
         assertTrue(hasResolved(m, "Cracked", "Gaping"));
@@ -3069,7 +3111,7 @@ class ExtractionIntegrationTest {
         assertEquals(StateMachine.Encoding.CENTRALIZED_DISPATCH, m.encoding());
         assertEquals(Set.of(CommitForm.FIELD_MUTATION), m.commitForms());
         assertEquals(Set.of("Fresh", "Waiting", "Stale"), stateIds(m));
-        assertEquals(7, m.transitions().size());
+        assertEquals(9, m.transitions().size()); // F38: negated tick tests, one edge per input
         assertEquals(0, m.unresolvedTransitionCount());
 
         assertTrue(hasResolved(m, "Fresh", "Waiting"), "new Waiting(f, 1)");
@@ -3465,8 +3507,8 @@ class ExtractionIntegrationTest {
         assertEquals(relationOf(full), relationOf(thin),
                 "the withheld files hold no transition logic, so withholding them "
                         + "must cost no edge");
-        assertEquals(5, thin.transitions().size());
-        assertEquals(5, thin.resolvedTransitionCount());
+        assertEquals(7, thin.transitions().size());
+        assertEquals(7, thin.resolvedTransitionCount());
 
         assertTrue(partial.diagnostics().stream()
                         .map(ExtractionResult.Diagnostic::message)
@@ -3501,12 +3543,12 @@ class ExtractionIntegrationTest {
         // cannot answer this at all.
         assertEquals("Closed", thin.initialState().orElse(null));
 
-        // PROVENANCE, and the reason a 5/5 here is not the same claim as the 5/5
-        // beside it. Every one of these five edges was matched through a name
+        // PROVENANCE, and the reason a 7/7 here is not the same claim as the 7/7
+        // beside it. Every one of these seven edges was matched through a name
         // Spoon guessed for a declaration nobody read; the score cannot show that,
         // so the model carries it and the CLI prints it under the table.
         assertEquals(Set.of("Open", "Closed", "Locked"), thin.statesWithUnreadDeclaration());
-        assertEquals(5, thin.transitionsViaUnreadDeclaration());
+        assertEquals(7, thin.transitionsViaUnreadDeclaration());
         assertTrue(full.statesWithUnreadDeclaration().isEmpty());
         assertEquals(0, full.transitionsViaUnreadDeclaration(),
                 "the same relation read from complete source claims full provenance, "
@@ -3515,7 +3557,7 @@ class ExtractionIntegrationTest {
         // Negative control: with every file present the identical switch produces
         // the full relation and no resolution diagnostic at all, so the messages
         // above track resolution and not merely the presence of a pattern arm.
-        assertEquals(5, full.resolvedTransitionCount());
+        assertEquals(7, full.resolvedTransitionCount());
         assertFalse(mentionsResolution(wholeDoor));
     }
 

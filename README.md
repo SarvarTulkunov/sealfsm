@@ -245,7 +245,7 @@ The `--returns` flag is especially useful: it shows the exact `CtExpression` sub
 | Example | Encoding | Expected result |
 |---------|----------|-----------------|
 | `examples/traffic` | distributed | 3 states; Red→Green→Yellow→Red; initial **Red**; 0 unresolved |
-| `examples/door` | centralized | 3 states; guarded + self-loop transitions; initial **Closed** |
+| `examples/door` | centralized | 3 states, 7/7 event-labelled transitions (F38); self-loops; initial **Closed** |
 | `examples/turnstile` | centralized | 2 states; imperative `if`-guarded arms with fall-through self-loops |
 | `examples/localvar` | centralized | 2 states; next state via a **reassigned root-typed local** — guarded edge + else self-loop, no blind self-loop (finding F1) |
 | `examples/gofcontext` | mutation / GoF | 3 states; transitions via `ctx.setState(...)` field mutation; recovers the **same edge set** as `examples/door` (finding F2) |
@@ -311,7 +311,8 @@ each repository to an exact commit; label every sealed hierarchy of the sample
 and plain data types; keep a held-out split; then score with
 `scripts/evaluation/score.py`. It reports classification TP/FP/FN, abstentions
 and coverage, state accuracy at each level, and transition precision and recall,
-with unresolved edges as their own figure. Conditional accuracy over recognised
+with unresolved edges as their own figure. A transition is scored as the
+distinct triple (source, event, target); guards are not scored. Conditional accuracy over recognised
 machines is always reported next to overall recall, never in place of it. The
 bundled examples are regression tests, not evidence of accuracy on independent
 projects.
@@ -323,7 +324,7 @@ projects.
 - **Inter-procedural targets** (`return helper();`, `return factory.make();`) are chased with bounded return-value summaries (finding F3), depth-limited to k = 2 with cycle detection and reported as a separate, precision-sensitive count in diagnostics; a library/abstract callee, a callee whose returns hide inside a switch/loop, or a target beyond the budget stays unresolved.
 - **Reassigned locals** are tracked by a flow-sensitive reaching-definitions pass over straight-line + `if`/`else` code (finding F1); a variable written inside a loop, `try`, or nested switch still falls back to an unresolved edge.
 - **Mutation / GoF State** transitions (field write or `setState` call) are recovered (finding F2), but only as a fallback and only once the hierarchy is classified as an FSM — a pure-mutation hierarchy currently needs the `@Fsm` marker, since detecting the GoF family structurally (without false-positiving on mutable-field sum types) is future work.
-- **Event labels & alphabet Σ.** The alphabet is enumerated exactly and completely from a sealed/enum event parameter — the same closed-world trick used for states (finding F4) — and a `switch (event)` labels each edge with its matched event. Still open: attributing events carried by `instanceof`/ternary guards (as in `examples/door`, whose Σ is recovered but whose edges stay guard-labelled) and mutation-style (GoF) event labelling.
+- **Event labels & alphabet Σ.** The alphabet is enumerated exactly and completely from a sealed/enum event parameter — the same closed-world trick used for states (finding F4) — and a `switch (event)` labels each edge with its matched event. An event test in an `if`, a ternary or an `instanceof`-chain link labels its edge too, and over a closed Σ the branch taken when the test fails is one edge per remaining input (finding F38: `examples/door` reports `Closed --Lock--> Locked`, `Closed --Push--> Open`, `Closed --Unlock--> Open`); over an open event type the negated test stays a guard. Still open: mutation-style (GoF) event labelling.
 - **Initial-state detection** is heuristic (field initializer, else the unique source-only state) and is flagged when it fails.
 
 ## Project layout

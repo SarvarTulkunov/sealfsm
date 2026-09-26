@@ -65,7 +65,16 @@ module declares, not just the ones that look like machines):
 - `codingPattern`: the pattern the transitions are written in (the vocabulary
   is below), whether or not SealFSM supports it;
 - for an FSM: `directBranches`, `enumChildStates`, `atomicStates`, and every
-  actual `transition` (from, to, optionally the event), each with its evidence.
+  actual `transition` (`from`, `event`, `to`), each with its evidence. The
+  `event` field is **required**: a string names the input that selects the
+  transition; `null` states that the transition is genuinely eventless (no input
+  selects it, e.g. a handler that takes only the state it leaves, or an arm
+  taken whatever the input is and that never tests it, which is labelled once
+  with `null` rather than once per event). A branch reached because an event test
+  FAILED is not eventless: it is one transition per remaining input (see
+  *Transition identity*). A missing
+  `event` field is a validation error, never read as eventless. See
+  *Transition identity* below for how events are spelled and matched.
 
 `UNCERTAIN` is for hierarchies a careful reader cannot decide. It is reported as
 its own row and excluded from precision and recall. It is not a way to avoid
@@ -90,6 +99,8 @@ and the move is reported.
 java -jar target/sealfsm.jar --src <root> [--src ...] [--classpath ...] --json --out evaluation/outcomes/<id>
 python scripts/evaluation/score.py evaluation/corpus/*.json            # all entries
 python scripts/evaluation/score.py evaluation/corpus/<id>.json --json  # one entry, machine-readable
+python scripts/evaluation/score.py evaluation/corpus/*.json --match state-pairs  # secondary metric only
+python -m unittest discover -s scripts/evaluation -p "test_*.py"        # the scorer's own tests
 ```
 
 The scorer reads each manifest, its labels, and the tool's
@@ -105,10 +116,67 @@ The scorer reads each manifest, its labels, and the tool's
 | **coverage** | TP / labelled FSMs: the share of real machines the tool reports as machines. This is overall detection recall |
 | **classification precision** | TP / (TP + FP) |
 | **state accuracy** | per TP: exact match of direct branches, exact match of atomic states, and their Jaccard indices |
-| **transition precision** | resolved edges that are labelled transitions / resolved edges, over TP machines |
-| **transition recall (conditional)** | labelled transitions matched by a resolved edge / labelled transitions of TP machines |
-| **transition recall (overall)** | the same numerator / labelled transitions of **all** labelled FSMs. A transition of a machine the tool skipped, or written in an unsupported style, counts as missed |
+| **transition precision** | distinct resolved transitions that are labelled transitions / distinct resolved transitions, over TP machines |
+| **transition recall (conditional)** | distinct labelled transitions matched by a resolved transition / distinct labelled transitions of TP machines |
+| **transition recall (overall)** | the same numerator / distinct labelled transitions of **all** labelled FSMs. A transition of a machine the tool skipped, or written in an unsupported style, counts as missed |
+| **missed / extra** | per FSM: the labelled transitions no resolved edge matched, and the resolved transitions no label matched |
 | **unresolved** | unresolved edges on TP machines, with how many have a known source state |
+
+#### Transition identity
+
+A transition is the triple **(source state, event, target state)**. The same
+identity is used for the labels, for the tool's resolved edges, and for every
+transition figure above (precision, both recalls, missed, extra).
+
+- `Idle --start--> Active` and `Idle --resume--> Active` are **two** transitions.
+  Finding one of them scores 1/2.
+- A labelled event matches an extracted event only by **exact string equality**
+  (after spelling nested types with `.` instead of `$`). Label events the way
+  SealFSM spells them: the simple name of an event type tested by a type
+  pattern or `instanceof` (`SegmentArrival`); an enum constant by its name
+  (`SEND_HEADERS`); an enum constant carried by a sealed event member as
+  `Member.CONSTANT` (`UserCall.CLOSE`, `Send.HEADERS`); a method name where the
+  hierarchy's handlers are several differently named methods (`pay`, `ship`).
+- A `null` (eventless) transition matches only an eventless edge, and a named
+  one never matches an eventless edge. When the tool records an event test as a
+  **guard** rather than as the edge's event, that edge does not match a label
+  that names the event. This is intended: the event was not recovered.
+- **Negated event tests.** When the source tests the input and the event type is
+  closed (a sealed type or an enum), the branch taken when the test fails fires
+  on the remaining inputs, so it is labelled **once per remaining input**, never
+  as `!Lock` and never as one eventless transition. In `examples/door`,
+  `(event instanceof Lock) ? new Locked() : new Open()` in state `Closed`, with
+  `Event permits Push, Lock, Unlock`, is three transitions: `Closed --Lock-->
+  Locked`, `Closed --Push--> Open`, `Closed --Unlock--> Open`. The same holds for
+  the `default` arm of a switch over the event and for code after an
+  `if (test) return ...;`. SealFSM reports them this way (F38). Label `null` only
+  when the source never tests the input on that path (an arm taken whatever the
+  input is). When the event type is **open** (a plain interface, `Object`,
+  `int`), "every input except `Lock`" is not a finite set: the tool keeps such an
+  edge eventless with the negated test as its guard, and a label naming concrete
+  inputs there will not match it.
+- Every count is over the **set** of distinct triples, per machine. A triple
+  labelled twice, or extracted twice (for example under two different guards),
+  counts once. The denominator of both recalls is the number of distinct
+  labelled triples, never the raw number of label entries; the per-hierarchy
+  row keeps the raw count as `truth_label_entries`. A labelled FSM the tool did
+  not report as a machine still contributes its distinct triples to the overall
+  denominator (with its state names qualified against its own labelled states).
+- **Guards are not part of this metric.** Neither the labels nor the scorer
+  compare guards; two edges that differ only in their guard are one triple, and
+  a guard the tool gets wrong is not penalised. Guard accuracy would need its
+  own labelled field and its own tested comparison, which the scorer does not
+  implement.
+- Unresolved edges, and edges from or to a pseudo-state (`<initial>`,
+  `<unknown>`, `<entry>`), are never matched; they are counted under
+  **unresolved**.
+
+A secondary, explicitly weaker metric, `--match state-pairs`, uses the pair
+(source, target) on both sides instead, ignoring events. Its numerators and
+denominators are all over distinct pairs. It answers "was the state graph
+recovered?", not "was the transition relation recovered?", and it must be
+labelled as such wherever it is reported. `--with-events` is still accepted
+and is the same as the default.
 
 Conditional accuracy (states, transitions over TP machines) is **never** reported
 as overall recall. Both are always reported side by side.

@@ -5,6 +5,9 @@
 # the outcomes; it is not evidence of accuracy (evaluation/PROTOCOL.md, Decision 3).
 #
 #   mvn package -DskipTests && bash scripts/evaluation/selftest/run.sh
+#
+# The metric itself is pinned by in-memory unit tests, independent of the tool:
+#   python -m unittest discover -s scripts/evaluation -p "test_*.py"
 set -eu
 cd "$(dirname "$0")/../../.."
 for fixture in converters typedhandler; do

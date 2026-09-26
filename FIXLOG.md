@@ -1978,3 +1978,80 @@ example, a nested sealed branch (`Mode`/`On`), an open branch with a subclass
 **Corpus.** DOT byte-identical. SCXML changed only in the header comment of the
 six machines with grouping nodes (`valueforms.Signal`, `namecollision.Link`, and
 the four `enumbodies` machines). Summary tables changed format everywhere.
+
+## F38 — a negated event test over a closed Σ is one transition per remaining input
+
+**Defect.** `examples/door` writes `case Closed c -> (event instanceof Lock) ?
+new Locked() : new Open()` with `Event permits Push, Lock, Unlock`. The tool
+published `Closed --[event instanceof Lock]--> Locked` and `Closed --[!(event
+instanceof Lock)]--> Open`: both edges eventless, the input kept as guard text.
+The evaluation's transition identity is `(source, event, target)` (Decision 3),
+so a labeller writes `Closed --Lock--> Locked`, `Closed --Push--> Open` and
+`Closed --Unlock--> Open`, and none of the three matched. The event test had
+been split into a label only on the carrier walk and on chain links, and nowhere
+was the NEGATED side ever expanded: the else-branch of an event test, the code
+after `if (event == X) return ...;`, and the `default` arm of a switch over the
+event all stayed eventless (`otherwise`), although over a closed Σ each fires on
+a finite, compiler-checked set of inputs.
+
+**Rule.** One routine, asked wherever a condition branches: `eventTest` reads a
+condition as `(taken, residual)` over Σ — pure tests (`instanceof`, `==`, `!=`,
+`!`, `&&`, `||`) as set operations, a conjunction with a data condition as the
+event part plus the data part as guard text — and `thenPaths`/`elsePaths` turn
+it into one `(event, guard)` path per input. The else-branch is every input the
+test did not take, unconditionally, plus every input it took under
+`!residual`. A `default` arm is Σ minus the inputs unguarded arms claim, each
+remaining input under the negated guards of the guarded arms naming it
+(`defaultArmPaths`). An input already fixed on the path is evaluated, not
+re-tested. Never a `!Lock` label: a label is a Σ symbol.
+
+**Not expanded, deliberately**, each keeping the pre-F38 reading: an OPEN event
+type (no Σ); two or more closed event parameters (`eventSigma` is empty — "not
+TURN" says nothing about the other input); a test in a shape not decided
+exactly; an arm that never tests the input (eventless = whatever the input). A
+fall-through after an event-testing `if` whose body does not always leave is
+reached by every input and stays an eventless `otherwise` edge.
+
+**Soundness detail found while measuring.** Paths are walked one input at a
+time, so a branch dead under one input (`if (cmd instanceof Reset)` walked for
+`Arm`) is live under another. The first version marked it unreachable per path,
+which (a) reported it in the new dead-branch diagnostic on tcp, Capstan,
+valueforms and Latch where no branch is dead, and (b) counted its returns as
+accounted for F18 while another path still needed them — a way to hide a real
+unread return. Deadness is now decided when a SCOPE closes (`SigmaScope`, per
+site and per fold, exactly like F18's accounting): candidates minus every node
+any path walked. After that, the only dead branch in the corpus is the fixture's.
+
+**Fixtures.** `examples/eventsplit` (`Latch`, `Valve`, controls `Pump` open Σ and
+`Gate` two inputs, `Bell` dead branch). `examples/factory` gained `Kick`: with
+`Event permits Turn` the delegate `event instanceof Turn ? new Shut() : current`
+took its `: current` branch only on a null event, so the self-loop the fixture
+documents had no input. Test `EventPartitionTest`; 18 existing assertions were
+re-baselined one by one to the fact they now state (e.g. throwguards'
+"negated rejection guard" is now "the producer fires on exactly the inputs the
+rejection did not take").
+
+**Corpus** (transitions, resolved), machines whose code tests its input:
+
+| machine | before | after |
+|---|---|---|
+| door.Door | 5, 5/5 | 7, 7/7 |
+| tcp.TcpState | 44, 44/44 | 90, 90/90 |
+| guardforms.Signal | 22, 22/22 | 41, 41/41 |
+| plumbing.Conveyor | 6, 6/6 | 12, 12/12 |
+| throwguards.Valve | 6, 6/6 | 10, 10/10 |
+| hiddenreturns.Pump | 9, 8/9 | 14, 13/14 |
+| valueforms.Signal | 10, 9/10 | 16, 13/16 |
+| eventalphabet.Player | 9, 9/9 | 12, 12/12 |
+| chaindispatch.Shutter | 5, 5/5 | 7, 7/7 |
+| statefuldriver.Sash / Hatch | 6, 6/6 each | 9, 9/9 each |
+| retrystate.Poll | 7, 7/7 | 9, 9/9 |
+| throwcarrier.Capstan / Hoist | 5, 5/5 each | 6, 6/6 / 7, 7/7 |
+
+Labels-only changes (same count): `chaindispatch.Relay`, `staticfactory.Gauge`,
+`turnstile.Turnstile`, `factory.Bolt`. Every added edge splits an edge that
+existed; no resolved edge became unresolved; valueforms' extra unresolved edges
+are its one unresolved fall-through split per input. Byte-identical:
+`lcp_automation` (113/113), `lcp_automation_chatgpt` (111/111), both http2
+machines, and every nondeterminism and exhaustiveness warning. The F9 diagnostic
+text now says "(arm, input) cell(s)", which is what it counted.

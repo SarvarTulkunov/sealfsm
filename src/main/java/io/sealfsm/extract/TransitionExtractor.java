@@ -26,6 +26,8 @@ import io.sealfsm.model.StateNaming;
 import io.sealfsm.model.Transition;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.BinaryOperatorKind;
+import spoon.reflect.code.CtUnaryOperator;
+import spoon.reflect.code.UnaryOperatorKind;
 import spoon.reflect.code.CtAbstractSwitch;
 import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtBinaryOperator;
@@ -82,6 +84,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -349,6 +352,27 @@ public final class TransitionExtractor {
     // reported as a diagnostic rather than letting them vanish unremarked.
     private int nonReturningCalls = 0;
 
+    // F38: branches no input of a closed Σ reaches — the event test above them
+    // already takes every input (`e instanceof Turn ? ... : current` when Σ is
+    // {Turn}; only a null event, which is not an input, reaches the else). They
+    // contribute no edge, and are counted so that they do not vanish unremarked.
+    // Identity-keyed: one branch walked once per path is still one branch.
+    private final Set<CtElement> sigmaDeadBranches =
+            Collections.newSetFromMap(new IdentityHashMap<>());
+    // A branch is dead only if NO path reaches it. Paths are walked one input at a
+    // time, and a branch dead under one input (`if (cmd instanceof Reset)` walked
+    // for Arm) is live under another, so deadness is decided when the scope closes:
+    // the candidates minus every node any path walked. Scoped like F18's return
+    // accounting (per fold, per site), because marking a branch unreachable while
+    // another path still reaches it would count its returns as accounted and hide
+    // a real unread one — the silent drop F18 exists to prevent.
+    private SigmaScope sigmaScope = new SigmaScope();
+
+    private static final class SigmaScope {
+        final Map<CtElement, List<? extends CtElement>> dead = new IdentityHashMap<>();
+        final Set<CtElement> live = Collections.newSetFromMap(new IdentityHashMap<>());
+    }
+
     // F20: produced values that nest a hierarchy value inside another one. The
     // hierarchy survived the (now bounded) compositional veto, so this expression
     // is a local observation, not a verdict about the type — and a composed node
@@ -387,6 +411,14 @@ public final class TransitionExtractor {
     // so `event == UserCall.CLOSE` / `event instanceof SegmentArrival` in a guard
     // can be attributed to the event that triggers the edge (F8).
     private Set<String> eventParamNames = new LinkedHashSet<>();
+    // F38: Σ of the method currently being walked, when it has exactly ONE closed
+    // event parameter — the set a negated event test is the complement within.
+    // Empty otherwise (no event parameter, an open one, or several), and then no
+    // test is ever expanded: with two event parameters "not Lock" says nothing
+    // about the other one, so a label naming one input would claim too much.
+    // Scoped to its method's walk and cleared after it, so the expansion can never
+    // reach a body whose parameter merely shares the name.
+    private List<String> eventSigma = List.of();
     // "<ownerQualifiedName>#<CONSTANT>" -> the Σ symbol that constant contributes,
     // recorded while Σ is enumerated so edge labels and Σ cannot drift apart.
     private final Map<String, String> eventSymbolByConstant = new LinkedHashMap<>();
@@ -969,10 +1001,16 @@ public final class TransitionExtractor {
                     + "They contributed no transition. They are undefined inputs, not unresolved "
                     + "targets (F33)");
         }
+        if (!sigmaDeadBranches.isEmpty()) {
+            diagnostics.add(sigmaDeadBranches.size() + " branch(es) are reached by no input of the "
+                    + "closed event alphabet (the event test before them already takes every input; "
+                    + "only a null event, which is not an input, could reach them) and contributed "
+                    + "no transition (F38)");
+        }
         if (nonReturningCalls > 0) {
-            diagnostics.add(nonReturningCalls + " call(s) to a helper that cannot return normally "
-                    + "(always throws or diverges) contributed no transition — the arms holding "
-                    + "them are undefined inputs, not unresolved targets");
+            diagnostics.add(nonReturningCalls + " (arm, input) cell(s) end in a call to a helper that "
+                    + "cannot return normally (always throws or diverges) and contributed no transition "
+                    + "— they are undefined inputs, not unresolved targets");
         }
         if (!unclaimedSites.isEmpty()) {
             diagnostics.add(unclaimedSites.size() + " value-returning site(s) were NOT walked, because "
@@ -1056,10 +1094,15 @@ public final class TransitionExtractor {
         WalkSite saved = this.walkSite;
         this.walkSite = new WalkSite(route, site == null ? null : site.locus(), commit, evidence);
         this.commitEvidence.add(evidence);
+        SigmaScope savedSigma = this.sigmaScope;
+        this.sigmaScope = new SigmaScope();
         try {
             walk.run();
         } finally {
+            closeSigmaScope(this.sigmaScope);
+            this.sigmaScope = savedSigma;
             this.walkSite = saved;
+            this.eventSigma = List.of(); // F38: Σ belongs to one site's walk
         }
     }
 
@@ -1331,6 +1374,8 @@ public final class TransitionExtractor {
      */
     private void enumerateEventAlphabet(CtMethod<?> method) {
         eventParamNames = new LinkedHashSet<>();
+        eventSigma = List.of();
+        List<List<String>> sigmas = new ArrayList<>();
         for (CtParameter<?> p : method.getParameters()) {
             CtTypeReference<?> pt = p.getType();
             if (pt == null || hierarchyQualifiedNames.contains(pt.getQualifiedName())) {
@@ -1363,7 +1408,9 @@ public final class TransitionExtractor {
                 eventQualifiedNames.add(ref.getQualifiedName());
             }
             alphabet.addAll(symbols);
+            sigmas.add(symbols);
         }
+        if (sigmas.size() == 1) eventSigma = List.copyOf(new LinkedHashSet<>(sigmas.get(0)));
     }
 
     /**
@@ -1761,63 +1808,124 @@ public final class TransitionExtractor {
      */
     private void walkCarrier(CtElement node, String from, String event, String guard, Set<Transition> out) {
         if (node == null) return;
+        sigmaScope.live.add(node);
 
         if (node instanceof CtBlock<?> block) {
-            String acc = guard;
-            boolean enteredOtherwise = otherwisePath;
-            try {
-                for (CtStatement st : block.getStatements()) {
-                    walkCarrier(st, from, event, acc, out);
-                    if (st instanceof CtIf ctIf
-                            && ctIf.getElseStatement() == null
-                            && alwaysTerminates(ctIf.getThenStatement())) {
-                        // `if (c) return ...;` — every later sibling is reached only
-                        // when c is false, so the guards stay mutually exclusive.
-                        acc = merge(acc, negate(safeText(ctIf.getCondition())));
-                    } else if (alwaysTerminates(st)) {
-                        break; // remaining statements are unreachable
-                    }
-                    if (st instanceof CtIf || st instanceof CtSwitch<?>) {
-                        // Anything after a conditional is on its fall-through path:
-                        // it runs precisely when none of the branches above took.
-                        // That is the definition of the default edge, and it holds
-                        // whether or not the branch above could be negated into a
-                        // guard — `if (e instanceof Seg) { ... }` followed by
-                        // `return ignore(this);` is the common shape where it
-                        // cannot, yet the trailing return is still the default.
-                        otherwisePath = true;
-                    }
-                }
-            } finally {
-                otherwisePath = enteredOtherwise;
-            }
+            walkCarrierStatements(block.getStatements(), from, event, guard, out);
         } else if (node instanceof CtIf ctIf) {
-            EventCond ec = splitEventCondition(ctIf.getCondition());
-            String thenGuard = merge(guard, ec.residual());
-            if (ec.symbols().isEmpty()) {
-                walkCarrier(ctIf.getThenStatement(), from, event, thenGuard, out);
-            } else {
-                // A disjunction of event tests (`e == CLOSE || e == USER`) triggers
-                // one edge per symbol: they are distinct inputs of Σ, not one edge
-                // with a compound label.
-                for (String sym : ec.symbols()) {
-                    walkCarrier(ctIf.getThenStatement(), from, sym, thenGuard, out);
+            EventTest test = eventTest(ctIf.getCondition());
+            List<EventPath> thens = thenPaths(test, event);
+            if (thens != null) {
+                // F38: the condition partitions Σ, so both branches are labelled.
+                walkCarrierPaths(ctIf.getThenStatement(), thens, from, guard, out);
+                if (ctIf.getElseStatement() != null) {
+                    boolean prev = otherwisePath;
+                    otherwisePath = true;
+                    try {
+                        walkCarrierPaths(ctIf.getElseStatement(), elsePaths(test, event), from, guard, out);
+                    } finally {
+                        otherwisePath = prev;
+                    }
+                }
+                return;
+            }
+            walkCarrierIf(ctIf, from, event, guard, out);
+        } else {
+            walkCarrierOther(node, from, event, guard, out);
+        }
+    }
+
+    /** {@link #walkCarrier} over a statement list: the fall-through rules of {@link #walkStatements}. */
+    private void walkCarrierStatements(List<CtStatement> stmts, String from, String event,
+                                       String guard, Set<Transition> out) {
+        String acc = guard;
+        boolean enteredOtherwise = otherwisePath;
+        try {
+            for (int i = 0; i < stmts.size(); i++) {
+                CtStatement st = stmts.get(i);
+                walkCarrier(st, from, event, acc, out);
+                if (st instanceof CtIf || st instanceof CtSwitch<?>) {
+                    // Anything after a conditional is on its fall-through path:
+                    // it runs precisely when none of the branches above took.
+                    // That is the definition of the default edge, and it holds
+                    // whether or not the branch above could be negated into a
+                    // guard — `if (e instanceof Seg) { ... }` followed by
+                    // `return ignore(this);` is the common shape where it
+                    // cannot, yet the trailing return is still the default.
+                    otherwisePath = true;
+                }
+                if (st instanceof CtIf ctIf
+                        && ctIf.getElseStatement() == null
+                        && alwaysTerminates(ctIf.getThenStatement())) {
+                    // `if (c) return ...;` — every later sibling is reached only
+                    // when c is false, so the guards stay mutually exclusive.
+                    List<EventPath> rest = elsePaths(eventTest(ctIf.getCondition()), event);
+                    if (rest == null) {
+                        acc = merge(acc, negate(safeText(ctIf.getCondition())));
+                    } else if (rest.size() == 1 && Objects.equals(rest.get(0).event(), event)) {
+                        acc = merge(acc, rest.get(0).guard());
+                    } else {
+                        // F38: the rest runs on the inputs the test did not take.
+                        List<CtStatement> tail = stmts.subList(i + 1, stmts.size());
+                        if (rest.isEmpty()) sigmaDeadTail(tail);
+                        for (EventPath p : rest) {
+                            walkCarrierStatements(tail, from, p.event(), merge(acc, p.guard()), out);
+                        }
+                        return;
+                    }
+                } else if (alwaysTerminates(st)) {
+                    break; // remaining statements are unreachable
                 }
             }
-            // The else branch keeps the inherited event and carries the negation of
-            // the *whole* condition — negating only the residual would be wrong
-            // once part of the condition was consumed as an event.
-            if (ctIf.getElseStatement() != null) {
-                boolean prev = otherwisePath;
-                otherwisePath = true;
-                try {
-                    walkCarrier(ctIf.getElseStatement(), from, event,
-                            merge(guard, negate(safeText(ctIf.getCondition()))), out);
-                } finally {
-                    otherwisePath = prev;
-                }
+        } finally {
+            otherwisePath = enteredOtherwise;
+        }
+    }
+
+    /** Walk a carrier branch once per path; a branch no path reaches is proven dead. */
+    private void walkCarrierPaths(CtElement node, List<EventPath> paths, String from, String guard,
+                                  Set<Transition> out) {
+        if (node == null) return;
+        if (paths.isEmpty()) {
+            sigmaDead(node);
+            return;
+        }
+        for (EventPath p : paths) walkCarrier(node, from, p.event(), merge(guard, p.guard()), out);
+    }
+
+    /** The carrier walk's reading of an {@code if} whose condition is not an exact Σ partition. */
+    private void walkCarrierIf(CtIf ctIf, String from, String event, String guard, Set<Transition> out) {
+        EventCond ec = splitEventCondition(ctIf.getCondition());
+        String thenGuard = merge(guard, ec.residual());
+        if (ec.symbols().isEmpty()) {
+            walkCarrier(ctIf.getThenStatement(), from, event, thenGuard, out);
+        } else {
+            // A disjunction of event tests (`e == CLOSE || e == USER`) triggers
+            // one edge per symbol: they are distinct inputs of Σ, not one edge
+            // with a compound label.
+            for (String sym : ec.symbols()) {
+                walkCarrier(ctIf.getThenStatement(), from, sym, thenGuard, out);
             }
-        } else if (node instanceof CtSwitch<?> sw) {
+        }
+        // The else branch keeps the inherited event and carries the negation of
+        // the *whole* condition — negating only the residual would be wrong
+        // once part of the condition was consumed as an event.
+        if (ctIf.getElseStatement() != null) {
+            boolean prev = otherwisePath;
+            otherwisePath = true;
+            try {
+                walkCarrier(ctIf.getElseStatement(), from, event,
+                        merge(guard, negate(safeText(ctIf.getCondition()))), out);
+            } finally {
+                otherwisePath = prev;
+            }
+        }
+    }
+
+    /** The carrier walk's remaining statement kinds. */
+    private void walkCarrierOther(CtElement node, String from, String event, String guard,
+                                  Set<Transition> out) {
+        if (node instanceof CtSwitch<?> sw) {
             walkCarrierSwitch(sw, from, event, guard, out);
         } else if (node instanceof CtReturn<?> ret) {
             handleCarrierValue(ret.getReturnedExpression(), from, event, guard, out);
@@ -1841,6 +1949,24 @@ public final class TransitionExtractor {
         Map<String, List<String>> guardsByLabel = new LinkedHashMap<>();
         for (CtCase<?> c : sw.getCases()) {
             List<String> caseEvents = overEvent ? caseEventNames(c) : List.of();
+            if (caseEvents.isEmpty() && overEvent && c.getCaseExpressions().isEmpty()) {
+                List<EventPath> rest = defaultArmPaths(sw, event, true, false, this::caseEventNames);
+                if (rest != null) { // F38, as in walkSwitch
+                    if (rest.isEmpty()) sigmaDead(c); else sigmaScope.live.add(c);
+                    boolean prev = otherwisePath;
+                    otherwisePath = true;
+                    try {
+                        for (EventPath p : rest) {
+                            for (CtStatement st : c.getStatements()) {
+                                walkCarrier(st, from, p.event(), merge(guard, p.guard()), out);
+                            }
+                        }
+                    } finally {
+                        otherwisePath = prev;
+                    }
+                    continue;
+                }
+            }
             if (caseEvents.isEmpty()) {
                 caseEvents = Collections.singletonList(event); // default arm inherits
             }
@@ -1890,6 +2016,7 @@ public final class TransitionExtractor {
     private void handleCarrierValue(CtExpression<?> value, String from, String event,
                                     String guard, Set<Transition> out) {
         if (value == null) return;
+        sigmaScope.live.add(value);
 
         // (0) F21: the call never returns, so it wraps nothing and yields nothing.
         // The arm is an undefined input, exactly as `throw illegal(...)` would be.
@@ -1913,6 +2040,11 @@ public final class TransitionExtractor {
         }
 
         // `cond ? Transition.to(new Listen()) : Transition.to(new Closed(), ...)`
+        if (value instanceof CtConditional<?> cond
+                && conditionalOnEvent(cond, event,
+                        (branch, p) -> handleCarrierValue(branch, from, p.event(), merge(guard, p.guard()), out))) {
+            return; // F38, as in handleValue
+        }
         if (value instanceof CtConditional<?> cond) {
             String c = safeText(cond.getCondition());
             handleCarrierValue(cond.getThenExpression(), from, event, merge(guard, c), out);
@@ -2041,10 +2173,14 @@ public final class TransitionExtractor {
             return t != null && eventQualifiedNames.contains(t.getQualifiedName())
                     ? t.getSimpleName() : null;
         }
-        if (kind == BinaryOperatorKind.EQ) {
-            if (isEventParamExpr(lhs)) return enumConstantSymbol(rhs);
-            if (isEventParamExpr(rhs)) return enumConstantSymbol(lhs);
-        }
+        if (kind == BinaryOperatorKind.EQ) return equalitySymbol(lhs, rhs);
+        return null;
+    }
+
+    /** The Σ constant one side of {@code event == C} (or {@code !=}) names, or {@code null}. */
+    private String equalitySymbol(CtExpression<?> lhs, CtExpression<?> rhs) {
+        if (isEventParamExpr(lhs)) return enumConstantSymbol(rhs);
+        if (isEventParamExpr(rhs)) return enumConstantSymbol(lhs);
         return null;
     }
 
@@ -2063,6 +2199,256 @@ public final class TransitionExtractor {
         if (owner == null) owner = fref.getType(); // noClasspath fallback: the constant's own type
         if (owner == null) return null;
         return eventSymbolByConstant.get(constantKey(owner.getQualifiedName(), fref.getSimpleName()));
+    }
+
+    // ---- F38: an event test partitions a CLOSED Σ ----------------------------
+    //
+    // `event instanceof Lock ? new Locked() : new Open()` names an input on BOTH
+    // branches. The then-branch fires on Lock; the else-branch fires on every
+    // other input, and when Σ is closed (a sealed or enum event parameter, F4)
+    // "every other input" is a finite, compiler-checked set — exact in the same
+    // way the permits clause is. So the else-branch is one edge per remaining
+    // symbol (Closed --Push--> Open, Closed --Unlock--> Open), never an eventless
+    // edge guarded by `!(event instanceof Lock)`, and never a `!Lock` label: a
+    // label is a Σ symbol, and a negation is not one.
+    //
+    // One rule, asked everywhere a condition branches — an `if`, a fall-through
+    // after an `if` that leaves, a ternary, an instanceof-chain link and its
+    // residual, the carrier walk, and the `default` arm of a switch over the
+    // event. What stays as it was, deliberately:
+    //   - an OPEN event type, or several event parameters: no Σ to take the
+    //     complement in (eventSigma is empty), so the negated guard is kept;
+    //   - a condition that tests the event in a shape not decided here (e.g.
+    //     `e instanceof Lock || retries > 3`): kept whole as a guard;
+    //   - an arm that never tests the event: eventless, i.e. "whatever the input",
+    //     because the source never partitioned Σ there.
+
+    /**
+     * A condition read as a partition of Σ: {@code taken} is the set of inputs on
+     * which it can hold, {@code residual} what it additionally requires of them
+     * (a data guard, or {@code null}).
+     */
+    private record EventTest(Set<String> taken, String residual) {
+    }
+
+    /** One way control reaches a branch: under this input, with this extra guard. */
+    private record EventPath(String event, String guard) {
+    }
+
+    /**
+     * The exact partition of Σ a condition makes, or {@code null} when it does not
+     * test the event or tests it in a shape this does not decide. A conjunction
+     * of an event test and a data condition splits into both; the data half is
+     * kept as source text, which is exact however it is written.
+     */
+    private EventTest eventTest(CtExpression<?> cond) {
+        if (eventSigma.isEmpty() || cond == null) return null;
+        Set<String> pure = sigmaSet(cond);
+        if (pure != null) return new EventTest(pure, null);
+        if (cond instanceof CtBinaryOperator<?> bin && bin.getKind() == BinaryOperatorKind.AND) {
+            return conjoin(List.of(bin.getLeftHandOperand(), bin.getRightHandOperand()));
+        }
+        return null;
+    }
+
+    /** {@link #eventTest} of a conjunction given as its conjuncts (a chain link's extras). */
+    private EventTest conjoin(List<? extends CtExpression<?>> conjuncts) {
+        if (eventSigma.isEmpty()) return null;
+        Set<String> taken = new LinkedHashSet<>(eventSigma);
+        String residual = null;
+        boolean tested = false;
+        for (CtExpression<?> c : conjuncts) {
+            EventTest t = eventTest(c);
+            if (t != null) {
+                tested = true;
+                taken.retainAll(t.taken());
+                residual = merge(residual, t.residual());
+            } else {
+                residual = merge(residual, safeText(c));
+            }
+        }
+        return tested ? new EventTest(taken, residual) : null;
+    }
+
+    /**
+     * The inputs on which a PURE event test holds, or {@code null} when the
+     * condition is not one. Leaves are {@link #eventSymbolOf}'s ({@code instanceof}
+     * and {@code ==}); {@code !=}, {@code !}, {@code &&} and {@code ||} compose
+     * them as set operations over Σ, which is exact because Σ is closed.
+     */
+    private Set<String> sigmaSet(CtExpression<?> cond) {
+        if (cond instanceof CtUnaryOperator<?> un && un.getKind() == UnaryOperatorKind.NOT) {
+            Set<String> inner = sigmaSet(un.getOperand());
+            return inner == null ? null : complement(inner);
+        }
+        if (cond instanceof CtBinaryOperator<?> bin) {
+            BinaryOperatorKind kind = bin.getKind();
+            if (kind == BinaryOperatorKind.OR || kind == BinaryOperatorKind.AND) {
+                Set<String> l = sigmaSet(bin.getLeftHandOperand());
+                Set<String> r = sigmaSet(bin.getRightHandOperand());
+                if (l == null || r == null) return null;
+                Set<String> s = new LinkedHashSet<>(l);
+                if (kind == BinaryOperatorKind.OR) s.addAll(r); else s.retainAll(r);
+                return s;
+            }
+            if (kind == BinaryOperatorKind.NE) {
+                String sym = equalitySymbol(bin.getLeftHandOperand(), bin.getRightHandOperand());
+                Set<String> eq = sym == null ? null : covered(sym);
+                return eq == null ? null : complement(eq);
+            }
+        }
+        String sym = eventSymbolOf(cond);
+        return sym == null ? null : covered(sym);
+    }
+
+    /**
+     * The Σ symbols a label covers: itself, or — for a family such as an enum
+     * member {@code UserCall} or a record carrying an enum {@code Send} — every
+     * symbol it prefixes. {@code null} when it covers none (the event ROOT type,
+     * say, which is no partition at all).
+     */
+    private Set<String> covered(String label) {
+        if (label == null) return null;
+        Set<String> out = new LinkedHashSet<>();
+        for (String s : eventSigma) {
+            if (s.equals(label) || s.startsWith(label + ".")) out.add(s);
+        }
+        return out.isEmpty() ? null : out;
+    }
+
+    private Set<String> complement(Set<String> symbols) {
+        Set<String> rest = new LinkedHashSet<>(eventSigma);
+        rest.removeAll(symbols);
+        return rest;
+    }
+
+    /**
+     * The paths on which a branch taken when {@code t} holds is reached, entering
+     * under {@code event}; {@code null} when {@code t} does not decide it (the
+     * caller keeps its guard-based reading). An empty list means the branch
+     * cannot run on any input here.
+     */
+    private List<EventPath> thenPaths(EventTest t, String event) {
+        if (t == null || (event != null && !eventSigma.contains(event))) return null;
+        List<EventPath> out = new ArrayList<>();
+        for (String s : event != null ? List.of(event) : eventSigma) {
+            if (t.taken().contains(s)) out.add(new EventPath(s, t.residual()));
+        }
+        return out;
+    }
+
+    /**
+     * The same for the branch taken when {@code t} does NOT hold: every input it
+     * does not take, unconditionally, and every input it takes, under the
+     * negation of what else it required.
+     */
+    private List<EventPath> elsePaths(EventTest t, String event) {
+        if (t == null || (event != null && !eventSigma.contains(event))) return null;
+        String negated = t.residual() == null ? null : negate(t.residual());
+        List<EventPath> out = new ArrayList<>();
+        for (String s : event != null ? List.of(event) : eventSigma) {
+            if (!t.taken().contains(s)) out.add(new EventPath(s, null));
+            else if (negated != null) out.add(new EventPath(s, negated));
+        }
+        return out;
+    }
+
+    /**
+     * Resolve both branches of a ternary whose condition partitions Σ, each once
+     * per path that reaches it. {@code false} when the condition does not, and the
+     * caller reads it as before (the whole condition as a guard).
+     */
+    private boolean conditionalOnEvent(CtConditional<?> cond, String event,
+                                       java.util.function.BiConsumer<CtExpression<?>, EventPath> resolve) {
+        EventTest test = eventTest(cond.getCondition());
+        List<EventPath> thens = thenPaths(test, event);
+        if (thens == null) return false;
+        List<EventPath> elses = elsePaths(test, event);
+        if (thens.isEmpty()) sigmaDead(cond.getThenExpression());
+        for (EventPath p : thens) resolve.accept(cond.getThenExpression(), p);
+        if (elses.isEmpty()) sigmaDead(cond.getElseExpression());
+        for (EventPath p : elses) resolve.accept(cond.getElseExpression(), p);
+        return true;
+    }
+
+    /**
+     * F38: the inputs on which a switch over the event reaches its {@code default}
+     * arm — Σ minus every input an unguarded labelled arm claims, each remaining
+     * input carrying the negated guards of the guarded arms that name it (JLS
+     * §14.11.1: {@code default} runs exactly when no label matches, wherever it
+     * is written). {@code null} when that is not decided exactly: no closed Σ, a
+     * selector that is not the event parameter, or a label covering no symbol.
+     * A component switch (F4, {@code case Send(Signal s) -> switch (s)}) takes its
+     * domain from the family its outer arm matched.
+     */
+    private List<EventPath> defaultArmPaths(CtAbstractSwitch<?> sw, String event, boolean overEvent,
+                                            boolean overComponent,
+                                            java.util.function.Function<CtCase<?>, List<String>> labelsOf) {
+        if (eventSigma.isEmpty()) return null;
+        Set<String> domain;
+        if (overEvent && event == null && isEventParamExpr(sw.getSelector())) {
+            domain = new LinkedHashSet<>(eventSigma);
+        } else if (overComponent && componentEvent != null
+                && Objects.equals(event, componentEvent.prefix())) {
+            domain = covered(event);
+        } else {
+            return null;
+        }
+        if (domain == null) return null;
+        Set<String> claimed = new LinkedHashSet<>();
+        Map<String, List<String>> guardsBySymbol = new LinkedHashMap<>();
+        for (CtCase<?> c : sw.getCases()) {
+            if (c.getCaseExpressions().isEmpty()) continue; // the default itself
+            List<String> labels = labelsOf.apply(c);
+            if (labels.isEmpty()) return null; // a label this cannot read
+            String ownGuard = caseGuard(c);
+            for (String label : labels) {
+                Set<String> cov = covered(label);
+                if (cov == null) return null;
+                if (ownGuard == null) claimed.addAll(cov);
+                else for (String sym : cov) guardsBySymbol.computeIfAbsent(sym, k -> new ArrayList<>()).add(ownGuard);
+            }
+        }
+        List<EventPath> out = new ArrayList<>();
+        for (String sym : domain) {
+            if (claimed.contains(sym)) continue;
+            String g = null;
+            for (String prior : guardsBySymbol.getOrDefault(sym, List.of())) g = merge(g, negate(prior));
+            out.add(new EventPath(sym, g));
+        }
+        return out;
+    }
+
+    /** A branch this path's input does not reach: a dead CANDIDATE (see {@link #sigmaScope}). */
+    private void sigmaDead(CtElement node) {
+        if (node == null) return;
+        sigmaScope.dead.putIfAbsent(node, List.of(node));
+    }
+
+    /** Close a scope: what no path reached is proven dead (F18) and counted (F38). */
+    private void closeSigmaScope(SigmaScope scope) {
+        for (Map.Entry<CtElement, List<? extends CtElement>> e : scope.dead.entrySet()) {
+            if (scope.live.contains(e.getKey())) continue;
+            e.getValue().forEach(this::markUnreachable);
+            sigmaDeadBranches.add(e.getKey());
+        }
+    }
+
+    /** The statements after an {@code if} that took every input: one dead branch. */
+    private void sigmaDeadTail(List<CtStatement> tail) {
+        if (tail.isEmpty()) return;
+        sigmaScope.dead.putIfAbsent(tail.get(0), List.copyOf(tail));
+    }
+
+    /** Walk {@code node} once per path; a branch no path reaches is proven dead (F18). */
+    private void walkPaths(CtElement node, List<EventPath> paths, String from, String guard,
+                           Set<Transition> out) {
+        if (node == null) return;
+        if (paths.isEmpty()) {
+            sigmaDead(node);
+            return;
+        }
+        for (EventPath p : paths) walk(node, from, p.event(), merge(guard, p.guard()), out);
     }
 
     /** True when {@code e} reads one of the current method's event parameters. */
@@ -2491,6 +2877,8 @@ public final class TransitionExtractor {
         Set<CtReturn<?>> enclosing = accountedReturns;
         Set<CtReturn<?>> accounted = Collections.newSetFromMap(new IdentityHashMap<>());
         accountedReturns = accounted;
+        SigmaScope enclosingSigma = sigmaScope;
+        sigmaScope = new SigmaScope();
         boolean top = foldActivations == 0;
         int resolvedBefore = top ? countResolved(out) : 0;
         // F25/F29 — ONE frame: the callee, what its caller handed it, the receiver
@@ -2512,6 +2900,8 @@ public final class TransitionExtractor {
             // recurses under the depth budget.
             walk(callee.getBody(), from, event, guard, out);
         } finally {
+            closeSigmaScope(sigmaScope); // before the accounting below reads `accounted`
+            sigmaScope = enclosingSigma;
             foldActivations--;
             resolver.leave();
             voidFold = enclosingVoidFold;
@@ -2735,11 +3125,15 @@ public final class TransitionExtractor {
         Set<CtReturn<?>> enclosingReturns = accountedReturns;
         voidFold = fold;
         accountedReturns = null;
+        SigmaScope enclosingSigma = sigmaScope;
+        sigmaScope = new SigmaScope();
         resolver.enter(frame);
         foldActivations++;
         try {
             walk(callee.getBody(), from, event, guard, local);
         } finally {
+            closeSigmaScope(sigmaScope);
+            sigmaScope = enclosingSigma;
             foldActivations--;
             resolver.leave();
             voidFold = enclosingFold;
@@ -2991,6 +3385,7 @@ public final class TransitionExtractor {
      */
     private void walk(CtElement node, String from, String event, String guard, Set<Transition> out) {
         if (node == null) return;
+        sigmaScope.live.add(node);
 
         if (node instanceof CtBlock<?> block) {
             walkBlock(block, from, event, guard, out);
@@ -3002,8 +3397,14 @@ public final class TransitionExtractor {
             // with a predicate that is really the arm label. Handled as a unit so
             // the else branch knows which states are left.
             DispatchCommitDetector.TypeChain chain = typeChainAt(ctIf);
+            EventTest test = chain == null ? eventTest(ctIf.getCondition()) : null;
+            List<EventPath> thens = thenPaths(test, event);
             if (chain != null) {
                 walkTypeChain(ctIf, candidateStates(from), event, guard, out);
+            } else if (thens != null) {
+                // F38: the condition tests the input, so it labels both branches.
+                walkPaths(ctIf.getThenStatement(), thens, from, guard, out);
+                walkPaths(ctIf.getElseStatement(), elsePaths(test, event), from, guard, out);
             } else {
                 String cond = safeText(ctIf.getCondition());
                 walk(ctIf.getThenStatement(), from, event, merge(guard, cond), out);
@@ -3200,14 +3601,29 @@ public final class TransitionExtractor {
      * {@code if} without an {@code else} definitely terminates its then-branch,
      * the negated condition guards every subsequent sibling. This recovers the
      * precise, mutually-exclusive guards real code relies on.
+     *
+     * <p>F38: when that condition is an event test over a closed Σ, what reaches
+     * the siblings is not "the negated test" but the remaining inputs, so the rest
+     * of the block is walked once per remaining input, each under its own label.
      */
     private void walkBlock(CtBlock<?> block, String from, String event,
                            String guard, Set<Transition> out) {
+        walkStatements(block.getStatements(), from, event, guard, true, out);
+    }
+
+    /**
+     * {@link #walkBlock} over a statement list. {@code narrowChains} is the chain
+     * rule below; a residual tail ({@link #walkResidual}) is walked without it,
+     * as it always was.
+     */
+    private void walkStatements(List<CtStatement> stmts, String from, String event, String guard,
+                                boolean narrowChains, Set<Transition> out) {
         String acc = guard;
         String accFrom = from;
-        for (CtStatement st : block.getStatements()) {
+        for (int i = 0; i < stmts.size(); i++) {
+            CtStatement st = stmts.get(i);
             DispatchCommitDetector.TypeChain chain =
-                    st instanceof CtIf ctIf ? typeChainAt(ctIf) : null;
+                    narrowChains && st instanceof CtIf ctIf ? typeChainAt(ctIf) : null;
             if (chain != null && chain.otherwise() == null && chainLinksAllTerminate(chain)) {
                 // A closed type-test chain narrows what follows it. `if (s
                 // instanceof Shut) {...} else if (s instanceof Ajar) {...}` whose
@@ -3217,50 +3633,60 @@ public final class TransitionExtractor {
                 // The same closed-world reasoning as the permits clause: the
                 // selector is one of the permitted subtypes or none of them.
                 walk(st, accFrom, event, acc, out);
-                Map<String, String> residual = chainResidual(chain, candidateStates(accFrom));
+                Map<String, List<EventPath>> residual =
+                        chainResidual(chain, candidateStates(accFrom), event);
                 if (residual.isEmpty()) {
                     // Every state was tested and every branch left the method:
                     // nothing that follows is reachable in any state.
                     break;
                 }
-                if (residual.size() == 1 && residual.values().iterator().next() == null) {
-                    accFrom = residual.keySet().iterator().next();
-                    continue;
+                if (residual.size() == 1) {
+                    Map.Entry<String, List<EventPath>> only = residual.entrySet().iterator().next();
+                    List<EventPath> paths = only.getValue();
+                    if (paths.size() == 1 && paths.get(0).guard() == null
+                            && Objects.equals(paths.get(0).event(), event)) {
+                        accFrom = only.getKey();
+                        continue;
+                    }
                 }
                 // Several states can still reach the rest of the block. Walking it
                 // once per state emits the one edge each of them really has; a
                 // single merged walk would have to call the origin unknown.
-                walkResidual(block, block.getStatements().indexOf(st) + 1,
-                        residual, event, acc, out);
+                walkResidual(stmts.subList(i + 1, stmts.size()), residual, acc, out);
                 return;
             }
             walk(st, accFrom, event, acc, out);
             if (st instanceof CtIf ctIf
                     && ctIf.getElseStatement() == null
                     && alwaysTerminates(ctIf.getThenStatement())) {
-                acc = merge(acc, negate(safeText(ctIf.getCondition())));
+                List<EventPath> rest = elsePaths(eventTest(ctIf.getCondition()), event);
+                if (rest == null) {
+                    acc = merge(acc, negate(safeText(ctIf.getCondition())));
+                } else if (rest.size() == 1 && Objects.equals(rest.get(0).event(), event)) {
+                    acc = merge(acc, rest.get(0).guard());
+                } else {
+                    List<CtStatement> tail = stmts.subList(i + 1, stmts.size());
+                    if (rest.isEmpty()) {
+                        sigmaDeadTail(tail); // every input left above
+                    }
+                    for (EventPath p : rest) {
+                        walkStatements(tail, accFrom, p.event(), merge(acc, p.guard()),
+                                narrowChains, out);
+                    }
+                    return;
+                }
             } else if (alwaysTerminates(st)) {
                 break; // remaining statements are unreachable
             }
         }
     }
 
-    /** Walk a block's tail once per state the preceding chain left possible. */
-    private void walkResidual(CtBlock<?> block, int firstIndex, Map<String, String> residual,
-                              String event, String guard, Set<Transition> out) {
-        List<CtStatement> tail = block.getStatements().subList(firstIndex, block.getStatements().size());
-        for (Map.Entry<String, String> e : residual.entrySet()) {
-            String stateGuard = merge(guard, e.getValue());
-            String acc = stateGuard;
-            for (CtStatement st : tail) {
-                walk(st, e.getKey(), event, acc, out);
-                if (st instanceof CtIf ctIf
-                        && ctIf.getElseStatement() == null
-                        && alwaysTerminates(ctIf.getThenStatement())) {
-                    acc = merge(acc, negate(safeText(ctIf.getCondition())));
-                } else if (alwaysTerminates(st)) {
-                    break;
-                }
+    /** Walk a block's tail once per (state, input) the preceding chain left possible. */
+    private void walkResidual(List<CtStatement> tail, Map<String, List<EventPath>> residual,
+                              String guard, Set<Transition> out) {
+        for (Map.Entry<String, List<EventPath>> e : residual.entrySet()) {
+            for (EventPath p : e.getValue()) {
+                walkStatements(tail, e.getKey(), p.event(), merge(guard, p.guard()), false, out);
             }
         }
     }
@@ -3325,6 +3751,12 @@ public final class TransitionExtractor {
             // The arm matched this state, so anything it fails to produce is an
             // absence the analysis observed rather than one it missed.
             dispatchedStates.add(from);
+            List<EventPath> thens = thenPaths(conjoin(link.extra()), event);
+            if (thens != null) {
+                // F38: the link's extra condition partitions Σ exactly.
+                walkPaths(link.branch(), thens, from, guard, out);
+                continue;
+            }
             EventCond ec = splitConjuncts(link.extra());
             String linkGuard = merge(guard, ec.residual());
             if (ec.symbols().isEmpty()) {
@@ -3341,40 +3773,64 @@ public final class TransitionExtractor {
         // held for one spelling of the default and not the other would put the
         // difference between two idioms into the model. Extending the flag to the
         // centralized walk is one change covering both.
-        for (Map.Entry<String, String> e : chainResidual(chain, candidates).entrySet()) {
+        for (Map.Entry<String, List<EventPath>> e : chainResidual(chain, candidates, event).entrySet()) {
             dispatchedStates.add(e.getKey());
-            walk(chain.otherwise(), e.getKey(), event, merge(guard, e.getValue()), out);
+            for (EventPath p : e.getValue()) {
+                walk(chain.otherwise(), e.getKey(), p.event(), merge(guard, p.guard()), out);
+            }
         }
     }
 
     /**
      * Which states can still be current once every link's test has failed, and
-     * under what guard.
+     * on which inputs and under what guard.
      *
      * <p>A link testing {@code s instanceof T} with nothing else removes T
      * outright. A link testing {@code s instanceof T && extra} does not: its
      * branch is skipped whenever {@code extra} is false, so T is still reachable
      * below — under {@code !extra}. Dropping T there would delete a real edge;
      * keeping it without the negation would report it as unconditional.
+     *
+     * <p>F38: when {@code extra} is an event test over a closed Σ, "extra is
+     * false" is a set of inputs, so T stays reachable on exactly the inputs the
+     * link did not take, each under its own label, and T is removed once the
+     * links testing it have taken every input.
      */
-    private Map<String, String> chainResidual(DispatchCommitDetector.TypeChain chain,
-                                              Set<String> candidates) {
-        Map<String, String> residual = new LinkedHashMap<>();
-        for (String c : candidates) residual.put(c, null);
+    private Map<String, List<EventPath>> chainResidual(DispatchCommitDetector.TypeChain chain,
+                                                       Set<String> candidates, String event) {
+        Map<String, List<EventPath>> residual = new LinkedHashMap<>();
+        for (String c : candidates) residual.put(c, List.of(new EventPath(event, null)));
         for (DispatchCommitDetector.ChainLink link : chain.links()) {
             String id = stateId(link.type());
             if (!residual.containsKey(id)) continue;
             if (link.extra().isEmpty()) {
                 residual.remove(id);
-            } else {
+                continue;
+            }
+            List<EventPath> next = new ArrayList<>();
+            EventTest test = conjoin(link.extra());
+            boolean exact = test != null;
+            for (EventPath p : residual.get(id)) {
+                List<EventPath> rest = exact ? elsePaths(test, p.event()) : null;
+                if (rest == null) {
+                    exact = false;
+                    break;
+                }
+                for (EventPath q : rest) next.add(new EventPath(q.event(), merge(p.guard(), q.guard())));
+            }
+            if (!exact) {
                 // The negation is of the source condition, not of the Σ symbols it
                 // split into: a symbol is an edge LABEL and is not an expression,
                 // so negating it would put `!(LOWER)` in a DOT label and an SCXML
                 // `cond` attribute, where a predicate is expected.
                 String taken = null;
                 for (CtExpression<?> c : link.extra()) taken = merge(taken, safeText(c));
-                residual.put(id, merge(residual.get(id), negate(taken)));
+                next.clear();
+                for (EventPath p : residual.get(id)) {
+                    next.add(new EventPath(p.event(), merge(p.guard(), negate(taken))));
+                }
             }
+            if (next.isEmpty()) residual.remove(id); else residual.put(id, next);
         }
         return residual;
     }
@@ -3532,8 +3988,16 @@ public final class TransitionExtractor {
     private void handleValue(CtExpression<?> value, String from, String event,
                              String guard, Set<Transition> out) {
         if (value == null) return;
+        sigmaScope.live.add(value);
         if (value instanceof CtSwitchExpression<?, ?> sw) {
             walkSwitch(sw, from, event, guard, out);
+            return;
+        }
+        // F38: `event instanceof Lock ? new Locked() : new Open()` — a ternary
+        // whose condition tests the input labels both of its branches.
+        if (value instanceof CtConditional<?> cond
+                && conditionalOnEvent(cond, event,
+                        (branch, p) -> handleValue(branch, from, p.event(), merge(guard, p.guard()), out))) {
             return;
         }
         // F1: a read of a *reassigned local* must not be resolved from its
@@ -3936,6 +4400,19 @@ public final class TransitionExtractor {
             List<String> caseEvents = overEvent ? caseEventNames(c)
                     : overComponent ? componentEventNames(c)
                     : List.<String>of();
+            if (caseEvents.isEmpty() && c.getCaseExpressions().isEmpty() && (overEvent || overComponent)) {
+                // F38: a `default` arm of a switch over the input fires on the
+                // inputs no labelled arm claimed, so it is one edge per such input.
+                List<EventPath> rest = defaultArmPaths(sw, event, overEvent, overComponent,
+                        overEvent ? this::caseEventNames : this::componentEventNames);
+                if (rest != null) {
+                    if (rest.isEmpty()) sigmaDead(c);
+                    for (EventPath p : rest) {
+                        walkArm(sw, c, caseFroms, List.of(p.event()), merge(guard, p.guard()), out);
+                    }
+                    continue;
+                }
+            }
             if (caseEvents.isEmpty()) {
                 // Not an event dispatch, or an unlabelled `default` arm: the
                 // inherited event label carries through unchanged. Inside a
@@ -3984,6 +4461,7 @@ public final class TransitionExtractor {
     private void walkArm(CtAbstractSwitch<?> sw, CtCase<?> c, List<String> froms,
                          List<String> events, String caseGuard, Set<Transition> out) {
         boolean discardedArms = !(sw instanceof CtSwitchExpression<?, ?>);
+        sigmaScope.live.add(c);
         CtElement leaked = leakedGuard(c);
         for (String armFrom : froms) {
             for (String caseEvent : events) {

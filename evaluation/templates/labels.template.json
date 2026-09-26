@@ -16,11 +16,12 @@
       "enumChildStates": {},
       "atomicStates": ["com.example.Open", "com.example.Closed", "com.example.Locked"],
       "transitions": [
-        {"from": "com.example.Closed", "to": "com.example.Locked", "event": null, "evidence": "DoorMachine.java:7"},
-        {"from": "com.example.Closed", "to": "com.example.Open", "event": null, "evidence": "DoorMachine.java:7"},
-        {"from": "com.example.Open", "to": "com.example.Closed", "event": null, "evidence": "DoorMachine.java:8"}
+        {"from": "com.example.Closed", "event": "Lock", "to": "com.example.Locked", "evidence": "DoorMachine.java:7 - case Closed, event instanceof Lock"},
+        {"from": "com.example.Closed", "event": "Push", "to": "com.example.Open", "evidence": "DoorMachine.java:7 - else-branch of the Lock test; Event permits Push, Lock, Unlock, so one entry per remaining input"},
+        {"from": "com.example.Closed", "event": "Unlock", "to": "com.example.Open", "evidence": "DoorMachine.java:7 - else-branch of the Lock test"},
+        {"from": "com.example.Open", "event": null, "to": "com.example.Closed", "evidence": "DoorMachine.java:8 - case Open closes on every call; no input selects it"}
       ],
-      "notes": "States may be named by qualified name (preferred) or by the tool's simple id."
+      "notes": "A transition is (from, event, to). 'event' is REQUIRED: the event's name as SealFSM spells it (see PROTOCOL.md, Transition identity), or null for a genuinely eventless transition (the source never tests the input there). A branch reached because an event test failed is one entry per remaining input, never '!Lock'. Guards are not scored. States may be named by qualified name (preferred) or by the tool's simple id."
     },
     {
       "root": "com.example.Length",

@@ -11,7 +11,8 @@
       "evidence": ["Lamp.java: LampPanel.press stores LampSwitch.press(dark) in the lamp field"],
       "directBranches": ["typedhandler.Lamp.Dark", "typedhandler.Lamp.Lit"],
       "atomicStates": ["typedhandler.Lamp.Dark", "typedhandler.Lamp.Lit"],
-      "transitions": [{"from": "Dark", "to": "Lit", "event": null, "evidence": "Lamp.java LampSwitch.press"}]
+      "transitions": [{"from": "Dark", "to": "Lit", "event": null, "evidence": "Lamp.java LampSwitch.press"}],
+      "notes": "Eventless: press(Dark) is the hierarchy's only handler and takes no input besides the state, so its name names the function, not an event that selects among successors."
     },
     {
       "root": "typedhandler.OrderState",
@@ -21,11 +22,13 @@
       "directBranches": ["Placed", "Validated", "Priced", "Invoiced", "Shipped", "Fulfilled"],
       "atomicStates": ["Placed", "Validated", "Priced", "Invoiced", "Shipped", "Fulfilled"],
       "transitions": [
-        {"from": "Placed", "to": "Validated"}, {"from": "Validated", "to": "Priced"},
-        {"from": "Priced", "to": "Invoiced"}, {"from": "Invoiced", "to": "Shipped"},
-        {"from": "Shipped", "to": "Fulfilled"}
+        {"from": "Placed", "to": "Validated", "event": null, "evidence": "OrderOrchestratorImpl.java handle(Placed)"},
+        {"from": "Validated", "to": "Priced", "event": null, "evidence": "OrderOrchestratorImpl.java handle(Validated)"},
+        {"from": "Priced", "to": "Invoiced", "event": null, "evidence": "OrderOrchestratorImpl.java handle(Priced)"},
+        {"from": "Invoiced", "to": "Shipped", "event": null, "evidence": "OrderOrchestratorImpl.java handle(Invoiced)"},
+        {"from": "Shipped", "to": "Fulfilled", "event": null, "evidence": "OrderOrchestratorImpl.java handle(Shipped)"}
       ],
-      "notes": "A real machine the tool abstains on (missing caller evidence): scored as FN and as an abstention."
+      "notes": "A real machine the tool abstains on (missing caller evidence): scored as FN and as an abstention. Every transition is eventless: each handler takes only the state it leaves, and all share the one name handle, so no input selects between successors."
     },
     {"root": "typedhandler.Length", "label": "NON_FSM", "codingPattern": "none",
      "evidence": ["Length.java: unit converters"]},

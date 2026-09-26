@@ -405,7 +405,9 @@ class StateCompletenessTest {
         StateMachine tcp = single(new Analyzer().analyze(modelOf("examples/tcp")));
         assertEquals(11, tcp.allStates().size());
         assertTrue(tcp.commitForms().contains(CommitForm.POLY_CARRIER), "tcp: POLY_CARRIER");
-        assertEquals(44, tcp.resolvedTransitionCount());
+        // F38 (not F26): each carrier fall-through is one self-loop per remaining
+        // input, so the relation is 90 edges; before, 44 with eventless `otherwise`s.
+        assertEquals(90, tcp.resolvedTransitionCount());
         assertEquals(CommitEvidence.VIA_CALLER, tcp.commitEvidence(),
                 "TcpConnection.apply unwraps the carrier and stores its state");
 
